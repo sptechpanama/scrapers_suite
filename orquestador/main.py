@@ -482,6 +482,10 @@ def main() -> None:
                 try:
                     update_manual_request_status(manual_row, "enqueued", enqueue_note)
                     manual_notes = enqueue_note
+                    logging.info(
+                        "Solicitud manual %s marcada como enqueued",
+                        manual_id or f"fila {manual_row}",
+                    )
                 except Exception:  # pylint: disable=broad-except
                     logging.exception(
                         "No se pudo marcar la solicitud manual fila %s como encolada",
@@ -531,6 +535,11 @@ def main() -> None:
                     try:
                         update_manual_request_status(manual_row, "running", running_note)
                         execution.manual_notes = running_note
+                        logging.info(
+                            "%s: estado actualizado a running (fila %s)",
+                            label,
+                            manual_row + 1,
+                        )
                     except Exception:  # pylint: disable=broad-except
                         logging.exception(
                             "No se pudo marcar la solicitud manual fila %s como en ejecución",
@@ -558,6 +567,12 @@ def main() -> None:
                         final_note = compose_note(final_note, shortened)
                     try:
                         update_manual_request_status(manual_row, final_status, final_note)
+                        logging.info(
+                            "%s: estado actualizado a %s (fila %s)",
+                            label,
+                            final_status,
+                            manual_row + 1,
+                        )
                     except Exception:  # pylint: disable=broad-except
                         logging.exception(
                             "No se pudo actualizar el resultado de la solicitud manual fila %s",
