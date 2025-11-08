@@ -482,6 +482,10 @@ def main() -> None:
                 continue
 
             try:
+                label = JOB_NAME_LABELS.get(execution.job.name, execution.job.name)
+                if execution.source == "manual":
+                    logging.info("%s (manual): inicio de ejecucion", label)
+
                 manual_row = execution.manual_row
                 if manual_row is not None:
                     running_note = compose_note(
@@ -498,6 +502,12 @@ def main() -> None:
                         )
 
                 status, detail = run_job(execution.job)
+
+                if execution.source == "manual":
+                    if status == "success":
+                        logging.info("%s (manual): ejecucion exitosa", label)
+                    else:
+                        logging.error("%s (manual): ejecucion con error: %s", label, detail or status)
 
                 if manual_row is not None:
                     final_status = "done" if status == "success" else "error"
