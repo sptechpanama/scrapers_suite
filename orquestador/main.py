@@ -36,6 +36,7 @@ from sheets_bridge import (
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 STATE_PATH = BASE_DIR / "state.json"
+DEFAULT_ORQUESTADOR_CREDENTIALS = BASE_DIR / "pure-beach-474203-p1-fdc9557f33d0.json"
 
 # Ajusta esta lista para controlar manualmente los horarios sin depender todavía de una interfaz externa.
 DEFAULT_TIMEZONE = "America/Panama"
@@ -166,6 +167,25 @@ def manual_log(message: str, *, level: str = "info") -> None:
     else:
         logging.info(message)
     print(message, flush=True)
+
+
+def configure_service_account() -> None:
+    """Asegura que el orquestador use las credenciales de Finance sin afectar otros scrapers."""
+    manual_path = os.environ.get("ORQUESTADOR_SERVICE_ACCOUNT_FILE")
+    candidate = None
+    if manual_path:
+        candidate = Path(manual_path).expanduser()
+    elif DEFAULT_ORQUESTADOR_CREDENTIALS.exists():
+        candidate = DEFAULT_ORQUESTADOR_CREDENTIALS
+
+    if candidate and candidate.exists():
+        os.environ["FINAPP_SERVICE_ACCOUNT_FILE"] = str(candidate)
+        logging.info("Cuenta de servicio para orquestador: %s", candidate)
+    else:
+        logging.warning(
+            "No se pudo establecer FINAPP_SERVICE_ACCOUNT_FILE específico del orquestador; "
+            "se usará la configuración existente."
+        )
 
 
 def build_config_signature(config: OrchestratorConfig) -> tuple:
@@ -395,6 +415,8 @@ def main() -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
+
+    configure_service_account()
 
     try:
         config = load_config()
