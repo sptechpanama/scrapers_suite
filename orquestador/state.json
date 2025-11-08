@@ -1,0 +1,28 @@
+{
+  "last_run": {
+    "clv": {
+      "started_at": "2025-11-07T17:00:00",
+      "finished_at": "2025-11-07T17:02:06",
+      "duration_seconds": 126.158,
+      "duration_display": "2 min 6 s",
+      "status": "success",
+      "detail": ""
+    },
+    "clrir": {
+      "started_at": "2025-11-06T18:00:00",
+      "finished_at": "2025-11-06T18:08:25",
+      "duration_seconds": 505.87,
+      "duration_display": "8 min 26 s",
+      "status": "success",
+      "detail": ""
+    },
+    "rir1": {
+      "started_at": "2025-11-07T16:30:00",
+      "finished_at": "2025-11-07T16:33:37",
+      "duration_seconds": 217.741,
+      "duration_display": "3 min 38 s",
+      "status": "success",
+      "detail": ""
+    }
+  }
+}

@@ -1,0 +1,5 @@
+apscheduler
+fastapi
+uvicorn[standard]
+pydantic
+google-api-python-client
