@@ -11,10 +11,12 @@ import sys, re, time, unicodedata, random, os
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse, unquote
+from typing import List, Tuple
 import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data"
+SHEET_CACHE_DIR = DATA_DIR / "sheet_cache"
 
 
 def _resolve_credentials_file() -> Path:
@@ -188,38 +190,54 @@ def exec_with_backoff(request, label: str) -> dict:
 
 
 def gs_get(rng):
+    sheet, range_part = _split_range(rng)
+    normalized = range_part.replace("$", "").upper()
+    if sheet and normalized == "A1:ZZ":
+        return _fetch_sheet_values(sheet)
+
     resp = exec_with_backoff(
         GSVC.spreadsheets().values().get(spreadsheetId=SSID, range=rng),
-        label=f"get {rng}"
+        label=f"get {rng}",
     )
-    return resp.get("values", [])
+    values = resp.get("values", [])
+    if sheet:
+        SHEET_CACHE.pop(sheet, None)
+    return values
 
 
 def gs_update(rng, values):
+    sheet, _ = _split_range(rng)
     exec_with_backoff(
-        GSVC.spreadsheets().values().update(
+        GSVC.spreadsheets()
+        .values()
+        .update(
             spreadsheetId=SSID,
             range=rng,
-            valueInputOption='RAW',
-            body={'values': values},
+            valueInputOption="RAW",
+            body={"values": values},
         ),
         label=f"update {rng}",
     )
+    if sheet:
+        SHEET_CACHE.pop(sheet, None)
 
 
 def gs_append(sheet, rows):
     if rows:
         exec_with_backoff(
-            GSVC.spreadsheets().values().append(
+            GSVC.spreadsheets()
+            .values()
+            .append(
                 spreadsheetId=SSID,
                 range=f"{sheet}!A1",
-                valueInputOption='RAW',
-                insertDataOption='INSERT_ROWS',
-                body={'values': rows},
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": rows},
             ),
             label=f"append {sheet}",
         )
         LOG("SHEETS", f"{sheet}: +{len(rows)} filas")
+        SHEET_CACHE.pop(sheet, None)
 
 
 def gs_meta():
@@ -883,3 +901,38 @@ def main():
 
 if __name__ == "__main__":
     main()     
+CREDENTIALS_FILE = _resolve_credentials_file()
+
+SHEET_CACHE: dict[str, List[List[str]]] = {}
+
+
+def _split_range(rng: str) -> Tuple[str | None, str]:
+    if "!" not in rng:
+        return None, rng
+    sheet, part = rng.split("!", 1)
+    sheet = sheet.strip().strip("'\"")
+    return sheet, part
+
+
+def _write_cache_to_excel(sheet: str, values: List[List[str]]) -> None:
+    try:
+        SHEET_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame(values)
+        df.to_excel(SHEET_CACHE_DIR / f"{sheet}.xlsx", index=False, header=False)
+    except Exception:
+        pass
+
+
+def _fetch_sheet_values(sheet: str) -> List[List[str]]:
+    if sheet in SHEET_CACHE:
+        return SHEET_CACHE[sheet]
+    resp = (
+        GSVC.spreadsheets()
+        .values()
+        .get(spreadsheetId=SSID, range=f"'{sheet}'!A1:ZZ")
+        .execute()
+    )
+    values = resp.get("values", [])
+    SHEET_CACHE[sheet] = values
+    _write_cache_to_excel(sheet, values)
+    return values
