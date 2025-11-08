@@ -586,6 +586,13 @@ def main() -> None:
                         )
                 continue
 
+            logging.info(
+                "Monitor manual: solicitud %s (%s) detectada para %s",
+                manual_request.get("id") or manual_request.get("row") or "sin-id",
+                manual_request.get("requested_by") or "desconocido",
+                JOB_NAME_LABELS.get(job.name, job.name),
+            )
+
             enqueue_execution(job, "manual", manual_request=manual_request)
 
     schedule_jobs(scheduler, current_config, enqueue_execution)
