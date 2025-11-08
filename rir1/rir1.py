@@ -5,7 +5,7 @@
 # - Mantiene toda la operativa (paginación, purga, CT/SR/RS/meds, checkboxes, fechas)
 # - Ajustado al HTML pegado: "Precio de referencia" + espera flexible (cualquiera de los XPaths de precio/título)
 
-import sys, re, time, unicodedata
+import sys, re, time, unicodedata, os
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse, unquote
@@ -17,7 +17,23 @@ from selenium.webdriver.support import expected_conditions as EC
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data"
-CREDENTIALS_FILE = REPO_ROOT / "credentials" / "service-account.json"
+
+
+def _resolve_credentials_file() -> Path:
+    env_path = os.environ.get("RIR1_SERVICE_ACCOUNT_FILE")
+    if env_path:
+        env_candidate = Path(env_path).expanduser()
+        if env_candidate.exists():
+            return env_candidate
+
+    legacy_candidate = Path(r"C:\Users\rodri\cl\serious-app-417920-eed299fa06b5.json")
+    if legacy_candidate.exists():
+        return legacy_candidate
+
+    return REPO_ROOT / "credentials" / "service-account.json"
+
+
+CREDENTIALS_FILE = _resolve_credentials_file()
 
 COMMON_DIR = REPO_ROOT / "common"
 if str(COMMON_DIR) not in sys.path:
