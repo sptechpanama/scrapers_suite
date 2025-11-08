@@ -81,6 +81,12 @@ DEFAULT_JOB_DATA = [
     },
 ]
 
+JOB_NAME_LABELS = {
+    "clv": "Cotizaciones Abiertas",
+    "clrir": "Cotizaciones Programadas",
+    "rir1": "Licitaciones",
+}
+
 JOB_LABEL_TITLES = {
     CONFIG_WATCH_JOB_ID: "monitor de configuracion",
     MANUAL_WATCH_JOB_ID: "monitor de solicitudes manuales",
