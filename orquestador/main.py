@@ -146,6 +146,17 @@ def format_execution_label(execution: ExecutionRequest) -> str:
     return f"{base_label} ({execution.source})"
 
 
+def describe_manual_request(manual_request: Dict[str, str]) -> tuple[str, str]:
+    request_id = (
+        manual_request.get("id")
+        or manual_request.get("row")
+        or manual_request.get("requested_at")
+        or "sin-id"
+    )
+    requested_by = manual_request.get("requested_by") or "desconocido"
+    return request_id, requested_by
+
+
 def build_config_signature(config: OrchestratorConfig) -> tuple:
     signature: list[tuple] = []
     for job in sorted(config.jobs, key=lambda item: item.name):
@@ -489,10 +500,11 @@ def main() -> None:
         job_queue.put(execution)
         logging.info("Job %s agregado a la cola (origen: %s)", job.name, source)
         if manual_request:
+            manual_tag, requester = describe_manual_request(manual_request)
             logging.info(
                 "Solicitud manual %s (%s) encolada para %s",
-                manual_request.get("id") or manual_request.get("row") or "sin-id",
-                manual_request.get("requested_by") or "desconocido",
+                manual_tag,
+                requester,
                 JOB_NAME_LABELS.get(job.name, job.name),
             )
 
@@ -532,6 +544,8 @@ def main() -> None:
                         logging.info("%s: ejecucion exitosa", label)
                     else:
                         logging.error("%s: ejecucion con error: %s", label, detail or status)
+                else:
+                    logging.info("%s: ejecucion completada con estado %s", label, status)
 
                 if manual_row is not None:
                     final_status = "done" if status == "success" else "error"
@@ -561,6 +575,8 @@ def main() -> None:
 
         if pending_requests:
             logging.info("Monitor manual: %s solicitudes detectadas", len(pending_requests))
+        else:
+            logging.info("Monitor manual: sin solicitudes pendientes")
         for manual_request in pending_requests:
             job_name = (manual_request.get("job") or "").strip()
             row_index = to_row_index(manual_request.get("row"))
@@ -592,11 +608,18 @@ def main() -> None:
                         )
                 continue
 
+            manual_tag, requester = describe_manual_request(manual_request)
             logging.info(
-                "Monitor manual: solicitud %s (%s) detectada para %s",
-                manual_request.get("id") or manual_request.get("row") or "sin-id",
-                manual_request.get("requested_by") or "desconocido",
+                "Solicitud manual %s (%s) detectada para %s (estado pending)",
+                manual_tag,
+                requester,
                 JOB_NAME_LABELS.get(job.name, job.name),
+            )
+
+            logging.info(
+                "Solicitud manual %s (%s) en proceso de encolado",
+                manual_tag,
+                requester,
             )
 
             enqueue_execution(job, "manual", manual_request=manual_request)
