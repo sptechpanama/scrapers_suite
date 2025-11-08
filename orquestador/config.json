@@ -1,25 +1,61 @@
 {
-  "jobs": [
-    {
-      "name": "clv",
-      "python": "C:/Users/rodri/clv/venv/Scripts/python.exe",
-      "script": "C:/Users/rodri/scrapers_repo/clv/clv.py",
-      "days_of_week": ["mon", "tue", "wed", "thu", "fri"],
-      "times": ["08:00", "14:00", "22:53"]
-    },
-    {
-      "name": "clrir",
-      "python": "C:/Users/rodri/clrir/venv/Scripts/python.exe",
-      "script": "C:/Users/rodri/scrapers_repo/clrir/clrir.py",
-      "days_of_week": ["mon", "tue", "wed", "thu", "fri"],
-      "times": ["08:30", "22:55"]
-    },
-    {
-      "name": "rir1",
-      "python": "C:/Users/rodri/rir1/venv/Scripts/python.exe",
-      "script": "C:/Users/rodri/scrapers_repo/rir1/rir1.py",
-      "days_of_week": ["mon", "tue", "fri"],
-      "times": ["22:57"]
-    }
-  ]
+    "jobs":  [
+                 {
+                     "name":  "clv",
+                     "python":  "C:/Users/rodri/clv/venv/Scripts/python.exe",
+                     "script":  "C:/Users/rodri/scrapers_repo/clv/clv.py",
+                     "days_of_week":  [
+                                          "mon",
+                                          "tue",
+                                          "wed",
+                                          "thu",
+                                          "fri"
+                                      ],
+                     "times":  [
+                                   "08:00",
+                                   "14:00",
+                                   "22:53"
+                               ]
+                 },
+                 {
+                     "name":  "clrir",
+                     "python":  "C:/Users/rodri/clrir/venv/Scripts/python.exe",
+                     "script":  "C:/Users/rodri/scrapers_repo/clrir/clrir.py",
+                     "days_of_week":  [
+                                          "mon",
+                                          "tue",
+                                          "wed",
+                                          "thu",
+                                          "fri"
+                                      ],
+                     "times":  [
+                                   "08:30",
+                                   "22:55"
+                               ]
+                 },
+                 {
+                     "name":  "rir1",
+                     "python":  "C:/Users/rodri/rir1/venv/Scripts/python.exe",
+                     "script":  "C:/Users/rodri/scrapers_repo/rir1/rir1.py",
+                     "days_of_week":  [
+                                          "mon",
+                                          "tue",
+                                          "fri"
+                                      ],
+                     "times":  [
+                                   "22:57"
+                               ]
+                 },
+                 {
+                     "name":  "sunday_db_minsa",
+                     "python":  "C:/Users/rodri/minsa_scraper/.venv/Scripts/python.exe",
+                     "script":  "C:/Users/rodri/scrapers_repo/orquestador/run_db_then_minsa.py",
+                     "days_of_week":  [
+                                          "sun"
+                                      ],
+                     "times":  [
+                                   "01:00"
+                               ]
+                 }
+             ]
 }
