@@ -471,6 +471,13 @@ def main() -> None:
         )
         job_queue.put(execution)
         logging.info("Job %s agregado a la cola (origen: %s)", job.name, source)
+        if manual_request:
+            logging.info(
+                "Solicitud manual %s (%s) encolada para job %s",
+                manual_request.get("id") or manual_request.get("row") or "sin-id",
+                manual_request.get("requested_by") or "desconocido",
+                job.name,
+            )
 
     def worker_loop() -> None:
         while True:
@@ -535,6 +542,8 @@ def main() -> None:
             logging.exception("No se pudo obtener solicitudes manuales desde Google Sheets")
             return
 
+        if pending_requests:
+            logging.info("Monitor manual: %s solicitudes detectadas", len(pending_requests))
         for manual_request in pending_requests:
             job_name = (manual_request.get("job") or "").strip()
             row_index = to_row_index(manual_request.get("row"))
