@@ -157,6 +157,17 @@ def describe_manual_request(manual_request: Dict[str, str]) -> tuple[str, str]:
     return request_id, requested_by
 
 
+def manual_log(message: str, *, level: str = "info") -> None:
+    """Envía el mensaje tanto al logger como a stdout para facilitar el monitoreo."""
+    if level == "error":
+        logging.error(message)
+    elif level == "warning":
+        logging.warning(message)
+    else:
+        logging.info(message)
+    print(message, flush=True)
+
+
 def build_config_signature(config: OrchestratorConfig) -> tuple:
     signature: list[tuple] = []
     for job in sorted(config.jobs, key=lambda item: item.name):
@@ -505,11 +516,8 @@ def main() -> None:
         logging.info("Job %s agregado a la cola (origen: %s)", job.name, source)
         if manual_request:
             manual_tag, requester = describe_manual_request(manual_request)
-            logging.info(
-                "Solicitud manual %s (%s) encolada para %s",
-                manual_tag,
-                requester,
-                JOB_NAME_LABELS.get(job.name, job.name),
+            manual_log(
+                f"Solicitud manual {manual_tag} ({requester}) encolada para {JOB_NAME_LABELS.get(job.name, job.name)}"
             )
 
     def worker_loop() -> None:
@@ -524,7 +532,7 @@ def main() -> None:
             try:
                 label = format_execution_label(execution)
                 if execution.source == "manual":
-                    logging.info("%s: inicio de ejecucion", label)
+                    manual_log(f"{label}: inicio de ejecucion")
 
                 manual_row = execution.manual_row
                 if manual_row is not None:
@@ -535,10 +543,8 @@ def main() -> None:
                     try:
                         update_manual_request_status(manual_row, "running", running_note)
                         execution.manual_notes = running_note
-                        logging.info(
-                            "%s: estado actualizado a running (fila %s)",
-                            label,
-                            manual_row + 1,
+                        manual_log(
+                            f"{label}: estado actualizado a running (fila {manual_row + 1})"
                         )
                     except Exception:  # pylint: disable=broad-except
                         logging.exception(
@@ -550,9 +556,12 @@ def main() -> None:
 
                 if execution.source == "manual":
                     if status == "success":
-                        logging.info("%s: ejecucion exitosa", label)
+                        manual_log(f"{label}: ejecucion exitosa")
                     else:
-                        logging.error("%s: ejecucion con error: %s", label, detail or status)
+                        manual_log(
+                            f"{label}: ejecucion con error: {detail or status}",
+                            level="error",
+                        )
                 else:
                     logging.info("%s: ejecucion completada con estado %s", label, status)
 
@@ -567,11 +576,8 @@ def main() -> None:
                         final_note = compose_note(final_note, shortened)
                     try:
                         update_manual_request_status(manual_row, final_status, final_note)
-                        logging.info(
-                            "%s: estado actualizado a %s (fila %s)",
-                            label,
-                            final_status,
-                            manual_row + 1,
+                        manual_log(
+                            f"{label}: estado actualizado a {final_status} (fila {manual_row + 1})"
                         )
                     except Exception:  # pylint: disable=broad-except
                         logging.exception(
@@ -589,9 +595,9 @@ def main() -> None:
             return
 
         if pending_requests:
-            logging.info("Monitor manual: %s solicitudes detectadas", len(pending_requests))
+            manual_log(f"Monitor manual: {len(pending_requests)} solicitudes detectadas")
         else:
-            logging.info("Monitor manual: sin solicitudes pendientes")
+            manual_log("Monitor manual: sin solicitudes pendientes")
         for manual_request in pending_requests:
             job_name = (manual_request.get("job") or "").strip()
             row_index = to_row_index(manual_request.get("row"))
@@ -624,17 +630,12 @@ def main() -> None:
                 continue
 
             manual_tag, requester = describe_manual_request(manual_request)
-            logging.info(
-                "Solicitud manual %s (%s) detectada para %s (estado pending)",
-                manual_tag,
-                requester,
-                JOB_NAME_LABELS.get(job.name, job.name),
+            manual_log(
+                f"Solicitud manual {manual_tag} ({requester}) detectada para {JOB_NAME_LABELS.get(job.name, job.name)} (estado pending)"
             )
 
-            logging.info(
-                "Solicitud manual %s (%s) en proceso de encolado",
-                manual_tag,
-                requester,
+            manual_log(
+                f"Solicitud manual {manual_tag} ({requester}) en proceso de encolado"
             )
 
             enqueue_execution(job, "manual", manual_request=manual_request)
