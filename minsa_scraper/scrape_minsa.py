@@ -1671,8 +1671,7 @@ def scrape_oferentes(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
         row_idx = 0
-
-
+        page_oferentes = 0
 
         while True:
 
@@ -1774,7 +1773,28 @@ def scrape_oferentes(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
 
+            oferente_label = (
+
+                base_entry.get("Oferente::Oferente")
+
+                or base_entry.get("Oferente::No. de Oferente")
+
+                or f"Fila {page_oferentes + 1}"
+
+            )
+
+            page_oferentes += 1
+
+            print(
+
+                f"[LOG] Oferentes: procesando '{oferente_label}' (página {page}, fila {page_oferentes})"
+
+            )
+
+
+
             catalog_rows_added = False
+            catalog_rows_total = 0
 
 
 
@@ -1815,6 +1835,8 @@ def scrape_oferentes(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
                         catalog_df = clean_catalog_dataframe(table_to_dataframe(catalog_table))
+
+                        print(f"[LOG] Catálogo página {catalog_page} para '{oferente_label}': {len(catalog_df)} filas")
 
 
 
@@ -1907,6 +1929,26 @@ def scrape_oferentes(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
                 finally:
+
+
+
+                    if catalog_rows_total:
+
+
+
+                        print(
+                            f"[LOG] Oferentes: '{oferente_label}' acumuló {catalog_rows_total} filas de catálogos"
+                        )
+
+
+
+                    else:
+
+
+
+                        print(
+                            f"[LOG] Oferentes: '{oferente_label}' no mostró catálogos"
+                        )
 
 
 
@@ -2035,6 +2077,12 @@ def scrape_oferentes(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
         time.sleep(1)
+
+
+
+        print(
+            f"[LOG] Oferentes: página {page} completada ({page_oferentes} oferentes revisados)"
+        )
 
 
 
@@ -2531,6 +2579,7 @@ if __name__ == "__main__":
 
 
     raise SystemExit(main())
+
 
 
 
