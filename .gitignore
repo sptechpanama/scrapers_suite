@@ -5,3 +5,6 @@
 outputs/
 
 orquestador/pure-beach-474203-p1-fdc9557f33d0.json
+\.venv/
+credentials/*.json
+data/db/*.db

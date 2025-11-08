@@ -143,6 +143,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 
 BASE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = BASE_DIR.parent
 
 
 
@@ -170,7 +171,7 @@ DEFAULT_OUTPUT_DIR = BASE_DIR / "outputs"
 
 
 
-_DEFAULT_CREDENTIALS_PATH = Path.home() / "orquestador" / "pure-beach-474203-p1-fdc9557f33d0.json"
+_DEFAULT_CREDENTIALS_PATH = REPO_ROOT / "credentials" / "service-account.json"
 
 
 
@@ -1344,6 +1345,7 @@ def scrape_ctni_fichas(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
         dataframes.append(df)
+        print(f"[LOG] CTNI: pagina {page} procesada ({len(df)} filas)")
 
 
 
@@ -1363,7 +1365,7 @@ def scrape_ctni_fichas(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
 
-            "//a[@id='FichasTable_next' and not(contains(@class,'disabled'))]",
+            "//li[@id='FichasTable_next' and not(contains(@class,'disabled'))]/a",
 
 
 
@@ -1491,6 +1493,7 @@ def scrape_criterios(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
         dataframes.append(df)
+        print(f"[LOG] Criterios: pagina {page} procesada ({len(df)} filas utiles)")
 
 
 
@@ -2528,6 +2531,9 @@ if __name__ == "__main__":
 
 
     raise SystemExit(main())
+
+
+
 
 
 

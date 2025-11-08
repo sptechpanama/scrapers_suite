@@ -9,12 +9,12 @@
       "detail": ""
     },
     "clrir": {
-      "started_at": "2025-11-06T18:00:00",
-      "finished_at": "2025-11-06T18:08:25",
-      "duration_seconds": 505.87,
-      "duration_display": "8 min 26 s",
-      "status": "success",
-      "detail": ""
+      "started_at": "2025-11-08T02:30:00",
+      "finished_at": "2025-11-08T02:31:43",
+      "duration_seconds": 103.04,
+      "duration_display": "1 min 43 s",
+      "status": "error",
+      "detail": "Traceback (most recent call last):\n  File \"C:\\Users\\rodri\\clrir\\clrir.py\", line 820, in <module>\n    main()     \n    ^^^^^^\n  File \"C:\\Users\\rodri\\clrir\\clrir.py\", line 703, in main\n    update_fechas_sheet(sh)\n  File \"C:\\Users\\rodri\\clrir\\clrir.py\", line 302, in update_fechas_sheet\n    vals = gs_get(f\"{sheet}!A1:ZZ\")\n           ^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\rodri\\clrir\\clrir.py\", line 154, in gs_get\n    return GSVC.spreadsheets().values().get(spreadsheetId=SSID, range=rng).execute().get(\"values\", [])\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\rodri\\clrir\\venv\\Lib\\site-packages\\googleapiclient\\_helpers.py\", line 130, in positional_wrapper\n    return wrapped(*args, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"C:\\Users\\rodri\\clrir\\venv\\Lib\\site-packages\\googleapiclient\\http.py\", line 938, in execute\n    raise HttpError(resp, content, uri=self.uri)\ngoogleapiclient.errors.HttpError: <HttpError 429 when requesting https://sheets.googleapis.com/v4/spreadsheets/17hOfP-vMdJ4D7xym1cUp7vAcd8XJPErpY3V-9Ui2tCo/values/cl_prog_con_ct%21A1%3AZZ?alt=json returned \"Quota exceeded for quota metric 'Read requests' and limit 'Read requests per minute per user' of service 'sheets.googleapis.com' for consumer 'project_number:773379225170'.\". Details: \"[{'@type': 'type.googleapis.com/google.rpc.ErrorInfo', 'reason': 'RATE_LIMIT_EXCEEDED', 'domain': 'googleapis.com', 'metadata': {'quota_location': 'global', 'consumer': 'projects/773379225170', 'service': 'sheets.googleapis.com', 'quota_limit_value': '60', 'quota_limit': 'ReadRequestsPerMinutePerUser', 'quota_metric': 'sheets.googleapis.com/read_requests', 'quota_unit': '1/min/{project}/{user}'}}, {'@type': 'type.googleapis.com/google.rpc.Help', 'links': [{'description': 'Request a higher quota limit.', 'url': 'https://cloud.google.com/docs/quotas/help/request_increase'}]}]\">"
     },
     "rir1": {
       "started_at": "2025-11-07T16:30:00",

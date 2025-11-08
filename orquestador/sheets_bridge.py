@@ -16,10 +16,11 @@ from googleapiclient.errors import HttpError
 from httplib2 import HttpLib2Error
 
 BASE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = BASE_DIR.parent
 SERVICE_ACCOUNT_FILE = Path(
     os.environ.get(
         "ORQUESTADOR_GOOGLE_SERVICE_ACCOUNT",
-        BASE_DIR / "pure-beach-474203-p1-fdc9557f33d0.json",
+        REPO_ROOT / "credentials" / "service-account.json",
     )
 )
 SPREADSHEET_ID = os.environ.get(

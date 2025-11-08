@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import sys, re, time, unicodedata
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import urlparse, urlunparse, unquote
 import pandas as pd
 from urllib.parse import urljoin
@@ -13,7 +14,11 @@ import sqlite3
 from sqlite3 import Error
 import re
 
-DB_PATH = "panamacompra.db"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO_ROOT / "data"
+CREDENTIALS_FILE = REPO_ROOT / "credentials" / "service-account.json"
+
+DB_PATH = str(DATA_DIR / "db" / "panamacompra.db")
 SAVE_BATCH_SIZE = 100  # Guarda en la base cada 100 actos
 
 
@@ -22,7 +27,7 @@ SAVE_BATCH_SIZE = 100  # Guarda en la base cada 100 actos
 # =========================
 CFG = {
     # ---- Google Sheets ----
-    "svc_key": r"C:\Users\rodri\cl\serious-app-417920-eed299fa06b5.json",
+    "svc_key": str(CREDENTIALS_FILE),
     "spreadsheet_id": "17hOfP-vMdJ4D7xym1cUp7vAcd8XJPErpY3V-9Ui2tCo",
     "sheet_db": "DB",
 

@@ -13,7 +13,11 @@ from pathlib import Path
 from urllib.parse import urlparse, urlunparse, unquote
 import pandas as pd
 
-COMMON_DIR = Path(__file__).resolve().parent.parent / "common"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO_ROOT / "data"
+CREDENTIALS_FILE = REPO_ROOT / "credentials" / "service-account.json"
+
+COMMON_DIR = REPO_ROOT / "common"
 if str(COMMON_DIR) not in sys.path:
     sys.path.append(str(COMMON_DIR))
 
@@ -24,16 +28,16 @@ from ficha_utils import detectar_fichas_tokens
 # =========================
 CFG = {
     # ---- Rutas locales (archivos Excel con listas auxiliares) ----
-    "xlsx_todas": r"C:\Users\rodri\fichas\todas_las_fichas.xlsx",
-    "xlsx_con_req": r"C:\Users\rodri\fichas\fichas_con_requisitos.xlsx",
-    "xlsx_sin_req": r"C:\Users\rodri\fichas\fichas_sin_requisitos.xlsx",
-    "xlsx_con_ct": r"C:\Users\rodri\clrir\fichas_con_CT_sin_RS.xlsx",
-    "xlsx_con_rs": r"C:\Users\rodri\clrir\fichas_con_RS.xlsx",
-    "xlsx_palabras": r"C:\Users\rodri\fichas\Palabras_Organizadas.xlsx",
-    "xlsx_meds": r"C:\Users\rodri\clv\lista_medicamentos.xlsx",
+    "xlsx_todas": str(DATA_DIR / "fichas" / "todas_las_fichas.xlsx"),
+    "xlsx_con_req": str(DATA_DIR / "fichas" / "fichas_con_requisitos.xlsx"),
+    "xlsx_sin_req": str(DATA_DIR / "fichas" / "fichas_sin_requisitos.xlsx"),
+    "xlsx_con_ct": str(DATA_DIR / "clrir" / "fichas_con_CT_sin_RS.xlsx"),
+    "xlsx_con_rs": str(DATA_DIR / "clrir" / "fichas_con_RS.xlsx"),
+    "xlsx_palabras": str(DATA_DIR / "fichas" / "Palabras_Organizadas.xlsx"),
+    "xlsx_meds": str(DATA_DIR / "references" / "lista_medicamentos.xlsx"),
 
     # ---- Google Sheets ----
-    "svc_key": r"C:\Users\rodri\cl\serious-app-417920-eed299fa06b5.json",
+    "svc_key": str(CREDENTIALS_FILE),
     "spreadsheet_id": "17hOfP-vMdJ4D7xym1cUp7vAcd8XJPErpY3V-9Ui2tCo",
     "sheets_data": ["cl_prog_sin_ficha", "cl_prog_sin_requisitos", "cl_prog_con_ct", "cl_prioritarios"],
     "sheet_desc": "cl_descartes",
@@ -145,28 +149,168 @@ MEDS = load_meds(CFG["xlsx_meds"])
 # =========================
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 creds = Credentials.from_service_account_file(CFG["svc_key"])
 GSVC = build('sheets','v4',credentials=creds)
 SSID = CFG["spreadsheet_id"]
 
-def gs_get(rng):
-    return GSVC.spreadsheets().values().get(spreadsheetId=SSID, range=rng).execute().get("values", [])
+GS_RATE_COOLDOWN = 1.2  # segundos entre lecturas para no sobrepasar 60 rpm
+_GS_CACHE = {}
+_LAST_GS_CALL = 0.0
+
+
+def _normalize_range_name(rng):
+    if not rng:
+        return rng
+    rng = rng.strip()
+    if "!" not in rng:
+        return rng.replace("'", "").replace('"', "")
+    sheet, rest = rng.split("!", 1)
+    sheet = sheet.strip().strip("'\"")
+    return f"{sheet}!{rest}"
+
+
+def _format_range(sheet, rng="A1:ZZ"):
+    sheet = sheet.strip()
+    if not sheet:
+        return rng
+    if " " in sheet and not sheet.startswith("'"):
+        sheet = f"'{sheet}'"
+    return f"{sheet}!{rng}"
+
+
+def _throttle_google_calls():
+    global _LAST_GS_CALL
+    now = time.perf_counter()
+    wait = GS_RATE_COOLDOWN - (now - _LAST_GS_CALL)
+    if wait > 0:
+        time.sleep(wait)
+    _LAST_GS_CALL = time.perf_counter()
+
+
+def _exec_with_retry(label, func, retries=4):
+    for attempt in range(retries):
+        try:
+            _throttle_google_calls()
+            return func()
+        except HttpError as exc:
+            status = getattr(exc.resp, "status", None)
+            if status == 429 and attempt < retries - 1:
+                backoff = min(10, (attempt + 1) * 2)
+                LOG("SHEETS", f"{label}: cuota alcanzada, reintento en {backoff:.1f}s")
+                time.sleep(backoff)
+                continue
+            raise
+
+
+def gs_get(rng, *, use_cache=True):
+    key = _normalize_range_name(rng)
+    if use_cache and key in _GS_CACHE:
+        return _GS_CACHE[key]
+
+    def _action():
+        return (
+            GSVC.spreadsheets()
+            .values()
+            .get(spreadsheetId=SSID, range=rng)
+            .execute()
+            .get("values", [])
+        )
+
+    values = _exec_with_retry(f"get {key}", _action)
+    if use_cache:
+        _GS_CACHE[key] = values
+    return values
+
+
+def gs_batch_get(ranges):
+    normalized = [_normalize_range_name(r) for r in ranges]
+    pending = []
+    results = {}
+    for raw, key in zip(ranges, normalized):
+        if key in _GS_CACHE:
+            results[key] = _GS_CACHE[key]
+        else:
+            pending.append((raw, key))
+    if pending:
+        query_ranges = [raw for raw, _ in pending]
+
+        def _action():
+            return (
+                GSVC.spreadsheets()
+                .values()
+                .batchGet(spreadsheetId=SSID, ranges=query_ranges)
+                .execute()
+            )
+
+        response = _exec_with_retry(f"batchGet {len(query_ranges)}", _action)
+        returned = set()
+        for rng_values in response.get("valueRanges", []):
+            key = _normalize_range_name(rng_values.get("range"))
+            values = rng_values.get("values", [])
+            _GS_CACHE[key] = values
+            results[key] = values
+            returned.add(key)
+        for _, key in pending:
+            if key not in returned:
+                _GS_CACHE[key] = []
+                results[key] = []
+    return results
+
+
+def _invalidate_cache():
+    _GS_CACHE.clear()
+
 
 def gs_update(rng, values):
-    GSVC.spreadsheets().values().update(spreadsheetId=SSID, range=rng, valueInputOption='RAW', body={'values': values}).execute()
+    def _action():
+        return (
+            GSVC.spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=SSID,
+                range=rng,
+                valueInputOption='RAW',
+                body={'values': values},
+            )
+            .execute()
+        )
+
+    result = _exec_with_retry(f"update {rng}", _action)
+    _invalidate_cache()
+    return result
+
 
 def gs_append(sheet, rows):
-    if rows:
-        GSVC.spreadsheets().values().append(
-            spreadsheetId=SSID, range=f"{sheet}!A1",
-            valueInputOption='RAW', insertDataOption='INSERT_ROWS',
-            body={'values': rows}
-        ).execute()
-        LOG("SHEETS", f"{sheet}: +{len(rows)} filas")
+    if not rows:
+        return None
+
+    def _action():
+        return (
+            GSVC.spreadsheets()
+            .values()
+            .append(
+                spreadsheetId=SSID,
+                range=f"{sheet}!A1",
+                valueInputOption='RAW',
+                insertDataOption='INSERT_ROWS',
+                body={'values': rows},
+            )
+            .execute()
+        )
+
+    result = _exec_with_retry(f"append {sheet}", _action)
+    _invalidate_cache()
+    LOG("SHEETS", f"{sheet}: +{len(rows)} filas")
+    return result
+
 
 def gs_meta():
-    return GSVC.spreadsheets().get(spreadsheetId=SSID).execute().get("sheets", [])
+    def _action():
+        return GSVC.spreadsheets().get(spreadsheetId=SSID).execute().get("sheets", [])
+
+    return _exec_with_retry("meta", _action)
 
 def gs_sheet_id(title):
     for s in gs_meta():
@@ -311,8 +455,10 @@ def update_fechas_sheet(sheet):
 def read_links_from_sheets(sheets):
     all_links = set()
     by = {}
-    for sh in sheets:
-        vals = gs_get(f"{sh}!A1:ZZ")
+    ranges = [_format_range(sh) for sh in sheets]
+    values_map = gs_batch_get(ranges)
+    for sh, rng in zip(sheets, ranges):
+        vals = values_map.get(_normalize_range_name(rng), [])
         if not vals:
             by[sh] = []
             LOG("SHEETS", f"{sh}: vacía")

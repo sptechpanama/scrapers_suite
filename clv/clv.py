@@ -13,7 +13,11 @@ from pathlib import Path
 from urllib.parse import urlparse, urlunparse, unquote
 import pandas as pd
 
-COMMON_DIR = Path(__file__).resolve().parent.parent / "common"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO_ROOT / "data"
+CREDENTIALS_FILE = REPO_ROOT / "credentials" / "service-account.json"
+
+COMMON_DIR = REPO_ROOT / "common"
 if str(COMMON_DIR) not in sys.path:
     sys.path.append(str(COMMON_DIR))
 
@@ -24,16 +28,16 @@ from ficha_utils import detectar_fichas_tokens
 # =========================
 CFG = {
     # ---- Rutas locales (archivos Excel con listas auxiliares) ----
-    "xlsx_todas": r"C:\Users\rodri\fichas\todas_las_fichas.xlsx",
-    "xlsx_con_req": r"C:\Users\rodri\fichas\fichas_con_requisitos.xlsx",
-    "xlsx_sin_req": r"C:\Users\rodri\fichas\fichas_sin_requisitos.xlsx",
-    "xlsx_con_ct": r"C:\Users\rodri\clrir\fichas_con_CT_sin_RS.xlsx",
-    "xlsx_con_rs": r"C:\Users\rodri\clrir\fichas_con_RS.xlsx",
-    "xlsx_palabras": r"C:\Users\rodri\fichas\Palabras_Organizadas.xlsx",
-    "xlsx_meds": r"C:\Users\rodri\clv\lista_medicamentos.xlsx",
+    "xlsx_todas": str(DATA_DIR / "fichas" / "todas_las_fichas.xlsx"),
+    "xlsx_con_req": str(DATA_DIR / "fichas" / "fichas_con_requisitos.xlsx"),
+    "xlsx_sin_req": str(DATA_DIR / "fichas" / "fichas_sin_requisitos.xlsx"),
+    "xlsx_con_ct": str(DATA_DIR / "clrir" / "fichas_con_CT_sin_RS.xlsx"),
+    "xlsx_con_rs": str(DATA_DIR / "clrir" / "fichas_con_RS.xlsx"),
+    "xlsx_palabras": str(DATA_DIR / "fichas" / "Palabras_Organizadas.xlsx"),
+    "xlsx_meds": str(DATA_DIR / "references" / "lista_medicamentos.xlsx"),
 
     # ---- Google Sheets ----
-    "svc_key": r"C:\Users\rodri\cl\serious-app-417920-eed299fa06b5.json",
+    "svc_key": str(CREDENTIALS_FILE),
     "spreadsheet_id": "17hOfP-vMdJ4D7xym1cUp7vAcd8XJPErpY3V-9Ui2tCo",
     "sheets_data": ["cl_abiertas", "cl_abiertas_rir_sin_requisitos", "cl_abiertas_rir_con_ct", "cl_prioritarios"],
     "sheet_desc": "cl_descartes",
