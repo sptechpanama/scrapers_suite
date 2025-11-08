@@ -129,6 +129,17 @@ class ExecutionRequest:
     manual_notes: Optional[str] = None
 
 
+def format_execution_label(execution: ExecutionRequest) -> str:
+    base_label = JOB_NAME_LABELS.get(execution.job.name, execution.job.name)
+    if execution.source == "manual":
+        manual_tag = execution.manual_id
+        if not manual_tag and execution.manual_row is not None:
+            manual_tag = f"fila {execution.manual_row + 1}"
+        manual_tag = manual_tag or "sin-id"
+        return f"{base_label} (manual {manual_tag})"
+    return f"{base_label} ({execution.source})"
+
+
 def build_config_signature(config: OrchestratorConfig) -> tuple:
     signature: list[tuple] = []
     for job in sorted(config.jobs, key=lambda item: item.name):
@@ -473,10 +484,10 @@ def main() -> None:
         logging.info("Job %s agregado a la cola (origen: %s)", job.name, source)
         if manual_request:
             logging.info(
-                "Solicitud manual %s (%s) encolada para job %s",
+                "Solicitud manual %s (%s) encolada para %s",
                 manual_request.get("id") or manual_request.get("row") or "sin-id",
                 manual_request.get("requested_by") or "desconocido",
-                job.name,
+                JOB_NAME_LABELS.get(job.name, job.name),
             )
 
     def worker_loop() -> None:
@@ -489,9 +500,9 @@ def main() -> None:
                 continue
 
             try:
-                label = JOB_NAME_LABELS.get(execution.job.name, execution.job.name)
+                label = format_execution_label(execution)
                 if execution.source == "manual":
-                    logging.info("%s (manual): inicio de ejecucion", label)
+                    logging.info("%s: inicio de ejecucion", label)
 
                 manual_row = execution.manual_row
                 if manual_row is not None:
@@ -512,9 +523,9 @@ def main() -> None:
 
                 if execution.source == "manual":
                     if status == "success":
-                        logging.info("%s (manual): ejecucion exitosa", label)
+                        logging.info("%s: ejecucion exitosa", label)
                     else:
-                        logging.error("%s (manual): ejecucion con error: %s", label, detail or status)
+                        logging.error("%s: ejecucion con error: %s", label, detail or status)
 
                 if manual_row is not None:
                     final_status = "done" if status == "success" else "error"

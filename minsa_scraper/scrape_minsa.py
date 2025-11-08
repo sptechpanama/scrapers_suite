@@ -1,4 +1,5 @@
-"""Scraper de portales pÃÂºblicos del MINSA usando Selenium."""
+﻿# -*- coding: utf-8 -*-
+"""Scraper de portales pÃƒÂƒÃ‚Âºblicos del MINSA usando Selenium."""
 
 
 
@@ -291,7 +292,7 @@ def build_key_series(df: pd.DataFrame, columns: Sequence[str]) -> pd.Series:
 
     if not columns:
 
-        raise ValueError("Se requieren columnas para construir la clave de deduplicación.")
+        raise ValueError("Se requieren columnas para construir la clave de deduplicaciÃ³n.")
 
     if df is None or df.empty:
 
@@ -327,7 +328,7 @@ class DriveUploader:
 
 
 
-    """PequeÃÂ±o helper para subir archivos a Google Drive."""
+    """PequeÃƒÂƒÃ‚Â±o helper para subir archivos a Google Drive."""
 
 
 
@@ -575,7 +576,7 @@ class DriveUploader:
 
 
 
-            raise FileNotFoundError(f"No se encontrÃÂ³ el archivo a subir: {file_path}")
+            raise FileNotFoundError(f"No se encontrÃƒÂƒÃ‚Â³ el archivo a subir: {file_path}")
 
 
 
@@ -751,7 +752,7 @@ class DriveUploader:
 
 
 
-            raise RuntimeError(f"FallÃÂ³ la subida a Drive para {file_name}: {exc}") from exc
+            raise RuntimeError(f"FallÃƒÂƒÃ‚Â³ la subida a Drive para {file_name}: {exc}") from exc
 
 
 
@@ -767,7 +768,7 @@ def create_driver(headless: bool = False) -> Chrome:
 
 
 
-    """Crea una instancia de Chrome lista para automatizaciÃÂ³n."""
+    """Crea una instancia de Chrome lista para automatizaciÃƒÂƒÃ‚Â³n."""
 
 
 
@@ -879,7 +880,7 @@ def wait_for_nonempty_table(
 
 
 
-    """Espera a que la tabla tenga registros reales (no mensajes vacÃÂ­os)."""
+    """Espera a que la tabla tenga registros reales (no mensajes vacÃƒÂƒÃ‚Â­os)."""
 
 
 
@@ -963,7 +964,7 @@ def clean_catalog_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 
-    """Elimina filas del catÃÂ¡logo que corresponden a paginadores o filas vacÃÂ­as."""
+    """Elimina filas del catÃƒÂƒÃ‚Â¡logo que corresponden a paginadores o filas vacÃƒÂƒÃ‚Â­as."""
 
 
 
@@ -1129,7 +1130,7 @@ def drop_numeric_pagination_rows(df: pd.DataFrame) -> pd.DataFrame:
 
             has_value = True
 
-            normalized = text.replace('.', '').replace('â¦', '').replace(' ', '')
+            normalized = text.replace('.', '').replace('Ã¢Â€Â¦', '').replace(' ', '')
 
             if not normalized:
 
@@ -1299,7 +1300,7 @@ def scrape_ctni_fichas(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
 
-    """Extrae las fichas tÃÂ©cnicas publicadas."""
+    """Extrae las fichas tÃƒÂƒÃ‚Â©cnicas publicadas."""
 
 
 
@@ -1340,7 +1341,7 @@ def scrape_ctni_fichas(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
 
-        df["PÃÂ¡gina"] = page
+        df["PÃƒÂƒÃ‚Â¡gina"] = page
 
 
 
@@ -1488,7 +1489,7 @@ def scrape_criterios(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
         df = drop_numeric_pagination_rows(table_to_dataframe(table))
 
-        df["PÃÂ¡gina"] = page
+        df["PÃƒÂƒÃ‚Â¡gina"] = page
 
 
 
@@ -1609,7 +1610,7 @@ def scrape_oferentes(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
 
-    """Descarga los oferentes y sus catÃÂ¡logos completos."""
+    """Descarga los oferentes y sus catÃƒÂƒÃ‚Â¡logos completos."""
 
 
 
@@ -1725,7 +1726,7 @@ def scrape_oferentes(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
 
-                "Oferente::TelÃÂ©fono": text_vals[5] if len(text_vals) > 5 else "",
+                "Oferente::TelÃƒÂƒÃ‚Â©fono": text_vals[5] if len(text_vals) > 5 else "",
 
 
 
@@ -1787,7 +1788,7 @@ def scrape_oferentes(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
             print(
 
-                f"[LOG] Oferentes: procesando '{oferente_label}' (p�gina {page}, fila {page_oferentes})"
+                f"[LOG] Oferentes: procesando '{oferente_label}' (página {page}, fila {page_oferentes})"
 
             )
 
@@ -1836,7 +1837,7 @@ def scrape_oferentes(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
                         catalog_df = clean_catalog_dataframe(table_to_dataframe(catalog_table))
 
-                        print(f"[LOG] Cat�logo p�gina {catalog_page} para '{oferente_label}': {len(catalog_df)} filas")
+                        print(f"[LOG] Catálogo página {catalog_page} para '{oferente_label}': {len(catalog_df)} filas")
 
 
 
@@ -1852,7 +1853,7 @@ def scrape_oferentes(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
 
-                                combined[f"CatÃ¡logo::{col_name}"] = value
+                                combined[f"CatÃƒÂ¡logo::{col_name}"] = value
 
 
 
@@ -1937,7 +1938,7 @@ def scrape_oferentes(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
                         print(
-                            f"[LOG] Oferentes: '{oferente_label}' acumul� {catalog_rows_total} filas de cat�logos"
+                            f"[LOG] Oferentes: '{oferente_label}' acumuló {catalog_rows_total} filas de catálogos"
                         )
 
 
@@ -1947,12 +1948,12 @@ def scrape_oferentes(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
                         print(
-                            f"[LOG] Oferentes: '{oferente_label}' no mostr� cat�logos"
+                            f"[LOG] Oferentes: '{oferente_label}' no mostró catálogos"
                         )
 
 
 
-                    # Cerrar catÃÂ¡logo y regresar al listado principal
+                    # Cerrar catÃƒÂƒÃ‚Â¡logo y regresar al listado principal
 
 
 
@@ -2081,7 +2082,7 @@ def scrape_oferentes(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
         print(
-            f"[LOG] Oferentes: p�gina {page} completada ({page_oferentes} oferentes revisados)"
+            f"[LOG] Oferentes: página {page} completada ({page_oferentes} oferentes revisados)"
         )
 
 
@@ -2140,10 +2141,10 @@ def export_results(results: Iterable[ScrapeResult], output_dir: Path) -> list[Pa
         df.to_excel(output_path, index=False)
         if dedup_columns:
             print(
-                f"[LOG] {result.name}: añadidos {new_rows_count} nuevos (total {len(df)})"
+                f"[LOG] {result.name}: aÃ±adidos {new_rows_count} nuevos (total {len(df)})"
             )
         else:
-            print(f"[LOG] {result.name}: exportadas {len(df)} filas (sin deduplicación)")
+            print(f"[LOG] {result.name}: exportadas {len(df)} filas (sin deduplicaciÃ³n)")
         print(f"[OK] {result.name} -> {output_path}")
         saved_paths.append(output_path)
     return saved_paths
@@ -2201,7 +2202,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 
-        help="Número máximo de páginas por portal (0 recorre todas).",
+        help="NÃºmero mÃ¡ximo de pÃ¡ginas por portal (0 recorre todas).",
 
 
 
@@ -2229,7 +2230,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 
-        help="Portales que quieres omitir en esta ejecuciÃÂ³n.",
+        help="Portales que quieres omitir en esta ejecuciÃƒÂƒÃ‚Â³n.",
 
 
 
@@ -2353,7 +2354,7 @@ def resolve_drive_uploader(args: argparse.Namespace) -> DriveUploader | None:
 
 
 
-        raise SystemExit(f"No se encontrÃÂ³ el archivo de credenciales: {credentials_path}")
+        raise SystemExit(f"No se encontrÃƒÂƒÃ‚Â³ el archivo de credenciales: {credentials_path}")
 
 
 
@@ -2482,7 +2483,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if "criterios" not in args.skip:
 
-        print("[LOG] Iniciando scraping de criterios técnicos...")
+        print("[LOG] Iniciando scraping de criterios tÃ©cnicos...")
 
 
 
@@ -2507,7 +2508,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
         results.append(ScrapeResult("criterios_tecnicos", df_criterios))
-        print(f"[LOG] Criterios técnicos: recuperadas {len(df_criterios)} filas.")
+        print(f"[LOG] Criterios tÃ©cnicos: recuperadas {len(df_criterios)} filas.")
 
 
 
@@ -2517,7 +2518,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if "oferentes" not in args.skip:
 
-        print("[LOG] Iniciando scraping de oferentes y catálogos...")
+        print("[LOG] Iniciando scraping de oferentes y catÃ¡logos...")
 
 
 
@@ -2579,6 +2580,10 @@ if __name__ == "__main__":
 
 
     raise SystemExit(main())
+
+
+
+
 
 
 
