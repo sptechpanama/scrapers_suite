@@ -459,6 +459,11 @@ CATALOGO_COLUMN_ORDER = [
 ]
 
 CRITERIO_TECNICO_PATTERN = re.compile(r"^[A-Za-z]{2,10}-[A-Za-z]{2}-\d{2}-\d{2}$")
+CT_REGEX = re.compile(
+    r"(?:[A-Z.]+[-\s]?){1,4}[A-Z]{2,4}-\d{2,4}-\d{2}-\d{2}(?:/[A-Z])?",
+    re.IGNORECASE,
+)
+
 CATALOG_FIELD_KEYS = tuple(f"Cat\u00E1logo:{column}" for column in CATALOGO_COLUMN_ORDER)
 CATALOG_REQUIRED_KEYS = (
     "Cat\u00E1logo:Nombre del Producto",
@@ -1229,6 +1234,15 @@ def _normalize_catalog_label(label: str) -> str:
     return text
 
 
+def _extract_ct_from_text(text: str) -> str:
+    if not text:
+        return ""
+    match = CT_REGEX.search(text.upper())
+    if not match:
+        return ""
+    return match.group(0).strip()
+
+
 def _build_catalog_alias_map() -> dict[str, str]:
     alias_map: dict[str, str] = {}
     for alias, canonical in CATALOG_ALIAS_SOURCE.items():
@@ -1260,6 +1274,8 @@ def _extract_cell_key_value(cell_text: str, alias_map: dict[str, str]) -> tuple[
         canonical = alias_map.get(normalized)
         if canonical:
             value = " ".join(lines[take:]).strip()
+            if canonical == "Criterio T\u00E9cnico" and not value:
+                value = _extract_ct_from_text(cell_text)
             return canonical, value
     return None
 
@@ -1451,7 +1467,9 @@ def _merge_catalog_row_values(target: dict[str, Any], source: dict[str, Any]) ->
         if not _sanitize_text(value):
             continue
         if column == "Cat\u00E1logo:Criterio T\u00E9cnico" and not CRITERIO_TECNICO_PATTERN.match(value.strip()):
-            continue
+            value = _extract_ct_from_text(value)
+            if not value:
+                continue
         target[column] = value
 
 
