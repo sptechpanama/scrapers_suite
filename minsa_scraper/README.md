@@ -1,6 +1,6 @@
 # Scraper de portales MINSA
 
-Proyecto de automatización basado en Selenium para descargar la información pública de:
+Automatización basada en Selenium para extraer información pública de:
 
 1. [Sistema de Fichas Técnicas](https://ctni.minsa.gob.pa/Home/ConsultarFichas)
 2. [Criterios Técnicos](https://dndmcriterios.minsa.gob.pa/ct/Consultas/frmCRITERIOS_Criterios.aspx)
@@ -14,37 +14,46 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## Uso
+## Uso rápido
 
 ```powershell
-python scrape_minsa.py
+python -m minsa_scraper.scrape_minsa --headless --max-pages 1
 ```
 
-Opciones:
-
-- `--headless`: ejecuta Chrome sin interfaz (útil para servidores).
-- `--max-pages`: número máximo de páginas por portal (usa `0` o no lo definas para recorrer todo; útil fijarlo en `1` durante pruebas rápidas).
-- `--skip fichas criterios oferentes`: omite alguno de los portales.
-- `--upload-to-drive`: al terminar sube los archivos generados a la carpeta de Google Drive configurada.
-- `--drive-folder-id`: ID de la carpeta destino (por defecto `0AMdsC0UugWLkUk9PVA`).
-- `--drive-credentials`: ruta al JSON del service account con permisos de Drive (por defecto `~/orquestador/pure-beach-474203-p1-fdc9557f33d0.json` si existe).
-
-Cada ejecución genera tres archivos `.xlsx` dentro de la carpeta indicada:
-
-- `fichas_ctni.xlsx`
-- `criterios_tecnicos.xlsx`
-- `oferentes_catalogos.xlsx`
-
-Estos archivos siempre se guardan en la carpeta `outputs/` del proyecto. Si ya existen, se sobrescriben.
-
-> Nota: El scraper está preparado para ampliar la paginación una vez validados los resultados de la primera página.
-
-### Subir automáticamente a Google Drive
-
-Para replicar la configuración de GEAPP basta con ejecutar:
+Durante la fase actual recomendamos probar el flujo completo (incluida la exportación consolidada) con:
 
 ```powershell
-python scrape_minsa.py --upload-to-drive
+python -m minsa_scraper.scrape_minsa --oferentes --headless --max-pages 5 --single-excel
 ```
 
-El script reutiliza las credenciales del service account `pure-beach-474203-p1` (carpeta `orquestador`) y actualiza/crea los archivos en la carpeta `Bases_de_datos` (`0AMdsC0UugWLkUk9PVA`). Si quieres usar otra ruta o credenciales basta con sobrescribir `--drive-folder-id` y `--drive-credentials`. Asegúrate de compartir la carpeta destino con `finapp-sa@pure-beach-474203-p1.iam.gserviceaccount.com` con permiso de editor para que la subida funcione.
+### Opciones relevantes
+
+- `--headless`: ejecuta Chrome sin interfaz.
+- `--max-pages`: tope de páginas por portal (`0` recorre todas).
+- `--skip fichas criterios oferentes`: omite uno o más portales.
+- `--single-excel`: genera un único `.xlsx` con las hojas `actos`, `fichas`, `oferentes` y `resumen_run`.
+- `--output-xlsx-dir`: carpeta destino del Excel único (por defecto `outputs/xlsx`).
+- `--oferentes-source catalog|legacy`: usa el cat?logo p?blico por defecto o el flujo legacy por oferente.
+- `--upload-to-drive`, `--drive-folder-id`, `--drive-credentials`: banderas heredadas; **la subida automática está deshabilitada en la Fase 1** y se ignoran aunque se indiquen.
+
+## Salidas
+
+- **Export clásico**: sin `--single-excel` se mantienen los archivos `fichas_ctni.xlsx`, `criterios_tecnicos.xlsx` y `oferentes_catalogos.xlsx` dentro de `outputs/`.
+- **Excel unificado** (`--single-excel`):
+  - Ruta por defecto `outputs/xlsx/scrape_YYYYMMDD_HHMM.xlsx`.
+  - Hojas:
+    - `fichas`: dataset CTNI deduplicado.
+    - `oferentes`: registros del cat?logo p?blico (`Public/Catalogos.aspx`) ya limpios (sin paginadores ni botones de acci?n).
+    - `actos`: mientras no exista un portal propio se reutiliza `criterios_tecnicos`.
+    - `resumen_run`: métricas de la ejecución (`inicio`, `fin`, `duracion_s`, páginas/registros por portal, runtime errors, rutas `debug_html`, ruta del Excel generado).
+
+## Anti-paginación y robustez
+
+- Limpieza agresiva de tablas ASP.NET: elimina filas numéricas, etiquetas de navegación y contenedores `GridPager`; también descarta columnas de acción como “Imprimir”.
+- Navegación segura de catálogos: cada `__doPostBack` se confirma mediante checksum del grid, incluye reintentos con backoff y recuperación ante `Runtime Error`.
+- Métricas expuestas en consola y en `resumen_run`: páginas recorridas, registros guardados, filas descartadas y mismatches por catálogo (con HTML guardado en `outputs/debug_html`).
+- Deduplicación consistente (`DEDUP_CONFIG`) tanto para los archivos clásicos como para el Excel único.
+
+## Google Drive (Fase 1)
+
+La subida automática (`--upload-to-drive`) queda temporalmente deshabilitada. El flag sigue aceptándose para mantener compatibilidad, pero se imprime una advertencia y no se realiza ninguna llamada a la API hasta la Fase 2.
