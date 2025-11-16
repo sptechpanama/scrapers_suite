@@ -458,11 +458,14 @@ CATALOGO_COLUMN_ORDER = [
     "Estado",
 ]
 
-CRITERIO_TECNICO_PATTERN = re.compile(r"^[A-Za-z]{2,10}-[A-Za-z]{2}-\d{2}-\d{2}$")
-CT_REGEX = re.compile(
-    r"(?:[A-Z.]+[-\s]?){1,4}[A-Z]{2,4}-\d{2,4}-\d{2}-\d{2}(?:/[A-Z])?",
-    re.IGNORECASE,
+CT_PATTERN = (
+    r"(?:[A-Z]{2,5}(?:[.\s]+[A-Z]{1,5}){0,3})"
+    r"(?:\s*-\s*[A-Z]{2,4})?"
+    r"\s*-\s*\d{1,5}\s*-\s*\d{2}\s*-\s*\d{2}"
+    r"(?:/(?:R|R/C))?"
 )
+CRITERIO_TECNICO_PATTERN = re.compile(rf"^{CT_PATTERN}$", re.IGNORECASE)
+CT_REGEX = re.compile(CT_PATTERN, re.IGNORECASE)
 
 CATALOG_FIELD_KEYS = tuple(f"Cat\u00E1logo:{column}" for column in CATALOGO_COLUMN_ORDER)
 CATALOG_REQUIRED_KEYS = (
