@@ -281,8 +281,8 @@ def fetch_jobs_from_sheet() -> tuple[List[Dict[str, List[str]]], bool]:
             continue
 
         name = row_data.get("name", "").strip()
-        python_path = row_data.get("python", "").strip()
-        script_path = row_data.get("script", "").strip()
+        python_path = row_data.get("python", "").strip().strip("\"' ")
+        script_path = row_data.get("script", "").strip().strip("\"' ")
         if not name or not python_path or not script_path:
             logging.warning(
                 "Fila %s en %s sin columnas obligatorias (name/python/script); se ignora",
