@@ -59,7 +59,7 @@
                  },
                  {
                      "name": "cotizacion_panama",
-                     "python": "C:/Users/rodri/selenium_cotizacion/venv/Scripts/python.exe",
+                     "python": "C:/Users/rodri/scrapers_repo/.venv/Scripts/python.exe",
                      "script": "C:/Users/rodri/selenium_cotizacion/cotizacion_worker.py",
                      "days_of_week": [],
                      "times": []
