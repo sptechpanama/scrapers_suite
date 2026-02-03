@@ -21,6 +21,9 @@ from apscheduler.events import (
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from pydantic import BaseModel, validator
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 
 from sheets_bridge import (
     CONFIG_SHEET_NAME,
@@ -31,6 +34,8 @@ from sheets_bridge import (
     push_jobs_to_sheet,
     push_state_to_sheet,
     update_manual_request_status,
+    update_manual_request_result,
+    SERVICE_ACCOUNT_FILE,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -134,6 +139,7 @@ class ExecutionRequest:
     manual_requested_by: Optional[str] = None
     manual_requested_at: Optional[str] = None
     manual_notes: Optional[str] = None
+    manual_payload: Optional[str] = None
 
 
 def format_execution_label(execution: ExecutionRequest) -> str:
@@ -272,6 +278,69 @@ def save_state(state: dict) -> None:
         json.dump(state, fp, indent=2, ensure_ascii=False)
 
 
+DEFAULT_COT_DRIVE_FOLDER_ID = os.environ.get(
+    "ORQUESTADOR_COTIZACIONES_FOLDER_ID",
+    "0AOB-QlptrUHYUk9PVA",
+)
+
+
+def _get_drive_client():
+    scopes = ["https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_file(str(SERVICE_ACCOUNT_FILE), scopes=scopes)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def _upload_excel_to_drive(
+    local_path: str,
+    filename: str,
+    folder_id: str | None = None,
+    existing_file_id: str | None = None,
+) -> dict:
+    media = MediaFileUpload(
+        local_path,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        resumable=False,
+    )
+    drive = _get_drive_client()
+    if existing_file_id:
+        return drive.files().update(
+            fileId=existing_file_id,
+            media_body=media,
+            fields="id,name",
+            supportsAllDrives=True,
+        ).execute()
+
+    metadata: Dict[str, object] = {"name": filename}
+    if folder_id:
+        metadata["parents"] = [folder_id]
+    return drive.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id,name",
+        supportsAllDrives=True,
+    ).execute()
+
+
+def _extract_result_json(stdout: str) -> Optional[Dict[str, str]]:
+    if not stdout:
+        return None
+    for line in stdout.splitlines()[::-1]:
+        line = line.strip()
+        if not line.startswith("RESULT_JSON="):
+            continue
+        raw = line.split("RESULT_JSON=", 1)[-1].strip()
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(payload, dict):
+            return payload
+        return None
+    return None
+
+
 def update_last_run(
     job_name: str,
     status: str,
@@ -297,11 +366,22 @@ def update_last_run(
         logging.exception("No se pudo sincronizar el estado con Google Sheets")
 
 
-def run_job(job: JobConfig) -> tuple[str, str]:
+def run_job(job: JobConfig, execution: Optional[ExecutionRequest] = None) -> tuple[str, str]:
     logging.info("Iniciando ejecucion del job %s", job.name)
     cmd = [job.python, job.script]
     env = os.environ.copy()
     env["PYTHONIOENCODING"] = "utf-8"
+    if execution and execution.source == "manual":
+        if execution.manual_row is not None:
+            env["ORQUESTADOR_MANUAL_ROW"] = str(execution.manual_row)
+        if execution.manual_id:
+            env["ORQUESTADOR_MANUAL_ID"] = str(execution.manual_id)
+        if execution.manual_requested_by:
+            env["ORQUESTADOR_MANUAL_REQUESTED_BY"] = str(execution.manual_requested_by)
+        if execution.manual_requested_at:
+            env["ORQUESTADOR_MANUAL_REQUESTED_AT"] = str(execution.manual_requested_at)
+        if execution.manual_payload:
+            env["ORQUESTADOR_MANUAL_PAYLOAD"] = str(execution.manual_payload)
     start_time = datetime.now()
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
@@ -310,6 +390,40 @@ def run_job(job: JobConfig) -> tuple[str, str]:
             logging.info("Job %s finalizo correctamente", job.name)
             if result.stdout:
                 logging.debug("%s stdout:\n%s", job.name, result.stdout.strip())
+            if execution and execution.manual_row is not None:
+                result_json = _extract_result_json(result.stdout)
+                if result_json:
+                    local_path = str(result_json.get("local_path") or "")
+                    file_name = str(result_json.get("file_name") or "")
+                    if local_path and os.path.exists(local_path):
+                        if not file_name:
+                            file_name = os.path.basename(local_path)
+                        try:
+                            upload = _upload_excel_to_drive(
+                                local_path,
+                                file_name,
+                                folder_id=DEFAULT_COT_DRIVE_FOLDER_ID,
+                            )
+                            file_id = upload.get("id", "")
+                            file_url = (
+                                f"https://drive.google.com/file/d/{file_id}/view"
+                                if file_id
+                                else ""
+                            )
+                            update_manual_request_result(
+                                execution.manual_row,
+                                {
+                                    "result_file_id": file_id,
+                                    "result_file_url": file_url,
+                                    "result_file_name": upload.get("name", file_name),
+                                    "result_error": "",
+                                },
+                            )
+                        except Exception as exc:  # pylint: disable=broad-except
+                            update_manual_request_result(
+                                execution.manual_row,
+                                {"result_error": str(exc)},
+                            )
             update_last_run(job.name, "success", started_at=start_time, finished_at=end_time)
             return "success", ""
         else:
@@ -371,6 +485,9 @@ def schedule_jobs(
     enqueue_func,
 ) -> None:
     for job in config.jobs:
+        if not job.days_of_week or not job.times:
+            logging.info("Job %s configurado como manual-only; no se agenda.", job.name)
+            continue
         days = ",".join(job.days_of_week)
         for time_str in job.times:
             hour, minute = map(int, time_str.split(":"))
@@ -500,6 +617,7 @@ def main() -> None:
         manual_requested_by: Optional[str] = None
         manual_requested_at: Optional[str] = None
         manual_notes: Optional[str] = None
+        manual_payload: Optional[str] = None
 
         if manual_request:
             manual_row = to_row_index(manual_request.get("row"))
@@ -507,6 +625,7 @@ def main() -> None:
             manual_requested_by = manual_request.get("requested_by")
             manual_requested_at = manual_request.get("requested_at")
             manual_notes = manual_request.get("notes")
+            manual_payload = manual_request.get("payload")
             if manual_row is not None:
                 enqueue_note = compose_note(
                     manual_notes,
@@ -533,6 +652,7 @@ def main() -> None:
             manual_requested_by=manual_requested_by,
             manual_requested_at=manual_requested_at,
             manual_notes=manual_notes,
+            manual_payload=manual_payload,
         )
         job_queue.put(execution)
         logging.info("Job %s agregado a la cola (origen: %s)", job.name, source)
@@ -574,7 +694,7 @@ def main() -> None:
                             manual_row,
                         )
 
-                status, detail = run_job(execution.job)
+                status, detail = run_job(execution.job, execution)
 
                 if execution.source == "manual":
                     if status == "success":
@@ -636,6 +756,9 @@ def main() -> None:
                 continue
 
             job = job_lookup.get(job_name)
+            if job is None:
+                refresh_config_from_sheet()
+                job = job_lookup.get(job_name)
             if job is None:
                 note = compose_note(
                     manual_request.get("notes"),

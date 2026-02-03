@@ -48,6 +48,11 @@ MANUAL_HEADERS = [
     "requested_at",
     "status",
     "notes",
+    "payload",
+    "result_file_id",
+    "result_file_url",
+    "result_file_name",
+    "result_error",
 ]
 
 SPANISH_DAY_MAP: Dict[str, str] = {
@@ -287,16 +292,22 @@ def fetch_jobs_from_sheet() -> tuple[List[Dict[str, List[str]]], bool]:
             continue
 
         days = _parse_days(row_data.get("days", ""), row_index)
-        if not days:
+        times = _parse_times(row_data.get("times", ""), row_index)
+
+        if not days and not times:
+            logging.info(
+                "Fila %s en %s configurada como manual-only (sin dias ni horarios).",
+                row_index,
+                CONFIG_SHEET_NAME,
+            )
+        elif not days:
             logging.warning(
                 "Fila %s en %s sin dias validos; se ignora",
                 row_index,
                 CONFIG_SHEET_NAME,
             )
             continue
-
-        times = _parse_times(row_data.get("times", ""), row_index)
-        if not times:
+        elif not times:
             logging.warning(
                 "Fila %s en %s sin horarios validos; se ignora",
                 row_index,
@@ -487,3 +498,16 @@ def update_manual_request_status(row_index: int, status: str, notes: str | None 
         else:
             values.append("")
     _update_values(range_a1, [values])
+
+
+def update_manual_request_result(row_index: int, result: Dict[str, str]) -> None:
+    _ensure_headers(MANUAL_SHEET_NAME, MANUAL_HEADERS)
+    if row_index is None:
+        return
+
+    for key, value in result.items():
+        if key not in MANUAL_HEADERS:
+            continue
+        col_index = MANUAL_HEADERS.index(key) + 1
+        range_a1 = f"{MANUAL_SHEET_NAME}!{_column_letter(col_index)}{row_index}"
+        _update_values(range_a1, [[value]])
