@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import itertools
 import logging
 import os
 import queue
@@ -556,7 +557,8 @@ def main() -> None:
     except Exception:  # pylint: disable=broad-except
         logging.exception("No se pudo sincronizar el estado inicial con Google Sheets")
 
-    job_queue: "queue.Queue[ExecutionRequest]" = queue.Queue()
+    job_queue: "queue.PriorityQueue[tuple[int, int, ExecutionRequest]]" = queue.PriorityQueue()
+    queue_counter = itertools.count()
     stop_event = threading.Event()
     protected_job_ids: set[str] = set()
 
@@ -612,6 +614,12 @@ def main() -> None:
         source: str,
         manual_request: Optional[Dict[str, str]] = None,
     ) -> None:
+        priority = 50
+        if source == "manual":
+            # Prioridad alta para cotización Panamá Compra:
+            # termina el scraper en curso y luego se ejecuta antes que el resto de cola.
+            priority = 0 if job.name == "cotizacion_panama" else 10
+
         manual_row: Optional[int] = None
         manual_id: Optional[str] = None
         manual_requested_by: Optional[str] = None
@@ -654,8 +662,13 @@ def main() -> None:
             manual_notes=manual_notes,
             manual_payload=manual_payload,
         )
-        job_queue.put(execution)
-        logging.info("Job %s agregado a la cola (origen: %s)", job.name, source)
+        job_queue.put((priority, next(queue_counter), execution))
+        logging.info(
+            "Job %s agregado a la cola (origen: %s, prioridad: %s)",
+            job.name,
+            source,
+            priority,
+        )
         if manual_request:
             manual_tag, requester = describe_manual_request(manual_request)
             manual_log(
@@ -667,7 +680,7 @@ def main() -> None:
             if stop_event.is_set() and job_queue.empty():
                 break
             try:
-                execution = job_queue.get(timeout=1)
+                _, _, execution = job_queue.get(timeout=1)
             except queue.Empty:
                 continue
 
