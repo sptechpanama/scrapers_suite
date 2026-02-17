@@ -455,6 +455,154 @@ def run_job(job: JobConfig, execution: Optional[ExecutionRequest] = None) -> tup
         return "exception", str(exc)
 
 
+def run_job_interruptible(
+    job: JobConfig,
+    execution: Optional[ExecutionRequest] = None,
+    *,
+    interrupt_event: Optional[threading.Event] = None,
+    on_process_start=None,
+    on_process_end=None,
+) -> tuple[str, str]:
+    logging.info("Iniciando ejecucion del job %s", job.name)
+    cmd = [job.python, job.script]
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    if execution and execution.source == "manual":
+        if execution.manual_row is not None:
+            env["ORQUESTADOR_MANUAL_ROW"] = str(execution.manual_row)
+        if execution.manual_id:
+            env["ORQUESTADOR_MANUAL_ID"] = str(execution.manual_id)
+        if execution.manual_requested_by:
+            env["ORQUESTADOR_MANUAL_REQUESTED_BY"] = str(execution.manual_requested_by)
+        if execution.manual_requested_at:
+            env["ORQUESTADOR_MANUAL_REQUESTED_AT"] = str(execution.manual_requested_at)
+        if execution.manual_payload:
+            env["ORQUESTADOR_MANUAL_PAYLOAD"] = str(execution.manual_payload)
+
+    start_time = datetime.now()
+    process: Optional[subprocess.Popen] = None
+    interrupted = False
+    interrupt_detail = "Interrumpido por prioridad de cotizacion_panama"
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        if on_process_start:
+            on_process_start(execution, process)
+
+        while True:
+            if (
+                interrupt_event is not None
+                and interrupt_event.is_set()
+                and execution is not None
+                and execution.job.name != "cotizacion_panama"
+                and process.poll() is None
+            ):
+                interrupted = True
+                try:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+                except Exception:  # pylint: disable=broad-except
+                    logging.exception("No se pudo interrumpir el proceso del job %s", job.name)
+                break
+            if process.poll() is not None:
+                break
+            time.sleep(0.5)
+
+        stdout, stderr = process.communicate()
+        end_time = datetime.now()
+
+        if interrupted:
+            update_last_run(
+                job.name,
+                "interrupted",
+                started_at=start_time,
+                finished_at=end_time,
+                detail=interrupt_detail,
+            )
+            return "interrupted_preempt", interrupt_detail
+
+        if process.returncode == 0:
+            logging.info("Job %s finalizo correctamente", job.name)
+            if stdout:
+                logging.debug("%s stdout:\n%s", job.name, stdout.strip())
+            if execution and execution.manual_row is not None:
+                result_json = _extract_result_json(stdout)
+                if result_json:
+                    local_path = str(result_json.get("local_path") or "")
+                    file_name = str(result_json.get("file_name") or "")
+                    if local_path and os.path.exists(local_path):
+                        if not file_name:
+                            file_name = os.path.basename(local_path)
+                        try:
+                            upload = _upload_excel_to_drive(
+                                local_path,
+                                file_name,
+                                folder_id=DEFAULT_COT_DRIVE_FOLDER_ID,
+                            )
+                            file_id = upload.get("id", "")
+                            file_url = (
+                                f"https://drive.google.com/file/d/{file_id}/view"
+                                if file_id
+                                else ""
+                            )
+                            update_manual_request_result(
+                                execution.manual_row,
+                                {
+                                    "result_file_id": file_id,
+                                    "result_file_url": file_url,
+                                    "result_file_name": upload.get("name", file_name),
+                                    "result_error": "",
+                                },
+                            )
+                        except Exception as exc:  # pylint: disable=broad-except
+                            update_manual_request_result(
+                                execution.manual_row,
+                                {"result_error": str(exc)},
+                            )
+            update_last_run(job.name, "success", started_at=start_time, finished_at=end_time)
+            return "success", ""
+
+        logging.error("Job %s fallo (return code %s)", job.name, process.returncode)
+        if stdout:
+            logging.error("%s stdout:\n%s", job.name, stdout.strip())
+        if stderr:
+            logging.error("%s stderr:\n%s", job.name, stderr.strip())
+        detail = stderr.strip() if stderr else "return code != 0"
+        update_last_run(
+            job.name,
+            "error",
+            started_at=start_time,
+            finished_at=end_time,
+            detail=detail,
+        )
+        return "error", detail
+    except Exception as exc:  # pylint: disable=broad-except
+        logging.exception("Excepcion no controlada al ejecutar el job %s", job.name)
+        end_time = datetime.now()
+        update_last_run(
+            job.name,
+            "exception",
+            started_at=start_time,
+            finished_at=end_time,
+            detail=str(exc),
+        )
+        return "exception", str(exc)
+    finally:
+        if on_process_end:
+            on_process_end()
+        if interrupt_event is not None:
+            interrupt_event.clear()
+
+
 def format_duration(total_seconds: float) -> str:
     total_seconds_int = int(round(total_seconds))
     hours, remainder = divmod(total_seconds_int, 3600)
@@ -559,6 +707,10 @@ def main() -> None:
 
     job_queue: "queue.PriorityQueue[tuple[int, int, ExecutionRequest]]" = queue.PriorityQueue()
     queue_counter = itertools.count()
+    running_lock = threading.Lock()
+    running_execution: Optional[ExecutionRequest] = None
+    running_process: Optional[subprocess.Popen] = None
+    interrupt_running_event = threading.Event()
     stop_event = threading.Event()
     protected_job_ids: set[str] = set()
 
@@ -613,12 +765,18 @@ def main() -> None:
         job: JobConfig,
         source: str,
         manual_request: Optional[Dict[str, str]] = None,
+        existing_execution: Optional[ExecutionRequest] = None,
+        priority_override: Optional[int] = None,
     ) -> None:
         priority = 50
         if source == "manual":
             # Prioridad alta para cotización Panamá Compra:
             # termina el scraper en curso y luego se ejecuta antes que el resto de cola.
             priority = 0 if job.name == "cotizacion_panama" else 10
+        if source == "resumed":
+            priority = 5
+        if priority_override is not None:
+            priority = int(priority_override)
 
         manual_row: Optional[int] = None
         manual_id: Optional[str] = None
@@ -627,7 +785,10 @@ def main() -> None:
         manual_notes: Optional[str] = None
         manual_payload: Optional[str] = None
 
-        if manual_request:
+        if existing_execution is not None:
+            execution = existing_execution
+            execution.source = source
+        elif manual_request:
             manual_row = to_row_index(manual_request.get("row"))
             manual_id = manual_request.get("id")
             manual_requested_by = manual_request.get("requested_by")
@@ -652,16 +813,16 @@ def main() -> None:
                         manual_row,
                     )
 
-        execution = ExecutionRequest(
-            job=job,
-            source=source,
-            manual_row=manual_row,
-            manual_id=manual_id,
-            manual_requested_by=manual_requested_by,
-            manual_requested_at=manual_requested_at,
-            manual_notes=manual_notes,
-            manual_payload=manual_payload,
-        )
+            execution = ExecutionRequest(
+                job=job,
+                source=source,
+                manual_row=manual_row,
+                manual_id=manual_id,
+                manual_requested_by=manual_requested_by,
+                manual_requested_at=manual_requested_at,
+                manual_notes=manual_notes,
+                manual_payload=manual_payload,
+            )
         job_queue.put((priority, next(queue_counter), execution))
         logging.info(
             "Job %s agregado a la cola (origen: %s, prioridad: %s)",
@@ -674,6 +835,33 @@ def main() -> None:
             manual_log(
                 f"Solicitud manual {manual_tag} ({requester}) encolada para {JOB_NAME_LABELS.get(job.name, job.name)}"
             )
+        if source == "manual" and job.name == "cotizacion_panama":
+            with running_lock:
+                should_preempt = (
+                    running_execution is not None
+                    and running_process is not None
+                    and running_process.poll() is None
+                    and running_execution.job.name != "cotizacion_panama"
+                )
+                running_name = running_execution.job.name if running_execution else ""
+            if should_preempt:
+                manual_log(
+                    f"Solicitud prioritaria de cotización detectada: interrumpiendo {running_name} para ejecutar cotizacion_panama.",
+                    level="warning",
+                )
+                interrupt_running_event.set()
+
+    def _register_running(execution: Optional[ExecutionRequest], process: subprocess.Popen) -> None:
+        nonlocal running_execution, running_process
+        with running_lock:
+            running_execution = execution
+            running_process = process
+
+    def _clear_running() -> None:
+        nonlocal running_execution, running_process
+        with running_lock:
+            running_execution = None
+            running_process = None
 
     def worker_loop() -> None:
         while True:
@@ -707,7 +895,48 @@ def main() -> None:
                             manual_row,
                         )
 
-                status, detail = run_job(execution.job, execution)
+                status, detail = run_job_interruptible(
+                    execution.job,
+                    execution,
+                    interrupt_event=interrupt_running_event,
+                    on_process_start=_register_running,
+                    on_process_end=_clear_running,
+                )
+
+                if status == "interrupted_preempt":
+                    resume_note = compose_note(
+                        execution.manual_notes,
+                        "Interrumpido por prioridad de cotizacion_panama; reencolado automáticamente.",
+                    )
+                    execution.manual_notes = resume_note
+                    if manual_row is not None:
+                        try:
+                            update_manual_request_status(manual_row, "enqueued", resume_note)
+                        except Exception:  # pylint: disable=broad-except
+                            logging.exception(
+                                "No se pudo reencolar la solicitud manual fila %s tras interrupción",
+                                manual_row,
+                            )
+                    resume_execution = ExecutionRequest(
+                        job=execution.job,
+                        source=execution.source,
+                        manual_row=execution.manual_row,
+                        manual_id=execution.manual_id,
+                        manual_requested_by=execution.manual_requested_by,
+                        manual_requested_at=execution.manual_requested_at,
+                        manual_notes=execution.manual_notes,
+                        manual_payload=execution.manual_payload,
+                    )
+                    enqueue_execution(
+                        resume_execution.job,
+                        "resumed",
+                        existing_execution=resume_execution,
+                    )
+                    manual_log(
+                        f"{label}: interrumpido y reencolado para continuar después de cotizacion_panama.",
+                        level="warning",
+                    )
+                    continue
 
                 if execution.source == "manual":
                     if status == "success":
