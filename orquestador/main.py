@@ -391,6 +391,8 @@ def run_job(job: JobConfig, execution: Optional[ExecutionRequest] = None) -> tup
             logging.info("Job %s finalizo correctamente", job.name)
             if result.stdout:
                 logging.debug("%s stdout:\n%s", job.name, result.stdout.strip())
+                if job.name == "cotizacion_panama":
+                    logging.info("%s stdout:\n%s", job.name, result.stdout.strip())
             if execution and execution.manual_row is not None:
                 result_json = _extract_result_json(result.stdout)
                 if result_json:
@@ -534,6 +536,8 @@ def run_job_interruptible(
             logging.info("Job %s finalizo correctamente", job.name)
             if stdout:
                 logging.debug("%s stdout:\n%s", job.name, stdout.strip())
+                if job.name == "cotizacion_panama":
+                    logging.info("%s stdout:\n%s", job.name, stdout.strip())
             if execution and execution.manual_row is not None:
                 result_json = _extract_result_json(stdout)
                 if result_json:
