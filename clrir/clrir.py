@@ -208,16 +208,17 @@ def _throttle_google_calls():
     _LAST_GS_CALL = time.perf_counter()
 
 
-def _exec_with_retry(label, func, retries=4):
+def _exec_with_retry(label, func, retries=5):
+    retry_statuses = {429, 500, 502, 503, 504}
     for attempt in range(retries):
         try:
             _throttle_google_calls()
             return func()
         except HttpError as exc:
             status = getattr(exc.resp, "status", None)
-            if status == 429 and attempt < retries - 1:
-                backoff = min(10, (attempt + 1) * 2)
-                LOG("SHEETS", f"{label}: cuota alcanzada, reintento en {backoff:.1f}s")
+            if status in retry_statuses and attempt < retries - 1:
+                backoff = min(30, (2 ** attempt) * 2)
+                LOG("SHEETS", f"{label}: HTTP {status}, reintento en {backoff:.1f}s")
                 time.sleep(backoff)
                 continue
             raise
@@ -592,7 +593,6 @@ import subprocess
 
 def start_browser():
     opts = Options()
-    opts.add_argument("--headless=new")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1366,768")
     opts.add_argument("--no-sandbox")
@@ -600,7 +600,11 @@ def start_browser():
     opts.add_argument("--log-level=3")
     opts.add_experimental_option("excludeSwitches", ["enable-logging"])
     srv = Service(ChromeDriverManager().install(), log_output=subprocess.DEVNULL)
-    return webdriver.Chrome(service=srv, options=opts)
+    driver = webdriver.Chrome(service=srv, options=opts)
+    # Evita que una URL lenta deje el scraper colgado indefinidamente.
+    driver.set_page_load_timeout(35)
+    driver.set_script_timeout(30)
+    return driver
 
 class PageTools:
     def __init__(self, driver): self.d = driver
@@ -623,6 +627,33 @@ class PageTools:
             return (int(m.group(1)), int(m.group(2))) if m else (None, None)
         except Exception:
             return (None, None)
+    def close_popup(self):
+        # Cierra modal emergente de PanamaCompra si aparece
+        try:
+            xps = [
+                "//button[contains(@class,'btn-close') and (@aria-label='Close' or contains(@title,'cerrar') or contains(.,'×'))]",
+                "//div[contains(@class,'modal')]//button[contains(@class,'btn-close')]",
+            ]
+            for xp in xps:
+                btns = self.d.find_elements(By.XPATH, xp)
+                for b in btns:
+                    try:
+                        if b.is_displayed():
+                            try:
+                                self.d.execute_script("arguments[0].scrollIntoView({block:'center'});", b)
+                            except Exception:
+                                pass
+                            try:
+                                b.click()
+                            except Exception:
+                                self.d.execute_script("arguments[0].click();", b)
+                            time.sleep(0.2)
+                            return True
+                    except StaleElementReferenceException:
+                        continue
+        except Exception:
+            pass
+        return False
     def tbody_ref(self):
         try: return self.d.find_element(By.XPATH, "//tabla-busqueda-avanzada-v3//table/tbody")
         except Exception: return None
@@ -682,7 +713,8 @@ def want_descartar(info):
     if med:
         return True, f"med:{med}"
     fichas_base = info.get('fichas_base') or []
-    if any(code in FICHAS_CON_RS for code in fichas_base):
+    has_sr = any(code in FICHAS_SIN_REQ for code in fichas_base)
+    if (not has_sr) and any(code in FICHAS_CON_RS for code in fichas_base):
         return True, "RS"
     return False, ""
 
@@ -696,14 +728,43 @@ def _first_text_by_xpaths(driver, xps, default="No Disponible"):
             if txt: return txt
     return default
 
+def _wait_any_xpath(driver, xps, to=25):
+    # Espera a que exista al menos UNO de los XPaths.
+    if isinstance(xps, str): xps = [xps]
+    conds = [EC.presence_of_element_located((By.XPATH, xp)) for xp in xps]
+    def any_present(drv):
+        for cond in conds:
+            try:
+                el = cond(drv)
+                if el:
+                    return el
+            except Exception:
+                pass
+        return False
+    WebDriverWait(driver, to).until(any_present)
+
 def scrape(page: PageTools, link: str):
     xp = CFG["xpath_map"]
-    page.d.get(link)
-    page.d.refresh()
-    # Espera a que aparezca el precio (cualquier variante)
-    WebDriverWait(page.d, 25).until(
-        EC.presence_of_element_located((By.XPATH, xp["precio"][0]))
-    )
+    try:
+        page.d.get(link)
+    except TimeoutException:
+        try:
+            page.d.execute_script("window.stop();")
+        except Exception:
+            pass
+        raise
+
+    try:
+        page.d.refresh()
+    except TimeoutException:
+        try:
+            page.d.execute_script("window.stop();")
+        except Exception:
+            pass
+        raise
+
+    # Espera flexible: precio o título, no solo un XPath fijo.
+    _wait_any_xpath(page.d, xp["precio"] + xp["titulo"], to=25)
 
     titulo  = _first_text_by_xpaths(page.d, xp["titulo"])
     precio  = _first_text_by_xpaths(page.d, xp["precio"])
@@ -761,7 +822,7 @@ def scrape(page: PageTools, link: str):
     }
 
 def clasifica(info):
-    return "rs" if info["has_rs"] else ("ct" if info["has_ct"] else ("sr" if info["has_sr"] else "sf"))
+    return "sr" if info["has_sr"] else ("rs" if info["has_rs"] else ("ct" if info["has_ct"] else "sf"))
 
 # =========================
 # MAIN (flujo completo)
@@ -787,6 +848,7 @@ def main():
             time.sleep(5)
 
     time.sleep(1.5)
+    PT.close_popup()
     driver.execute_script("window.scrollBy(0,400)")
     time.sleep(0.3)
 
@@ -794,11 +856,13 @@ def main():
     boton_programadas = WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.XPATH, "//label[@for='btnradio2']")))
     driver.execute_script("arguments[0].click();", boton_programadas)
     time.sleep(0.2)
+    PT.close_popup()
 
     # 50 por página
     select_registros = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, "//select[contains(@class,'form-select')]")))
     Select(select_registros).select_by_visible_text("50")
     time.sleep(0.3)
+    PT.close_popup()
 
     WebDriverWait(driver, 30).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, CFG["css_links"])))
 
@@ -806,6 +870,7 @@ def main():
 
     #page_counter = 0
     while True:
+        PT.close_popup()
         WebDriverWait(driver, 20).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, CFG["css_links"])))
         urls = [u for u in PT.collect_links() if u]
         added = 0
@@ -824,6 +889,7 @@ def main():
         next_disabled = False
         if not last:
             tbody_old = PT.tbody_ref()
+            PT.close_popup()
             if not PT.click_next():
                 next_disabled = True
             else:
@@ -880,7 +946,18 @@ def main():
         try:
             info = scrape(PT, link)
         except TimeoutException:
-            LOG("SCRAPE", "timeout")
+            LOG("SCRAPE", "timeout; salto al siguiente enlace")
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
+            continue
+        except Exception as exc:
+            LOG("SCRAPE", f"error ({type(exc).__name__}): salto al siguiente enlace")
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
             continue
 
         # Descarte por precio/RS/med
