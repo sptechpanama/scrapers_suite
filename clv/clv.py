@@ -172,16 +172,54 @@ from googleapiclient.errors import HttpError
 creds = Credentials.from_service_account_file(CFG["svc_key"])
 GSVC = build('sheets','v4',credentials=creds)
 SSID = CFG["spreadsheet_id"]
+SHEET_CACHE: dict[str, List[List[str]]] = {}
+
+
+def _split_range(rng: str) -> Tuple[str | None, str]:
+    if "!" not in rng:
+        return None, rng
+    sheet, part = rng.split("!", 1)
+    sheet = sheet.strip().strip("'\"")
+    return sheet, part
+
+
+def _write_cache_to_excel(sheet: str, values: List[List[str]]) -> None:
+    try:
+        SHEET_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame(values)
+        df.to_excel(SHEET_CACHE_DIR / f"{sheet}.xlsx", index=False, header=False)
+    except Exception:
+        pass
+
+
+def _fetch_sheet_values(sheet: str) -> List[List[str]]:
+    if sheet in SHEET_CACHE:
+        return SHEET_CACHE[sheet]
+    resp = (
+        GSVC.spreadsheets()
+        .values()
+        .get(spreadsheetId=SSID, range=f"'{sheet}'!A1:ZZ")
+        .execute()
+    )
+    values = resp.get("values", [])
+    SHEET_CACHE[sheet] = values
+    _write_cache_to_excel(sheet, values)
+    return values
 
 def call_with_backoff(action, label: str = "Sheets", max_attempts: int = 5, base_delay: float = 2.0) -> dict:
+    retry_statuses = {429, 500, 502, 503, 504}
     for attempt in range(max_attempts):
         try:
             return action()
         except HttpError as err:
-            if err.resp.status != 429 or attempt == max_attempts - 1:
+            status = getattr(err.resp, "status", None)
+            if status not in retry_statuses or attempt == max_attempts - 1:
                 raise
-            wait = base_delay * (2 ** attempt) + random.uniform(0, 1)
-            LOG("BACKOFF", f"429 en {label}; reintento {attempt + 1}/{max_attempts} en {wait:.1f}s")
+            wait = min(60.0, base_delay * (2 ** attempt) + random.uniform(0, 1))
+            LOG(
+                "BACKOFF",
+                f"HTTP {status} en {label}; reintento {attempt + 1}/{max_attempts} en {wait:.1f}s",
+            )
             time.sleep(wait)
 
 
@@ -511,7 +549,6 @@ import subprocess
 
 def start_browser():
     opts = Options()
-    opts.add_argument("--headless=new")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1366,768")
     opts.add_argument("--no-sandbox")
@@ -519,7 +556,26 @@ def start_browser():
     opts.add_argument("--log-level=3")
     opts.add_experimental_option("excludeSwitches", ["enable-logging"])
     srv = Service(ChromeDriverManager().install(), log_output=subprocess.DEVNULL)
-    return webdriver.Chrome(service=srv, options=opts)
+    driver = webdriver.Chrome(service=srv, options=opts)
+    driver.set_page_load_timeout(35)
+    driver.set_script_timeout(30)
+    try:
+        driver.command_executor.set_timeout(40)
+    except Exception:
+        try:
+            driver.command_executor._conn.timeout = 40
+        except Exception:
+            pass
+    return driver
+
+
+def _restart_scrape_driver(driver):
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    new_driver = start_browser()
+    return new_driver, PageTools(new_driver)
 
 class PageTools:
     def __init__(self, driver): self.d = driver
@@ -542,11 +598,39 @@ class PageTools:
             return (int(m.group(1)), int(m.group(2))) if m else (None, None)
         except Exception:
             return (None, None)
+    def close_popup(self):
+        # Cierra modal emergente de PanamaCompra si aparece
+        try:
+            xps = [
+                "//button[contains(@class,'btn-close') and (@aria-label='Close' or contains(@title,'cerrar'))]",
+                "//div[contains(@class,'modal')]//button[contains(@class,'btn-close')]",
+            ]
+            for xp in xps:
+                btns = self.d.find_elements(By.XPATH, xp)
+                for b in btns:
+                    try:
+                        if b.is_displayed():
+                            try:
+                                self.d.execute_script("arguments[0].scrollIntoView({block:'center'});", b)
+                            except Exception:
+                                pass
+                            try:
+                                b.click()
+                            except Exception:
+                                self.d.execute_script("arguments[0].click();", b)
+                            time.sleep(0.2)
+                            return True
+                    except StaleElementReferenceException:
+                        continue
+        except Exception:
+            pass
+        return False
     def tbody_ref(self):
         try: return self.d.find_element(By.XPATH, "//tabla-busqueda-avanzada-v3//table/tbody")
         except Exception: return None
     def click_next(self):
         try:
+            self.close_popup()
             nxt = self.d.find_element(By.XPATH, "//ul[contains(@class,'pagination')]//a[@aria-label='Next']")
             li = nxt.find_element(By.XPATH, "./ancestor::li[1]")
             disabled = ("disabled" in (nxt.get_attribute("class") or "").lower()) or \
@@ -556,8 +640,16 @@ class PageTools:
             if disabled: return False
             try: self.d.execute_script("arguments[0].scrollIntoView();", nxt); time.sleep(0.15); self.d.execute_script("window.scrollBy(0,-160);")
             except: pass
-            try: nxt.click()
-            except ElementClickInterceptedException: self.d.execute_script("arguments[0].click();", nxt)
+            try:
+                nxt.click()
+            except (ElementClickInterceptedException, ElementNotInteractableException):
+                try:
+                    self.d.execute_script("arguments[0].click();", nxt)
+                except Exception:
+                    self.close_popup()
+                    time.sleep(0.2)
+                    nxt = self.d.find_element(By.XPATH, "//ul[contains(@class,'pagination')]//a[@aria-label='Next']")
+                    self.d.execute_script("arguments[0].click();", nxt)
             return True
         except NoSuchElementException:
             LOG("PAGE", "No Next."); return False
@@ -601,7 +693,8 @@ def want_descartar(info):
     if med:
         return True, f"med:{med}"
     fichas_base = info.get('fichas_base') or []
-    if any(code in FICHAS_CON_RS for code in fichas_base):
+    has_sr = any(code in FICHAS_SIN_REQ for code in fichas_base)
+    if (not has_sr) and any(code in FICHAS_CON_RS for code in fichas_base):
         return True, "RS"
     return False, ""
 
@@ -617,8 +710,22 @@ def _first_text_by_xpaths(driver, xps, default="No Disponible"):
 
 def scrape(page: PageTools, link: str):
     xp = CFG["xpath_map"]
-    page.d.get(link)
-    page.d.refresh()
+    try:
+        page.d.get(link)
+    except TimeoutException:
+        try:
+            page.d.execute_script("window.stop();")
+        except Exception:
+            pass
+        raise
+    try:
+        page.d.refresh()
+    except TimeoutException:
+        try:
+            page.d.execute_script("window.stop();")
+        except Exception:
+            pass
+        raise
     # Espera a que aparezca el precio (cualquier variante)
     WebDriverWait(page.d, 25).until(
         EC.presence_of_element_located((By.XPATH, xp["precio"][0]))
@@ -683,7 +790,7 @@ def scrape(page: PageTools, link: str):
     }
 
 def clasifica(info):
-    return "rs" if info["has_rs"] else ("ct" if info["has_ct"] else ("sr" if info["has_sr"] else "sf"))
+    return "sr" if info["has_sr"] else ("rs" if info["has_rs"] else ("ct" if info["has_ct"] else "sf"))
 
 # =========================
 # MAIN (flujo completo)
@@ -709,6 +816,7 @@ def main():
             time.sleep(5)
 
     time.sleep(1.5)
+    PT.close_popup()
     driver.execute_script("window.scrollBy(0,400)")
     time.sleep(0.3)
 
@@ -716,11 +824,13 @@ def main():
     boton_abiertas = WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.XPATH, "//label[@for='btnradio1']")))
     driver.execute_script("arguments[0].click();", boton_abiertas)
     time.sleep(0.2)
+    PT.close_popup()
 
     # 50 por página
     select_registros = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, "//select[contains(@class,'form-select')]")))
     Select(select_registros).select_by_visible_text("50")
     time.sleep(0.3)
+    PT.close_popup()
 
     WebDriverWait(driver, 30).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, CFG["css_links"])))
 
@@ -728,6 +838,7 @@ def main():
 
     #page_counter = 0
     while True:
+        PT.close_popup()
         WebDriverWait(driver, 20).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, CFG["css_links"])))
         urls = [u for u in PT.collect_links() if u]
         added = 0
@@ -746,6 +857,7 @@ def main():
         next_disabled = False
         if not last:
             tbody_old = PT.tbody_ref()
+            PT.close_popup()
             if not PT.click_next():
                 next_disabled = True
             else:
@@ -798,10 +910,26 @@ def main():
     for key in nuevos:
         link = map_key_raw[key]
         LOG("SCRAPE", link)
-        try:
-            info = scrape(PT, link)
-        except TimeoutException:
-            LOG("SCRAPE", "timeout")
+        info = None
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            t0 = time.time()
+            try:
+                info = scrape(PT, link)
+                LOG("SCRAPE", f"ok ({time.time()-t0:.1f}s)")
+                break
+            except TimeoutException:
+                LOG("SCRAPE", f"timeout (intento {attempt}/{max_attempts})")
+            except Exception as exc:
+                LOG("SCRAPE", f"error {type(exc).__name__} (intento {attempt}/{max_attempts})")
+            try:
+                driver.execute_script("window.stop();")
+            except Exception:
+                pass
+            if attempt < max_attempts:
+                driver, PT = _restart_scrape_driver(driver)
+        if info is None:
+            LOG("SCRAPE", "falló el enlace tras reintentos; salto definitivo")
             continue
 
         # Descarte por precio/RS/med
@@ -900,39 +1028,4 @@ def main():
     LOG("DONE", f"CT={len(datos_ct)} | SinReq={len(datos_sr)} | SinFicha={len(datos_sf)} | Ignorados_RS={len(datos_rs)}")
 
 if __name__ == "__main__":
-    main()     
-CREDENTIALS_FILE = _resolve_credentials_file()
-
-SHEET_CACHE: dict[str, List[List[str]]] = {}
-
-
-def _split_range(rng: str) -> Tuple[str | None, str]:
-    if "!" not in rng:
-        return None, rng
-    sheet, part = rng.split("!", 1)
-    sheet = sheet.strip().strip("'\"")
-    return sheet, part
-
-
-def _write_cache_to_excel(sheet: str, values: List[List[str]]) -> None:
-    try:
-        SHEET_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        df = pd.DataFrame(values)
-        df.to_excel(SHEET_CACHE_DIR / f"{sheet}.xlsx", index=False, header=False)
-    except Exception:
-        pass
-
-
-def _fetch_sheet_values(sheet: str) -> List[List[str]]:
-    if sheet in SHEET_CACHE:
-        return SHEET_CACHE[sheet]
-    resp = (
-        GSVC.spreadsheets()
-        .values()
-        .get(spreadsheetId=SSID, range=f"'{sheet}'!A1:ZZ")
-        .execute()
-    )
-    values = resp.get("values", [])
-    SHEET_CACHE[sheet] = values
-    _write_cache_to_excel(sheet, values)
-    return values
+    main()

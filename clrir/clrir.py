@@ -604,7 +604,24 @@ def start_browser():
     # Evita que una URL lenta deje el scraper colgado indefinidamente.
     driver.set_page_load_timeout(35)
     driver.set_script_timeout(30)
+    # Corta comandos WebDriver que se queden colgados (find/click/execute_script).
+    try:
+        driver.command_executor.set_timeout(40)
+    except Exception:
+        try:
+            driver.command_executor._conn.timeout = 40
+        except Exception:
+            pass
     return driver
+
+
+def _restart_scrape_driver(driver):
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    new_driver = start_browser()
+    return new_driver, PageTools(new_driver)
 
 class PageTools:
     def __init__(self, driver): self.d = driver
@@ -943,21 +960,26 @@ def main():
     for key in nuevos:
         link = map_key_raw[key]
         LOG("SCRAPE", link)
-        try:
-            info = scrape(PT, link)
-        except TimeoutException:
-            LOG("SCRAPE", "timeout; salto al siguiente enlace")
+        info = None
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            t0 = time.time()
+            try:
+                info = scrape(PT, link)
+                LOG("SCRAPE", f"ok ({time.time()-t0:.1f}s)")
+                break
+            except TimeoutException:
+                LOG("SCRAPE", f"timeout (intento {attempt}/{max_attempts})")
+            except Exception as exc:
+                LOG("SCRAPE", f"error {type(exc).__name__} (intento {attempt}/{max_attempts})")
             try:
                 driver.execute_script("window.stop();")
             except Exception:
                 pass
-            continue
-        except Exception as exc:
-            LOG("SCRAPE", f"error ({type(exc).__name__}): salto al siguiente enlace")
-            try:
-                driver.execute_script("window.stop();")
-            except Exception:
-                pass
+            if attempt < max_attempts:
+                driver, PT = _restart_scrape_driver(driver)
+        if info is None:
+            LOG("SCRAPE", "falló el enlace tras reintentos; salto definitivo")
             continue
 
         # Descarte por precio/RS/med
