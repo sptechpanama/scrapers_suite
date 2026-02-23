@@ -7,7 +7,7 @@
 # - Orden de columnas: ... ficha_detectada, Prioritario, Descartar, descripcion, item_1..item_n
 # - Mantiene toda la operativa (paginación, purga, CT/SR/RS/meds, checkboxes, fechas)
 
-import sys, re, time, unicodedata, random, os
+import sys, re, time, unicodedata, random, os, ssl, socket, json
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse, unquote
@@ -17,6 +17,7 @@ import pandas as pd
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = REPO_ROOT / "data"
 SHEET_CACHE_DIR = DATA_DIR / "sheet_cache"
+FAILED_APPEND_DIR = DATA_DIR / "failed_sheet_writes"
 
 
 def _resolve_credentials_file() -> Path:
@@ -170,7 +171,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 creds = Credentials.from_service_account_file(CFG["svc_key"])
-GSVC = build('sheets','v4',credentials=creds)
+GSVC = build('sheets', 'v4', credentials=creds, cache_discovery=False)
 SSID = CFG["spreadsheet_id"]
 SHEET_CACHE: dict[str, List[List[str]]] = {}
 
@@ -192,6 +193,94 @@ def _write_cache_to_excel(sheet: str, values: List[List[str]]) -> None:
         pass
 
 
+def _persist_failed_append(sheet: str, rows: List[List[str]], reason: str) -> None:
+    """Guarda localmente lotes que no se pudieron subir para reintentar en la próxima corrida."""
+    try:
+        FAILED_APPEND_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d")
+        path = FAILED_APPEND_DIR / f"failed_append_{stamp}.jsonl"
+        payload = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "sheet": sheet,
+            "rows": rows,
+            "reason": str(reason)[:500],
+        }
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        LOG("SHEETS", f"{sheet}: lote fallido guardado en fallback ({path.name})")
+    except Exception as exc:
+        LOG("SHEETS", f"{sheet}: no se pudo guardar fallback local ({type(exc).__name__})")
+
+
+def _flush_failed_appends(max_files: int = 20) -> None:
+    """Reintenta subir lotes fallidos de corridas anteriores."""
+    if not FAILED_APPEND_DIR.exists():
+        return
+
+    files = sorted(FAILED_APPEND_DIR.glob("failed_append_*.jsonl"))[:max_files]
+    for path in files:
+        try:
+            lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        except Exception:
+            continue
+        if not lines:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            continue
+
+        remaining = []
+        recovered = 0
+        for ln in lines:
+            try:
+                rec = json.loads(ln)
+            except Exception:
+                continue
+
+            sheet = str(rec.get("sheet", "")).strip()
+            rows = rec.get("rows") or []
+            if not sheet or not rows:
+                continue
+
+            try:
+                exec_with_backoff(
+                    GSVC.spreadsheets()
+                    .values()
+                    .append(
+                        spreadsheetId=SSID,
+                        range=f"{sheet}!A1",
+                        valueInputOption="RAW",
+                        insertDataOption="INSERT_ROWS",
+                        body={"values": rows},
+                    ),
+                    label=f"replay {sheet}",
+                )
+                recovered += len(rows)
+                SHEET_CACHE.pop(sheet, None)
+            except Exception as exc:
+                rec["reason"] = f"replay-failed: {type(exc).__name__}: {str(exc)[:300]}"
+                remaining.append(rec)
+
+        if remaining:
+            try:
+                with path.open("w", encoding="utf-8") as fh:
+                    for rec in remaining:
+                        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+            LOG(
+                "SHEETS",
+                f"Replay parcial {path.name}: recuperadas={recovered} pendientes={len(remaining)}",
+            )
+        else:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            LOG("SHEETS", f"Replay completo {path.name}: recuperadas={recovered}")
+
+
 def _fetch_sheet_values(sheet: str) -> List[List[str]]:
     if sheet in SHEET_CACHE:
         return SHEET_CACHE[sheet]
@@ -206,7 +295,40 @@ def _fetch_sheet_values(sheet: str) -> List[List[str]]:
     _write_cache_to_excel(sheet, values)
     return values
 
-def call_with_backoff(action, label: str = "Sheets", max_attempts: int = 5, base_delay: float = 2.0) -> dict:
+def _rebuild_gsvc() -> None:
+    """Recrea el cliente de Sheets tras errores de transporte."""
+    global GSVC
+    GSVC = build('sheets', 'v4', credentials=creds, cache_discovery=False)
+
+
+def _is_retryable_transport_error(err: Exception) -> bool:
+    retryable_types = (
+        ssl.SSLEOFError,
+        ssl.SSLZeroReturnError,
+        ssl.SSLError,
+        socket.timeout,
+        TimeoutError,
+        ConnectionError,
+    )
+    if isinstance(err, retryable_types):
+        return True
+    if isinstance(err, OSError):
+        msg = str(err).lower()
+        return any(
+            token in msg
+            for token in (
+                "timed out",
+                "eof occurred in violation of protocol",
+                "connection reset",
+                "connection aborted",
+                "broken pipe",
+                "temporary failure",
+            )
+        )
+    return False
+
+
+def call_with_backoff(action, label: str = "Sheets", max_attempts: int = 7, base_delay: float = 2.0) -> dict:
     retry_statuses = {429, 500, 502, 503, 504}
     for attempt in range(max_attempts):
         try:
@@ -220,6 +342,17 @@ def call_with_backoff(action, label: str = "Sheets", max_attempts: int = 5, base
                 "BACKOFF",
                 f"HTTP {status} en {label}; reintento {attempt + 1}/{max_attempts} en {wait:.1f}s",
             )
+            _rebuild_gsvc()
+            time.sleep(wait)
+        except Exception as err:
+            if not _is_retryable_transport_error(err) or attempt == max_attempts - 1:
+                raise
+            wait = min(60.0, base_delay * (2 ** attempt) + random.uniform(0, 1))
+            LOG(
+                "BACKOFF",
+                f"Transporte {type(err).__name__} en {label}; reintento {attempt + 1}/{max_attempts} en {wait:.1f}s",
+            )
+            _rebuild_gsvc()
             time.sleep(wait)
 
 
@@ -261,21 +394,36 @@ def gs_update(rng, values):
 
 
 def gs_append(sheet, rows):
-    if rows:
-        exec_with_backoff(
-            GSVC.spreadsheets()
-            .values()
-            .append(
-                spreadsheetId=SSID,
-                range=f"{sheet}!A1",
-                valueInputOption="RAW",
-                insertDataOption="INSERT_ROWS",
-                body={"values": rows},
-            ),
-            label=f"append {sheet}",
-        )
-        LOG("SHEETS", f"{sheet}: +{len(rows)} filas")
+    if not rows:
+        return
+
+    chunk_size = 150
+    total_ok = 0
+    total_fail = 0
+    for idx in range(0, len(rows), chunk_size):
+        batch = rows[idx : idx + chunk_size]
+        try:
+            exec_with_backoff(
+                GSVC.spreadsheets()
+                .values()
+                .append(
+                    spreadsheetId=SSID,
+                    range=f"{sheet}!A1",
+                    valueInputOption="RAW",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": batch},
+                ),
+                label=f"append {sheet} (lote {idx // chunk_size + 1})",
+            )
+            total_ok += len(batch)
+        except Exception as exc:
+            total_fail += len(batch)
+            LOG("SHEETS", f"{sheet}: fallo lote {idx // chunk_size + 1} ({type(exc).__name__})")
+            _persist_failed_append(sheet, batch, f"{type(exc).__name__}: {exc}")
+
+    if total_ok:
         SHEET_CACHE.pop(sheet, None)
+    LOG("SHEETS", f"{sheet}: ok={total_ok} fail={total_fail}")
 
 
 def gs_meta():
@@ -796,6 +944,7 @@ def clasifica(info):
 # MAIN (flujo completo)
 # =========================
 def main():
+    _flush_failed_appends()
     purge_all()
 
     _, all_links = read_links_from_sheets(CFG["sheets_data"])
