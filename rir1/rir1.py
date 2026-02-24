@@ -41,6 +41,10 @@ if str(COMMON_DIR) not in sys.path:
 
 from ficha_utils import detectar_fichas_tokens
 
+SCRAPE_WAIT_SECONDS = 10
+SCRAPE_FALLBACK_WAIT_SECONDS = 8
+SCRAPE_MAX_ATTEMPTS = 2
+
 
 # =========================
 # CONFIGURACIÓN (CFG)
@@ -659,16 +663,20 @@ def scrape(page: PageTools, link: str):
             pass
         raise
     try:
-        page.d.refresh()
+        _wait_any_xpath(page.d, xp["precio"] + xp["titulo"], to=SCRAPE_WAIT_SECONDS)
     except TimeoutException:
+        LOG("SCRAPE", "sin XPaths esperados en carga inicial; refresh rapido")
         try:
-            page.d.execute_script("window.stop();")
-        except Exception:
-            pass
-        raise
+            page.d.refresh()
+        except TimeoutException:
+            try:
+                page.d.execute_script("window.stop();")
+            except Exception:
+                pass
+            raise
+        _wait_any_xpath(page.d, xp["precio"] + xp["titulo"], to=SCRAPE_FALLBACK_WAIT_SECONDS)
 
-    # Espera flexible: cualquiera de los XPaths de precio o el título (según el HTML real)
-    _wait_any_xpath(page.d, xp["precio"] + xp["titulo"], to=25)
+    # Espera flexible de XPaths ya realizada arriba con timeout corto + fallback.
 
     titulo  = _first_text_by_xpaths(page.d, xp["titulo"])
     precio  = _first_text_by_xpaths(page.d, xp["precio"])
@@ -849,7 +857,7 @@ def main():
         link = map_key_raw[key]
         LOG("SCRAPE", link)
         info = None
-        max_attempts = 2
+        max_attempts = SCRAPE_MAX_ATTEMPTS
         for attempt in range(1, max_attempts + 1):
             t0 = time.time()
             try:
@@ -857,7 +865,9 @@ def main():
                 LOG("SCRAPE", f"ok ({time.time()-t0:.1f}s)")
                 break
             except TimeoutException:
-                LOG("SCRAPE", f"timeout (intento {attempt}/{max_attempts})")
+                # Si no aparecen los XPaths, no insistimos para evitar quedarnos pegados.
+                LOG("SCRAPE", f"timeout (intento {attempt}/{max_attempts}) - salto rapido")
+                break
             except Exception as exc:
                 LOG("SCRAPE", f"error {type(exc).__name__} (intento {attempt}/{max_attempts})")
             try:
@@ -867,6 +877,11 @@ def main():
             if attempt < max_attempts:
                 driver, PT = _restart_scrape_driver(driver)
         if info is None:
+            # Se marca como descarte tecnico para no volver a trabarse con el mismo enlace.
+            try:
+                gs_append(CFG["sheet_desc"], [[link, "skip_timeout_xpath"]])
+            except Exception:
+                pass
             LOG("SCRAPE", "falló el enlace tras reintentos; salto definitivo")
             continue
 
