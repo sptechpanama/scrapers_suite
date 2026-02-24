@@ -8,6 +8,7 @@ import queue
 import subprocess
 import threading
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
@@ -63,6 +64,30 @@ try:
     )
 except ValueError:
     MANUAL_POLL_INTERVAL_SECONDS = 30
+
+try:
+    PIPELINE_LOG_INTERVAL_SECONDS = int(
+        os.environ.get("ORQUESTADOR_PIPELINE_LOG_SECONDS", "20")
+    )
+except ValueError:
+    PIPELINE_LOG_INTERVAL_SECONDS = 20
+
+try:
+    DEFAULT_JOB_TIMEOUT_SECONDS = int(
+        os.environ.get("ORQUESTADOR_DEFAULT_JOB_TIMEOUT_SECONDS", "4200")
+    )
+except ValueError:
+    DEFAULT_JOB_TIMEOUT_SECONDS = 4200
+
+JOB_TIMEOUT_SECONDS_DEFAULTS = {
+    "clv": 5400,
+    "clrir": 5400,
+    "rir1": 5400,
+    "cotizacion_panama": 1200,
+    "sunday_db_minsa": 5400,
+}
+
+MAX_QUEUE_LOG_ITEMS = 12
 
 DEFAULT_JOB_DATA = [
     {
@@ -367,6 +392,38 @@ def update_last_run(
         logging.exception("No se pudo sincronizar el estado con Google Sheets")
 
 
+def resolve_job_timeout_seconds(job_name: str) -> int:
+    env_key = f"ORQUESTADOR_TIMEOUT_{job_name.upper()}"
+    env_value = os.environ.get(env_key)
+    if env_value is not None:
+        try:
+            parsed = int(env_value)
+            if parsed > 0:
+                return parsed
+        except ValueError:
+            logging.warning(
+                "Timeout invalido en %s=%r; se usara valor por defecto",
+                env_key,
+                env_value,
+            )
+
+    default = JOB_TIMEOUT_SECONDS_DEFAULTS.get(job_name, DEFAULT_JOB_TIMEOUT_SECONDS)
+    return max(1, int(default))
+
+
+def _stream_reader(stream, sink: deque) -> None:
+    try:
+        for line in iter(stream.readline, ""):
+            sink.append(line)
+    except Exception:
+        pass
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
 def run_job(job: JobConfig, execution: Optional[ExecutionRequest] = None) -> tuple[str, str]:
     logging.info("Iniciando ejecucion del job %s", job.name)
     cmd = [job.python, job.script]
@@ -482,9 +539,21 @@ def run_job_interruptible(
             env["ORQUESTADOR_MANUAL_PAYLOAD"] = str(execution.manual_payload)
 
     start_time = datetime.now()
+    timeout_seconds = resolve_job_timeout_seconds(job.name)
+    logging.info(
+        "Job %s timeout maximo configurado en %s segundos",
+        job.name,
+        timeout_seconds,
+    )
     process: Optional[subprocess.Popen] = None
     interrupted = False
     interrupt_detail = "Interrumpido por prioridad de cotizacion_panama"
+    timed_out = False
+    timeout_detail = ""
+    stdout_lines: deque[str] = deque(maxlen=4000)
+    stderr_lines: deque[str] = deque(maxlen=4000)
+    stdout_thread: Optional[threading.Thread] = None
+    stderr_thread: Optional[threading.Thread] = None
     try:
         process = subprocess.Popen(
             cmd,
@@ -492,7 +561,25 @@ def run_job_interruptible(
             stderr=subprocess.PIPE,
             text=True,
             env=env,
+            bufsize=1,
         )
+        if process.stdout is not None:
+            stdout_thread = threading.Thread(
+                target=_stream_reader,
+                args=(process.stdout, stdout_lines),
+                name=f"{job.name}-stdout-reader",
+                daemon=True,
+            )
+            stdout_thread.start()
+        if process.stderr is not None:
+            stderr_thread = threading.Thread(
+                target=_stream_reader,
+                args=(process.stderr, stderr_lines),
+                name=f"{job.name}-stderr-reader",
+                daemon=True,
+            )
+            stderr_thread.start()
+
         if on_process_start:
             on_process_start(execution, process)
 
@@ -515,12 +602,68 @@ def run_job_interruptible(
                 except Exception:  # pylint: disable=broad-except
                     logging.exception("No se pudo interrumpir el proceso del job %s", job.name)
                 break
+            elapsed_seconds = (datetime.now() - start_time).total_seconds()
+            if process.poll() is None and elapsed_seconds >= timeout_seconds:
+                timed_out = True
+                timeout_detail = (
+                    f"Timeout alcanzado ({int(elapsed_seconds)}s >= {timeout_seconds}s)"
+                )
+                logging.error(
+                    "Job %s excedio el timeout configurado (%ss). Se terminara el proceso.",
+                    job.name,
+                    timeout_seconds,
+                )
+                try:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=10)
+                except Exception:  # pylint: disable=broad-except
+                    logging.exception(
+                        "No se pudo finalizar el job %s tras timeout", job.name
+                    )
+                break
             if process.poll() is not None:
                 break
             time.sleep(0.5)
 
-        stdout, stderr = process.communicate()
+        if process.poll() is None:
+            try:
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                logging.error(
+                    "Job %s no finalizo tras espera adicional; se forzara kill.",
+                    job.name,
+                )
+                try:
+                    process.kill()
+                    process.wait(timeout=10)
+                except Exception:  # pylint: disable=broad-except
+                    logging.exception("No se pudo forzar cierre del job %s", job.name)
+
+        if stdout_thread:
+            stdout_thread.join(timeout=5)
+        if stderr_thread:
+            stderr_thread.join(timeout=5)
+
+        stdout = "".join(stdout_lines)
+        stderr = "".join(stderr_lines)
         end_time = datetime.now()
+
+        if timed_out:
+            detail = timeout_detail or "Timeout de ejecucion"
+            if stderr.strip():
+                detail = f"{detail} | {stderr.strip()[:240]}"
+            update_last_run(
+                job.name,
+                "timeout",
+                started_at=start_time,
+                finished_at=end_time,
+                detail=detail,
+            )
+            return "timeout", detail
 
         if interrupted:
             update_last_run(
@@ -731,6 +874,41 @@ def main() -> None:
 
     scheduler = BackgroundScheduler(timezone=DEFAULT_TIMEZONE)
 
+    def _queue_snapshot() -> list[str]:
+        with job_queue.mutex:
+            raw_items = list(job_queue.queue)
+        ordered = sorted(raw_items, key=lambda item: (item[0], item[1]))
+        snapshot: list[str] = []
+        for position, (priority, _, pending_execution) in enumerate(ordered, start=1):
+            label = format_execution_label(pending_execution)
+            snapshot.append(f"{position}:{label}[p={priority}]")
+        return snapshot
+
+    def log_pipeline_state(context: str) -> None:
+        with running_lock:
+            current_running = running_execution
+            current_process = running_process
+        running_label = "ninguno"
+        if current_running is not None:
+            running_label = format_execution_label(current_running)
+            if current_process is not None and current_process.poll() is None:
+                running_label = f"{running_label} (PID {current_process.pid})"
+        snapshot = _queue_snapshot()
+        if snapshot:
+            preview = " -> ".join(snapshot[:MAX_QUEUE_LOG_ITEMS])
+            remaining = len(snapshot) - MAX_QUEUE_LOG_ITEMS
+            if remaining > 0:
+                preview = f"{preview} -> ... (+{remaining} mas)"
+        else:
+            preview = "vacia"
+        logging.info(
+            "PIPELINE[%s] running=%s | cola=%d | orden=%s",
+            context,
+            running_label,
+            len(snapshot),
+            preview,
+        )
+
     def describe_job(job_id: str) -> str:
         if job_id in JOB_LABEL_TITLES:
             return JOB_LABEL_TITLES[job_id]
@@ -834,6 +1012,7 @@ def main() -> None:
             source,
             priority,
         )
+        log_pipeline_state(f"enqueue:{job.name}:{source}")
         if manual_request:
             manual_tag, requester = describe_manual_request(manual_request)
             manual_log(
@@ -877,6 +1056,7 @@ def main() -> None:
                 continue
 
             try:
+                log_pipeline_state("dequeue")
                 label = format_execution_label(execution)
                 if execution.source == "manual":
                     manual_log(f"{label}: inicio de ejecucion")
@@ -974,6 +1154,7 @@ def main() -> None:
                         )
             finally:
                 job_queue.task_done()
+                log_pipeline_state("task_done")
 
     def poll_manual_requests() -> None:
         try:
@@ -1091,10 +1272,16 @@ def main() -> None:
     scheduler.start()
     active_jobs = [job for job in scheduler.get_jobs() if job.id not in protected_job_ids]
     logging.info("Scheduler iniciado con %d jobs activos", len(active_jobs))
+    log_pipeline_state("startup")
 
     try:
+        last_pipeline_log = time.monotonic()
         while True:
             time.sleep(1)
+            now = time.monotonic()
+            if now - last_pipeline_log >= PIPELINE_LOG_INTERVAL_SECONDS:
+                log_pipeline_state("heartbeat")
+                last_pipeline_log = now
     except KeyboardInterrupt:
         logging.info("Interrupcion solicitada; cerrando orquestador...")
     finally:
