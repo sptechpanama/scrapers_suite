@@ -450,40 +450,69 @@ def run_job(job: JobConfig, execution: Optional[ExecutionRequest] = None) -> tup
                 logging.debug("%s stdout:\n%s", job.name, result.stdout.strip())
                 if job.name == "cotizacion_panama":
                     logging.info("%s stdout:\n%s", job.name, result.stdout.strip())
+            upload_error = ""
             if execution and execution.manual_row is not None:
                 result_json = _extract_result_json(result.stdout)
-                if result_json:
-                    local_path = str(result_json.get("local_path") or "")
-                    file_name = str(result_json.get("file_name") or "")
-                    if local_path and os.path.exists(local_path):
-                        if not file_name:
-                            file_name = os.path.basename(local_path)
+                if job.name == "cotizacion_panama":
+                    if not result_json:
+                        upload_error = "No se encontro RESULT_JSON en la salida del worker"
+                    else:
+                        local_path = str(result_json.get("local_path") or "")
+                        file_name = str(result_json.get("file_name") or "")
+                        if not local_path:
+                            upload_error = "El worker no devolvio local_path del archivo generado"
+                        elif not os.path.exists(local_path):
+                            upload_error = f"No existe el archivo local para subir a Drive: {local_path}"
+                        else:
+                            if not file_name:
+                                file_name = os.path.basename(local_path)
+                            try:
+                                upload = _upload_excel_to_drive(
+                                    local_path,
+                                    file_name,
+                                    folder_id=DEFAULT_COT_DRIVE_FOLDER_ID,
+                                )
+                                file_id = str(upload.get("id") or "").strip()
+                                if not file_id:
+                                    upload_error = "Google Drive no devolvio file_id para el archivo generado"
+                                file_url = (
+                                    f"https://drive.google.com/file/d/{file_id}/view"
+                                    if file_id
+                                    else ""
+                                )
+                                update_manual_request_result(
+                                    execution.manual_row,
+                                    {
+                                        "result_file_id": file_id,
+                                        "result_file_url": file_url,
+                                        "result_file_name": upload.get("name", file_name),
+                                        "result_error": upload_error,
+                                    },
+                                )
+                                logging.info(
+                                    "Archivo de cotizacion subido a Drive: id=%s nombre=%s carpeta=%s",
+                                    file_id or "sin-id",
+                                    upload.get("name", file_name),
+                                    DEFAULT_COT_DRIVE_FOLDER_ID,
+                                )
+                            except Exception as exc:  # pylint: disable=broad-except
+                                upload_error = f"No se pudo subir a Drive: {exc}"
+                    if upload_error:
                         try:
-                            upload = _upload_excel_to_drive(
-                                local_path,
-                                file_name,
-                                folder_id=DEFAULT_COT_DRIVE_FOLDER_ID,
-                            )
-                            file_id = upload.get("id", "")
-                            file_url = (
-                                f"https://drive.google.com/file/d/{file_id}/view"
-                                if file_id
-                                else ""
-                            )
                             update_manual_request_result(
                                 execution.manual_row,
-                                {
-                                    "result_file_id": file_id,
-                                    "result_file_url": file_url,
-                                    "result_file_name": upload.get("name", file_name),
-                                    "result_error": "",
-                                },
+                                {"result_error": upload_error},
                             )
-                        except Exception as exc:  # pylint: disable=broad-except
-                            update_manual_request_result(
-                                execution.manual_row,
-                                {"result_error": str(exc)},
-                            )
+                        except Exception:
+                            pass
+                        update_last_run(
+                            job.name,
+                            "error",
+                            started_at=start_time,
+                            finished_at=end_time,
+                            detail=upload_error,
+                        )
+                        return "error", upload_error
             update_last_run(job.name, "success", started_at=start_time, finished_at=end_time)
             return "success", ""
         else:
@@ -681,40 +710,76 @@ def run_job_interruptible(
                 logging.debug("%s stdout:\n%s", job.name, stdout.strip())
                 if job.name == "cotizacion_panama":
                     logging.info("%s stdout:\n%s", job.name, stdout.strip())
+            upload_error = ""
             if execution and execution.manual_row is not None:
                 result_json = _extract_result_json(stdout)
-                if result_json:
-                    local_path = str(result_json.get("local_path") or "")
-                    file_name = str(result_json.get("file_name") or "")
-                    if local_path and os.path.exists(local_path):
-                        if not file_name:
-                            file_name = os.path.basename(local_path)
+                if job.name == "cotizacion_panama":
+                    if not result_json:
+                        upload_error = "No se encontro RESULT_JSON en la salida del worker"
                         try:
-                            upload = _upload_excel_to_drive(
-                                local_path,
-                                file_name,
-                                folder_id=DEFAULT_COT_DRIVE_FOLDER_ID,
-                            )
-                            file_id = upload.get("id", "")
-                            file_url = (
-                                f"https://drive.google.com/file/d/{file_id}/view"
-                                if file_id
-                                else ""
-                            )
                             update_manual_request_result(
                                 execution.manual_row,
-                                {
-                                    "result_file_id": file_id,
-                                    "result_file_url": file_url,
-                                    "result_file_name": upload.get("name", file_name),
-                                    "result_error": "",
-                                },
+                                {"result_error": upload_error},
                             )
-                        except Exception as exc:  # pylint: disable=broad-except
-                            update_manual_request_result(
-                                execution.manual_row,
-                                {"result_error": str(exc)},
-                            )
+                        except Exception:
+                            pass
+                    else:
+                        local_path = str(result_json.get("local_path") or "")
+                        file_name = str(result_json.get("file_name") or "")
+                        if not local_path:
+                            upload_error = "El worker no devolvio local_path del archivo generado"
+                        elif not os.path.exists(local_path):
+                            upload_error = f"No existe el archivo local para subir a Drive: {local_path}"
+                        else:
+                            if not file_name:
+                                file_name = os.path.basename(local_path)
+                            try:
+                                upload = _upload_excel_to_drive(
+                                    local_path,
+                                    file_name,
+                                    folder_id=DEFAULT_COT_DRIVE_FOLDER_ID,
+                                )
+                                file_id = str(upload.get("id") or "").strip()
+                                if not file_id:
+                                    upload_error = "Google Drive no devolvio file_id para el archivo generado"
+                                file_url = (
+                                    f"https://drive.google.com/file/d/{file_id}/view"
+                                    if file_id
+                                    else ""
+                                )
+                                update_manual_request_result(
+                                    execution.manual_row,
+                                    {
+                                        "result_file_id": file_id,
+                                        "result_file_url": file_url,
+                                        "result_file_name": upload.get("name", file_name),
+                                        "result_error": upload_error,
+                                    },
+                                )
+                                logging.info(
+                                    "Archivo de cotizacion subido a Drive: id=%s nombre=%s carpeta=%s",
+                                    file_id or "sin-id",
+                                    upload.get("name", file_name),
+                                    DEFAULT_COT_DRIVE_FOLDER_ID,
+                                )
+                            except Exception as exc:  # pylint: disable=broad-except
+                                upload_error = f"No se pudo subir a Drive: {exc}"
+                                try:
+                                    update_manual_request_result(
+                                        execution.manual_row,
+                                        {"result_error": upload_error},
+                                    )
+                                except Exception:
+                                    pass
+                    if upload_error:
+                        update_last_run(
+                            job.name,
+                            "error",
+                            started_at=start_time,
+                            finished_at=end_time,
+                            detail=upload_error,
+                        )
+                        return "error", upload_error
             update_last_run(job.name, "success", started_at=start_time, finished_at=end_time)
             return "success", ""
 
