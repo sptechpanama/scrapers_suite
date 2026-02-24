@@ -5,6 +5,7 @@ import itertools
 import logging
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -367,6 +368,97 @@ def _extract_result_json(stdout: str) -> Optional[Dict[str, str]]:
     return None
 
 
+def _extract_generated_excel_name(stdout: str) -> str:
+    if not stdout:
+        return ""
+    matches = re.findall(
+        r"excel guardado:\s*([^\r\n]+?\.xlsx)\s*$",
+        stdout,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    if not matches:
+        return ""
+    raw = matches[-1].strip().strip("\"'")
+    raw = raw.replace("\\", "/")
+    return os.path.basename(raw)
+
+
+def _candidate_output_dirs(job: JobConfig) -> list[Path]:
+    script_parent = Path(job.script).resolve().parent
+    dirs = [
+        script_parent / "outputs",
+        script_parent,
+        Path("C:/Users/rodri/selenium_cotizacion/outputs"),
+    ]
+    unique: list[Path] = []
+    for item in dirs:
+        try:
+            resolved = item.resolve()
+        except Exception:
+            resolved = item
+        if resolved not in unique:
+            unique.append(resolved)
+    return unique
+
+
+def _recover_result_payload_from_stdout(
+    job: JobConfig,
+    execution: Optional[ExecutionRequest],
+    stdout: str,
+) -> Optional[Dict[str, str]]:
+    result_json = _extract_result_json(stdout)
+    if isinstance(result_json, dict):
+        return result_json
+
+    candidate_names: list[str] = []
+    from_stdout = _extract_generated_excel_name(stdout)
+    if from_stdout:
+        candidate_names.append(from_stdout)
+
+    manual_id = (execution.manual_id or "").strip() if execution else ""
+    if manual_id:
+        candidate_names.append(f"cotizacion_panama_{manual_id}.xlsx")
+
+    seen_names: set[str] = set()
+    for file_name in candidate_names:
+        normalized = file_name.strip()
+        if not normalized or normalized in seen_names:
+            continue
+        seen_names.add(normalized)
+        for directory in _candidate_output_dirs(job):
+            candidate_path = directory / normalized
+            if candidate_path.exists():
+                recovered = {
+                    "local_path": str(candidate_path),
+                    "file_name": normalized,
+                    "recovered_from": "stdout_fallback",
+                }
+                return recovered
+
+    if manual_id:
+        pattern = f"cotizacion_panama_{manual_id}*.xlsx"
+        for directory in _candidate_output_dirs(job):
+            if not directory.exists():
+                continue
+            try:
+                matches = sorted(
+                    directory.glob(pattern),
+                    key=lambda path: path.stat().st_mtime,
+                    reverse=True,
+                )
+            except Exception:
+                matches = []
+            if matches:
+                chosen = matches[0]
+                return {
+                    "local_path": str(chosen),
+                    "file_name": chosen.name,
+                    "recovered_from": "manual_id_glob",
+                }
+
+    return None
+
+
 def update_last_run(
     job_name: str,
     status: str,
@@ -442,7 +534,15 @@ def run_job(job: JobConfig, execution: Optional[ExecutionRequest] = None) -> tup
             env["ORQUESTADOR_MANUAL_PAYLOAD"] = str(execution.manual_payload)
     start_time = datetime.now()
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            encoding="utf-8",
+            errors="replace",
+        )
         end_time = datetime.now()
         if result.returncode == 0:
             logging.info("Job %s finalizo correctamente", job.name)
@@ -452,11 +552,21 @@ def run_job(job: JobConfig, execution: Optional[ExecutionRequest] = None) -> tup
                     logging.info("%s stdout:\n%s", job.name, result.stdout.strip())
             upload_error = ""
             if execution and execution.manual_row is not None:
-                result_json = _extract_result_json(result.stdout)
+                result_json = _recover_result_payload_from_stdout(
+                    job,
+                    execution,
+                    result.stdout,
+                )
                 if job.name == "cotizacion_panama":
                     if not result_json:
-                        upload_error = "No se encontro RESULT_JSON en la salida del worker"
+                        upload_error = "No se encontro RESULT_JSON ni fallback de archivo en stdout del worker"
                     else:
+                        recovered_from = str(result_json.get("recovered_from") or "").strip()
+                        if recovered_from:
+                            logging.warning(
+                                "cotizacion_panama sin RESULT_JSON; se recupero salida por %s",
+                                recovered_from,
+                            )
                         local_path = str(result_json.get("local_path") or "")
                         file_name = str(result_json.get("file_name") or "")
                         if not local_path:
@@ -591,6 +701,8 @@ def run_job_interruptible(
             text=True,
             env=env,
             bufsize=1,
+            encoding="utf-8",
+            errors="replace",
         )
         if process.stdout is not None:
             stdout_thread = threading.Thread(
@@ -712,10 +824,14 @@ def run_job_interruptible(
                     logging.info("%s stdout:\n%s", job.name, stdout.strip())
             upload_error = ""
             if execution and execution.manual_row is not None:
-                result_json = _extract_result_json(stdout)
+                result_json = _recover_result_payload_from_stdout(
+                    job,
+                    execution,
+                    stdout,
+                )
                 if job.name == "cotizacion_panama":
                     if not result_json:
-                        upload_error = "No se encontro RESULT_JSON en la salida del worker"
+                        upload_error = "No se encontro RESULT_JSON ni fallback de archivo en stdout del worker"
                         try:
                             update_manual_request_result(
                                 execution.manual_row,
@@ -724,6 +840,12 @@ def run_job_interruptible(
                         except Exception:
                             pass
                     else:
+                        recovered_from = str(result_json.get("recovered_from") or "").strip()
+                        if recovered_from:
+                            logging.warning(
+                                "cotizacion_panama sin RESULT_JSON; se recupero salida por %s",
+                                recovered_from,
+                            )
                         local_path = str(result_json.get("local_path") or "")
                         file_name = str(result_json.get("file_name") or "")
                         if not local_path:
