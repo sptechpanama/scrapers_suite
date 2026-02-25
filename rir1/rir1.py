@@ -136,6 +136,46 @@ def _norm_txt(s):
     s = "".join(ch for ch in unicodedata.normalize("NFD", s.lower().strip()) if unicodedata.category(ch) != "Mn")
     return re.sub(r"\s+", " ", s)
 
+ACTO_URL_MARKERS = (
+    "solicitud-de-cotizacion",
+    "pliego-de-cargos",
+    "acto-publico",
+    "licitacion",
+)
+
+
+def _looks_dynamic_token(segment: str) -> bool:
+    s = (segment or "").strip()
+    if len(s) < 12:
+        return False
+    if "-" in s:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9_=]+", s))
+
+
+def extract_acto_key_from_url(u: str) -> str:
+    if not u:
+        return ""
+    raw = u.strip()
+    if raw.startswith("/"):
+        raw = f"https://{CFG['host']}{raw}"
+    p = urlparse(raw)
+    text = f"{unquote(p.path or '')}/{unquote(p.fragment or '')}".lower()
+    text = re.sub(r"/{2,}", "/", text)
+
+    for marker in ACTO_URL_MARKERS:
+        m = re.search(rf"/{re.escape(marker)}/([^/?#]+)", text)
+        if m:
+            acto = (m.group(1) or "").strip().upper()
+            if acto:
+                return f"{marker}:{acto}"
+
+    fallback = re.search(r"/(\d{4}(?:-[a-z0-9]+){3,})", text)
+    if fallback:
+        return f"acto:{fallback.group(1).upper()}"
+    return ""
+
+
 def normalize_url(u: str) -> str:
     if not u: return ""
     u = u.strip()
@@ -145,6 +185,10 @@ def normalize_url(u: str) -> str:
     if netloc.endswith("panamacompra.gob.pa") and not netloc.startswith("www."): netloc = "www." + netloc
     path = re.sub(r"/{2,}", "/", unquote(p.path)).rstrip("/") or "/"
     frag = re.sub(r"/{2,}", "/", unquote(p.fragment)).rstrip("/").lower()
+    frag_parts = [part for part in frag.split("/") if part]
+    if len(frag_parts) >= 3 and frag_parts[0] in ACTO_URL_MARKERS and _looks_dynamic_token(frag_parts[-1]):
+        frag_parts = frag_parts[:-1]
+        frag = "/" + "/".join(frag_parts)
     return urlunparse(("https", netloc, path, "", "", frag))
 
 # =========================
@@ -403,10 +447,15 @@ def move_rows_by_checkbox(sources, target, col_chk):
         ensure_header(target, hdr_t)
     idx_t_enlace = find_idx(hdr_t, 'enlace') if hdr_t else None
     existing = set()
+    existing_actos = set()
     if hdr_t and vals_t:
         for r in vals_t[1:]:
             if idx_t_enlace is not None and idx_t_enlace < len(r) and r[idx_t_enlace]:
-                existing.add(normalize_url(r[idx_t_enlace].strip()))
+                raw_existing = r[idx_t_enlace].strip()
+                existing.add(normalize_url(raw_existing))
+                acto_key = extract_acto_key_from_url(raw_existing)
+                if acto_key:
+                    existing_actos.add(acto_key)
     total = 0
     for src in sources:
         vals = gs_get(f"{src}!A1:ZZ")
@@ -421,7 +470,8 @@ def move_rows_by_checkbox(sources, target, col_chk):
             if iC < len(row) and str(row[iC]).strip().upper() == 'TRUE':
                 raw = row[iE].strip()
                 key = normalize_url(raw)
-                if key in existing:
+                acto_key = extract_acto_key_from_url(raw)
+                if key in existing or (acto_key and acto_key in existing_actos):
                     to_del.append(r1)
                     continue
                 out = (row + [''] * (len(hdr_t) - len(row)))[:len(hdr_t)]
@@ -429,6 +479,8 @@ def move_rows_by_checkbox(sources, target, col_chk):
                 to_app.append(out)
                 to_del.append(r1)
                 existing.add(key)
+                if acto_key:
+                    existing_actos.add(acto_key)
         gs_append(target, to_app)
         delete_rows(src, to_del)
         total += len(to_app)
@@ -832,12 +884,34 @@ def main():
 
     # De-duplicación y filtro de nuevos
     map_key_raw = {}
+    map_key_acto = {}
     for u in links:
         k = normalize_url(u)
-        if k and k not in map_key_raw: map_key_raw[k] = u
+        a = extract_acto_key_from_url(u)
+        if not k:
+            continue
+        if a and a in map_key_acto:
+            continue
+        if k not in map_key_raw:
+            map_key_raw[k] = u
+            if a:
+                map_key_acto[a] = k
     existentes_norm = {normalize_url(x) for x in all_links}
+    existentes_acto = {
+        extract_acto_key_from_url(x) for x in all_links if extract_acto_key_from_url(x)
+    }
     descartados_norm = {normalize_url(x) for x in descartes}
-    nuevos = [k for k in map_key_raw if k not in existentes_norm and k not in descartados_norm]
+    descartados_acto = {
+        extract_acto_key_from_url(x) for x in descartes if extract_acto_key_from_url(x)
+    }
+    nuevos = []
+    for k, raw in map_key_raw.items():
+        acto_key = extract_acto_key_from_url(raw)
+        if k in existentes_norm or k in descartados_norm:
+            continue
+        if acto_key and (acto_key in existentes_acto or acto_key in descartados_acto):
+            continue
+        nuevos.append(k)
     LOG("DONE", f"nuevos={len(nuevos)} | existentes={len(existentes_norm)} | descartes={len(descartados_norm)}")
 
     if not nuevos:
@@ -963,7 +1037,51 @@ def main():
             df['Descartar'] = df['Descartar'].replace("", "")
 
         ensure_header(sheet, desired)
-        gs_append(sheet, df[desired].values.tolist())
+        vals_existing = gs_get(f"{sheet}!A1:ZZ")
+        existing_norm = set()
+        existing_acto = set()
+        if vals_existing:
+            hdr_existing = vals_existing[0]
+            idx_existing_enlace = find_idx(hdr_existing, 'enlace')
+            if idx_existing_enlace is not None:
+                for row in vals_existing[1:]:
+                    if idx_existing_enlace >= len(row):
+                        continue
+                    raw = str(row[idx_existing_enlace]).strip()
+                    if not raw:
+                        continue
+                    nk = normalize_url(raw)
+                    ak = extract_acto_key_from_url(raw)
+                    if nk:
+                        existing_norm.add(nk)
+                    if ak:
+                        existing_acto.add(ak)
+
+        idx_new_enlace = desired.index('enlace') if 'enlace' in desired else -1
+        rows_in = df[desired].values.tolist()
+        rows_out = []
+        skipped_dups = 0
+        for row in rows_in:
+            raw = ""
+            if 0 <= idx_new_enlace < len(row):
+                raw = str(row[idx_new_enlace]).strip()
+            nk = normalize_url(raw)
+            ak = extract_acto_key_from_url(raw)
+            if (nk and nk in existing_norm) or (ak and ak in existing_acto):
+                skipped_dups += 1
+                continue
+            rows_out.append(row)
+            if nk:
+                existing_norm.add(nk)
+            if ak:
+                existing_acto.add(ak)
+
+        if skipped_dups:
+            LOG("SHEETS", f"{sheet}: duplicados filtrados={skipped_dups}")
+        if rows_out:
+            gs_append(sheet, rows_out)
+        else:
+            LOG("SHEETS", f"{sheet}: sin filas nuevas para append")
 
     append_df('ap_con_ct', df_prepare(datos_ct))
     append_df('ap_sin_requisitos', df_prepare(datos_sr))
