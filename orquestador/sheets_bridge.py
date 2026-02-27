@@ -6,6 +6,7 @@ import socket
 import ssl
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -155,6 +156,30 @@ def _call_with_backoff(action, label: str, max_attempts: int = 5, base_delay: fl
                 wait,
             )
             time.sleep(wait)
+
+
+def _repair_mojibake(token: str) -> str:
+    """
+    Repara casos comunes de texto mojibake (ej. 'miÃ©rcoles').
+    Si no aplica, devuelve el token original.
+    """
+    if not token:
+        return token
+    try:
+        repaired = token.encode("latin-1", errors="strict").decode("utf-8", errors="strict")
+        return repaired or token
+    except Exception:
+        return token
+
+
+def _normalize_day_token(token: str) -> str:
+    if not token:
+        return ""
+    repaired = _repair_mojibake(str(token))
+    lowered = repaired.strip().lower().replace(".", "")
+    return "".join(
+        ch for ch in unicodedata.normalize("NFD", lowered) if unicodedata.category(ch) != "Mn"
+    ).strip()
 
 def _column_letter(index: int) -> str:
     result: List[str] = []
@@ -329,13 +354,14 @@ def fetch_jobs_from_sheet() -> tuple[List[Dict[str, List[str]]], bool]:
 
 
 def _parse_days(raw_value: str, row_index: int) -> List[str]:
-    tokens = [token.strip().lower() for token in DAY_SPLIT_RE.split(raw_value or "") if token.strip()]
+    tokens = [token.strip() for token in DAY_SPLIT_RE.split(raw_value or "") if token.strip()]
     days: List[str] = []
     for token in tokens:
-        if token in SPANISH_DAY_MAP:
-            normalized = SPANISH_DAY_MAP[token]
-        elif token in VALID_DAY_ABBRS:
-            normalized = token
+        token_norm = _normalize_day_token(token)
+        if token_norm in SPANISH_DAY_MAP:
+            normalized = SPANISH_DAY_MAP[token_norm]
+        elif token_norm in VALID_DAY_ABBRS:
+            normalized = token_norm
         else:
             logging.warning(
                 "Fila %s: valor de dia '%s' no reconocido; se ignora",

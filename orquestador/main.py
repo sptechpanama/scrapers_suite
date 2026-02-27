@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import json
 import itertools
 import logging
@@ -45,6 +46,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 STATE_PATH = BASE_DIR / "state.json"
 DEFAULT_ORQUESTADOR_CREDENTIALS = BASE_DIR / "pure-beach-474203-p1-fdc9557f33d0.json"
+PID_PATH = BASE_DIR / "orquestador.pid"
 
 # Ajusta esta lista para controlar manualmente los horarios sin depender todavía de una interfaz externa.
 DEFAULT_TIMEZONE = "America/Panama"
@@ -79,6 +81,13 @@ try:
     )
 except ValueError:
     DEFAULT_JOB_TIMEOUT_SECONDS = 4200
+
+try:
+    CRON_MISFIRE_GRACE_SECONDS = int(
+        os.environ.get("ORQUESTADOR_CRON_MISFIRE_SECONDS", "21600")
+    )
+except ValueError:
+    CRON_MISFIRE_GRACE_SECONDS = 21600
 
 JOB_TIMEOUT_SECONDS_DEFAULTS = {
     "clv": 5400,
@@ -962,11 +971,68 @@ def compose_note(existing: Optional[str], addition: str) -> str:
     return f"{existing_normalized} | {addition_normalized}"
 
 
+def _is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def acquire_single_instance_guard() -> None:
+    current_pid = os.getpid()
+    if PID_PATH.exists():
+        try:
+            existing_pid = int(PID_PATH.read_text(encoding="utf-8").strip())
+        except Exception:
+            existing_pid = 0
+        if existing_pid and existing_pid != current_pid and _is_pid_running(existing_pid):
+            raise RuntimeError(
+                f"Ya existe una instancia activa del orquestador (PID {existing_pid}). "
+                "Cierra esa instancia antes de iniciar una nueva."
+            )
+
+    PID_PATH.write_text(str(current_pid), encoding="utf-8")
+
+    def _cleanup_pid_file() -> None:
+        try:
+            if PID_PATH.exists():
+                current_value = PID_PATH.read_text(encoding="utf-8").strip()
+                if current_value == str(current_pid):
+                    PID_PATH.unlink()
+        except Exception:
+            pass
+
+    atexit.register(_cleanup_pid_file)
+
+
+def log_config_overview(config: OrchestratorConfig, context: str) -> None:
+    if not config.jobs:
+        logging.warning("%s: configuracion sin jobs", context)
+        return
+    chunks: list[str] = []
+    for job in sorted(config.jobs, key=lambda item: item.name):
+        if job.days_of_week and job.times:
+            chunks.append(
+                f"{job.name}[dias={','.join(job.days_of_week)}|horas={','.join(job.times)}]"
+            )
+        else:
+            chunks.append(f"{job.name}[manual-only]")
+    logging.info("%s: %s", context, " ; ".join(chunks))
+
+
 def schedule_jobs(
     scheduler: BackgroundScheduler,
     config: OrchestratorConfig,
     enqueue_func,
 ) -> None:
+    scheduled_count = 0
     for job in config.jobs:
         if not job.days_of_week or not job.times:
             logging.info("Job %s configurado como manual-only; no se agenda.", job.name)
@@ -976,20 +1042,35 @@ def schedule_jobs(
             hour, minute = map(int, time_str.split(":"))
             trigger = CronTrigger(day_of_week=days, hour=hour, minute=minute, timezone=DEFAULT_TIMEZONE)
             job_id = f"{job.name}-{hour:02d}{minute:02d}"
-            scheduler.add_job(
+            scheduled_job = scheduler.add_job(
                 enqueue_func,
                 trigger=trigger,
                 args=[job, "cron"],
                 id=job_id,
                 name=job.name,
                 replace_existing=True,
+                misfire_grace_time=CRON_MISFIRE_GRACE_SECONDS,
+                coalesce=True,
+            )
+            next_run = (
+                scheduled_job.next_run_time.isoformat(timespec="seconds")
+                if getattr(scheduled_job, "next_run_time", None)
+                else "desconocida"
             )
             logging.info(
-                "Job %s programado a las %s (dias: %s)",
+                "Job %s programado a las %s (dias: %s) | proxima ejecucion: %s",
                 job.name,
                 time_str,
                 days,
+                next_run,
             )
+            scheduled_count += 1
+    if scheduled_count == 0:
+        logging.warning(
+            "No se agendo ningun job por cron. Revisa pc_config (dias/horas) y la hoja activa."
+        )
+    else:
+        logging.info("Total de ejecuciones cron agendadas: %s", scheduled_count)
 
 
 def apply_config_to_scheduler(
@@ -1016,6 +1097,7 @@ def main() -> None:
     )
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
+    acquire_single_instance_guard()
     configure_service_account()
 
     try:
@@ -1027,6 +1109,7 @@ def main() -> None:
     current_config = config
     current_signature = build_config_signature(current_config)
     job_lookup: Dict[str, JobConfig] = {job.name: job for job in current_config.jobs}
+    log_config_overview(current_config, "Configuracion inicial activa")
 
     try:
         current_state = load_state()
@@ -1418,6 +1501,7 @@ def main() -> None:
         current_config = new_config
         current_signature = new_signature
         job_lookup = {job.name: job for job in current_config.jobs}
+        log_config_overview(current_config, "Configuracion actualizada activa")
         apply_config_to_scheduler(
             scheduler,
             current_config,
