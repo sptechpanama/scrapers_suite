@@ -1381,6 +1381,11 @@ def main() -> None:
                 manual_notes=manual_notes,
                 manual_payload=manual_payload,
             )
+        else:
+            execution = ExecutionRequest(
+                job=job,
+                source=source,
+            )
         job_queue.put((priority, next(queue_counter), execution))
         logging.info(
             "Job %s agregado a la cola (origen: %s, prioridad: %s)",
