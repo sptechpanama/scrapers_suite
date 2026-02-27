@@ -89,6 +89,13 @@ try:
 except ValueError:
     CRON_MISFIRE_GRACE_SECONDS = 21600
 
+try:
+    CRON_STARTUP_CATCHUP_SECONDS = int(
+        os.environ.get("ORQUESTADOR_CRON_STARTUP_CATCHUP_SECONDS", "180")
+    )
+except ValueError:
+    CRON_STARTUP_CATCHUP_SECONDS = 180
+
 JOB_TIMEOUT_SECONDS_DEFAULTS = {
     "clv": 5400,
     "clrir": 5400,
@@ -491,6 +498,96 @@ def update_last_run(
         push_state_to_sheet(state)
     except Exception:  # pylint: disable=broad-except
         logging.exception("No se pudo sincronizar el estado con Google Sheets")
+
+
+def _parse_iso_datetime(value: object) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _cron_catchup_slot_key(job_name: str, scheduled_at: datetime) -> str:
+    return f"{job_name}|{scheduled_at.isoformat(timespec='minutes')}"
+
+
+def _job_already_ran_for_slot(job_name: str, scheduled_at: datetime) -> bool:
+    state = load_state()
+    last_run = state.get("last_run", {}).get(job_name, {})
+    started_at = _parse_iso_datetime(last_run.get("started_at"))
+    if started_at is None:
+        return False
+    return started_at >= scheduled_at
+
+
+def _cron_slot_already_caught_up(job_name: str, scheduled_at: datetime) -> bool:
+    state = load_state()
+    slot_key = _cron_catchup_slot_key(job_name, scheduled_at)
+    return bool(state.get("cron_catchup_slots", {}).get(slot_key))
+
+
+def _mark_cron_slot_caught_up(job_name: str, scheduled_at: datetime) -> None:
+    state = load_state()
+    slots = state.setdefault("cron_catchup_slots", {})
+    slot_key = _cron_catchup_slot_key(job_name, scheduled_at)
+    slots[slot_key] = datetime.now().isoformat(timespec="seconds")
+    if len(slots) > 500:
+        kept_keys = sorted(slots.keys())[-300:]
+        state["cron_catchup_slots"] = {key: slots[key] for key in kept_keys}
+    save_state(state)
+
+
+def _maybe_enqueue_recent_cron_catchup(
+    job: JobConfig,
+    *,
+    time_str: str,
+    enqueue_func,
+) -> None:
+    if CRON_STARTUP_CATCHUP_SECONDS <= 0:
+        return
+
+    try:
+        hour, minute = map(int, time_str.split(":"))
+    except ValueError:
+        return
+
+    now_ref = datetime.now()
+    weekday_token = now_ref.strftime("%a").lower()[:3]
+    if weekday_token not in set(job.days_of_week):
+        return
+
+    scheduled_at = now_ref.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    delta_seconds = (now_ref - scheduled_at).total_seconds()
+    if delta_seconds < 0 or delta_seconds > CRON_STARTUP_CATCHUP_SECONDS:
+        return
+
+    if _job_already_ran_for_slot(job.name, scheduled_at):
+        logging.info(
+            "Job %s %s ya habia corrido para esta franja; no se hace catch-up.",
+            job.name,
+            time_str,
+        )
+        return
+
+    if _cron_slot_already_caught_up(job.name, scheduled_at):
+        logging.info(
+            "Job %s %s ya fue recuperado previamente; no se repite catch-up.",
+            job.name,
+            time_str,
+        )
+        return
+
+    _mark_cron_slot_caught_up(job.name, scheduled_at)
+    logging.info(
+        "Job %s perdio la hora %s por %ss al cargar/reprogramar; se encola ejecucion inmediata.",
+        job.name,
+        time_str,
+        int(delta_seconds),
+    )
+    enqueue_func(job, "cron")
 
 
 def resolve_job_timeout_seconds(job_name: str) -> int:
@@ -1067,6 +1164,11 @@ def schedule_jobs(
                 time_str,
                 days,
                 next_run,
+            )
+            _maybe_enqueue_recent_cron_catchup(
+                job,
+                time_str=time_str,
+                enqueue_func=enqueue_func,
             )
             scheduled_count += 1
     if scheduled_count == 0:
