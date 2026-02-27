@@ -1052,9 +1052,13 @@ def schedule_jobs(
                 misfire_grace_time=CRON_MISFIRE_GRACE_SECONDS,
                 coalesce=True,
             )
+            next_run_time = getattr(scheduled_job, "next_run_time", None)
+            if next_run_time is None:
+                now_ref = datetime.now(trigger.timezone) if getattr(trigger, "timezone", None) else datetime.now()
+                next_run_time = trigger.get_next_fire_time(None, now_ref)
             next_run = (
-                scheduled_job.next_run_time.isoformat(timespec="seconds")
-                if getattr(scheduled_job, "next_run_time", None)
+                next_run_time.isoformat(timespec="seconds")
+                if next_run_time is not None
                 else "desconocida"
             )
             logging.info(
