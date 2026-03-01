@@ -553,8 +553,9 @@ def purge_by_fecha(sheet):
         md = re.findall(r"\b(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b", t)
         if not md: return pd.to_datetime(t, dayfirst=True, errors="coerce")
         if len(md) >= 2:
-            d = pd.to_datetime(md[-1], dayfirst=True, errors="coerce")
-            return d + pd.Timedelta(hours=23, minutes=59) if pd.notna(d) else pd.NaT
+            # En cotizaciones programadas el acto deja de mostrarse al llegar la
+            # primera fecha del rango, no la ultima.
+            return pd.to_datetime(md[0], dayfirst=True, errors="coerce")
         base = pd.to_datetime(md[0], dayfirst=True, errors="coerce")
         if pd.isna(base): return pd.NaT
         mt = list(re.finditer(r"\b(\d{1,2})(?::(\d{2}))?\s*([APap]\.?M\.?)?\b", t))
