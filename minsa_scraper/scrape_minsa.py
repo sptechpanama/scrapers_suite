@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 
 import contextlib
+import html as html_lib
 
 
 
@@ -75,6 +76,7 @@ from typing import Any, Callable, Iterable, Sequence, Optional
 
 
 import pandas as pd
+import requests
 
 
 
@@ -2247,6 +2249,119 @@ def click_if_present(driver: Chrome, xpath: str, timeout: int = 5) -> bool:
 
 
 
+def _normalize_ctni_label(value: str) -> str:
+    text = str(value or "")
+    text = "".join(
+        ch for ch in unicodedata.normalize("NFD", text.lower())
+        if unicodedata.category(ch) != "Mn"
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _extract_ver_ficha_links_from_table(driver: Chrome, table: WebElement) -> list[str]:
+    """Extrae href de 'Ver Ficha' en bloque para evitar stale por fila."""
+    try:
+        hrefs = driver.execute_script(
+            """
+            const table = arguments[0];
+            const rows = Array.from(table.querySelectorAll("tbody tr"))
+              .filter(r => !(r.style.display || "").includes("none"));
+            return rows.map((r) => {
+              const a = r.querySelector("a[href*='/Utilities/LoadFicha']");
+              return a ? (a.getAttribute("href") || "") : "";
+            });
+            """,
+            table,
+        )
+    except StaleElementReferenceException:
+        return []
+
+    out: list[str] = []
+    if not isinstance(hrefs, list):
+        return out
+    for href in hrefs:
+        href_text = str(href or "").strip()
+        if not href_text:
+            out.append("")
+        elif href_text.startswith("http://") or href_text.startswith("https://"):
+            out.append(href_text)
+        else:
+            out.append(f"https://ctni.minsa.gob.pa{href_text}")
+    return out
+
+
+def _extract_ctni_cell_value(value_html: str) -> str:
+    input_matches = re.findall(r'value\s*=\s*"([^"]*)"', value_html, flags=re.IGNORECASE)
+    for raw in input_matches:
+        clean = html_lib.unescape(raw).strip()
+        if clean:
+            return clean
+
+    textarea_match = re.search(
+        r"<textarea[^>]*>(.*?)</textarea>",
+        value_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if textarea_match:
+        text = html_lib.unescape(textarea_match.group(1))
+        text = re.sub(r"<[^>]+>", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    text = html_lib.unescape(value_html)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _extract_ctni_detail_fields_from_html(html_text: str) -> tuple[str, str]:
+    row_pattern = re.compile(
+        r"<tr[^>]*>\s*<td[^>]*>(?P<label>.*?)</td>\s*<td[^>]*>(?P<value>.*?)</td>\s*</tr>",
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    detail_rows: list[tuple[str, str]] = []
+    for match in row_pattern.finditer(html_text):
+        raw_label = html_lib.unescape(re.sub(r"<[^>]+>", " ", match.group("label")))
+        label = re.sub(r"\s+", " ", raw_label).strip()
+        if not label:
+            continue
+        value = _extract_ctni_cell_value(match.group("value"))
+        if value:
+            detail_rows.append((_normalize_ctni_label(label), value))
+
+    def _pick_value(priority_labels: list[str]) -> str:
+        for target in priority_labels:
+            target_norm = _normalize_ctni_label(target)
+            for label_norm, value in detail_rows:
+                if label_norm == target_norm and value:
+                    return value
+        for target in priority_labels:
+            target_norm = _normalize_ctni_label(target)
+            for label_norm, value in detail_rows:
+                if target_norm in label_norm and value:
+                    return value
+        return ""
+
+    nombre = _pick_value(["Nombre Genérico", "Nombre"])
+    clase_riesgo = _pick_value(["Clase de Riesgo"])
+    return nombre, clase_riesgo
+
+
+def _fetch_ctni_detail_fields(
+    link: str,
+    *,
+    session: requests.Session,
+    timeout_seconds: int = 30,
+) -> tuple[str, str]:
+    if not link:
+        return "", ""
+    try:
+        response = session.get(link, timeout=timeout_seconds)
+        response.raise_for_status()
+    except Exception as exc:
+        print(f"[WARN] CTNI detalle: no se pudo abrir {link} ({exc})")
+        return "", ""
+    return _extract_ctni_detail_fields_from_html(response.text)
+
+
 def scrape_ctni_fichas(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
@@ -2265,6 +2380,8 @@ def scrape_ctni_fichas(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
     dataframes: list[pd.DataFrame] = []
+    detail_cache: dict[str, tuple[str, str]] = {}
+    detail_session = requests.Session()
 
 
 
@@ -2289,6 +2406,43 @@ def scrape_ctni_fichas(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
         df = table_to_dataframe(table)
+        links = _extract_ver_ficha_links_from_table(driver, table)
+        if len(links) < len(df):
+            links.extend([""] * (len(df) - len(links)))
+        elif len(links) > len(df):
+            links = links[: len(df)]
+
+        nombres_completos: list[str] = []
+        clases_riesgo: list[str] = []
+        total_links = len(links)
+        for idx, link in enumerate(links, start=1):
+            if not link:
+                nombres_completos.append("")
+                clases_riesgo.append("")
+                continue
+            detail = detail_cache.get(link)
+            if detail is None:
+                detail = _fetch_ctni_detail_fields(link, session=detail_session)
+                detail_cache[link] = detail
+            nombres_completos.append(detail[0])
+            clases_riesgo.append(detail[1])
+            if idx % 25 == 0 or idx == total_links:
+                print(f"[LOG] CTNI: detalle pagina {page} {idx}/{total_links}")
+
+        nombres_series = pd.Series(nombres_completos, index=df.index, dtype="object")
+        clases_series = pd.Series(clases_riesgo, index=df.index, dtype="object")
+        df["Nombre Completo"] = nombres_series
+        df["Clase de Riesgo"] = clases_series
+
+        target_name_col: str | None = None
+        for col in df.columns:
+            norm_col = _normalize_ctni_label(col)
+            if norm_col.startswith("nombre gen") or norm_col == "nombre":
+                target_name_col = col
+                break
+        if target_name_col:
+            mask = nombres_series.fillna("").str.strip().ne("")
+            df.loc[mask, target_name_col] = nombres_series.loc[mask]
 
 
 
@@ -2341,6 +2495,7 @@ def scrape_ctni_fichas(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
 
+    detail_session.close()
     return pd.concat(dataframes, ignore_index=True) if dataframes else pd.DataFrame()
 
 
