@@ -8,6 +8,7 @@ modules do not incur repeated Excel reads or regex compilation.
 from __future__ import annotations
 
 import re
+import unicodedata
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, List, Set, Tuple
@@ -15,6 +16,16 @@ from typing import Dict, Iterable, List, Set, Tuple
 import pandas as pd
 
 FICHAS_DEFAULT_PATH = Path(r"C:\Users\rodri\fichas\fichas-y-nombre.xlsx")
+
+
+def _normalize_name(value: str | None) -> str:
+    text = "" if value is None else str(value)
+    text = "".join(
+        ch for ch in unicodedata.normalize("NFD", text.lower())
+        if unicodedata.category(ch) != "Mn"
+    )
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _path_key(path: Path | str | None) -> str:
@@ -36,12 +47,19 @@ def _load_fichas(path_key: str) -> Tuple[Dict[str, str], Set[str]]:
     fichas_dict: Dict[str, str] = {}
     fichas_set: Set[str] = set()
     for _, row in df.iterrows():
-        ficha = str(row.iloc[0]).strip()
-        if not ficha or len(ficha) > 6:
+        raw_ficha = row.iloc[0]
+        if pd.isna(raw_ficha):
             continue
+        ficha_match = re.search(r"(?<!\d)(\d{1,6})(?!\d)", str(raw_ficha))
+        if not ficha_match:
+            continue
+        ficha = ficha_match.group(1).lstrip("0") or "0"
         fichas_set.add(ficha)
         if len(row) > 1:
-            nombre = str(row.iloc[1]).strip().lower()
+            raw_nombre = row.iloc[1]
+            if pd.isna(raw_nombre):
+                continue
+            nombre = _normalize_name(str(raw_nombre))
             if nombre:
                 fichas_dict[nombre] = ficha
     return fichas_dict, fichas_set
@@ -52,7 +70,13 @@ def _compile_patterns(path_key: str) -> Tuple[List[Tuple[re.Pattern[str], str]],
     nombres, codigos = _load_fichas(path_key)
     patrones_numericos: List[Tuple[re.Pattern[str], str]] = []
     for ficha in sorted(codigos):
-        patrones_numericos.append((re.compile(rf"(?<![\w\d]){re.escape(ficha)}(?![\w\d])"), ficha))
+        # Acepta codigos con o sin '*' pegado (ej: 43358 o 43358*).
+        patrones_numericos.append(
+            (
+                re.compile(rf"(?<![0-9A-Za-z]){re.escape(ficha)}(?:\s*\*)?(?![0-9A-Za-z])"),
+                ficha,
+            )
+        )
 
     patrones_nombres: Dict[str, Tuple[re.Pattern[str], str]] = {}
     for nombre, ficha in nombres.items():
@@ -104,7 +128,7 @@ def detectar_fichas_tokens(
         return []
     path_key = _path_key(path)
     patrones_num, patrones_nom = _compile_patterns(path_key)
-    texto_safe = texto.lower()
+    texto_safe = _normalize_name(texto)
 
     tokens: List[str] = []
     bases_detectadas: Set[str] = set()
