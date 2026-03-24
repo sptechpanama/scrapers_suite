@@ -34,18 +34,19 @@ def _path_key(path: Path | str | None) -> str:
 
 
 @lru_cache(maxsize=4)
-def _load_fichas(path_key: str) -> Tuple[Dict[str, str], Set[str]]:
+def _load_fichas(path_key: str) -> Tuple[Dict[str, str], Set[str], Set[str]]:
     path = Path(path_key)
     if not path.exists():
-        return {}, set()
+        return {}, set(), set()
 
     try:
         df = pd.read_excel(path)
     except Exception:
-        return {}, set()
+        return {}, set(), set()
 
     fichas_dict: Dict[str, str] = {}
     fichas_set: Set[str] = set()
+    nombres_truncados: Set[str] = set()
     for _, row in df.iterrows():
         raw_ficha = row.iloc[0]
         if pd.isna(raw_ficha):
@@ -59,15 +60,18 @@ def _load_fichas(path_key: str) -> Tuple[Dict[str, str], Set[str]]:
             raw_nombre = row.iloc[1]
             if pd.isna(raw_nombre):
                 continue
-            nombre = _normalize_name(str(raw_nombre))
+            raw_nombre_str = str(raw_nombre)
+            nombre = _normalize_name(raw_nombre_str)
             if nombre:
                 fichas_dict[nombre] = ficha
-    return fichas_dict, fichas_set
+                if "..." in raw_nombre_str or "…" in raw_nombre_str:
+                    nombres_truncados.add(nombre)
+    return fichas_dict, fichas_set, nombres_truncados
 
 
 @lru_cache(maxsize=4)
 def _compile_patterns(path_key: str) -> Tuple[List[Tuple[re.Pattern[str], str]], Dict[str, Tuple[re.Pattern[str], str]]]:
-    nombres, codigos = _load_fichas(path_key)
+    nombres, codigos, nombres_truncados = _load_fichas(path_key)
     patrones_numericos: List[Tuple[re.Pattern[str], str]] = []
     for ficha in sorted(codigos):
         # Acepta codigos con o sin '*' pegado (ej: 43358 o 43358*).
@@ -80,8 +84,9 @@ def _compile_patterns(path_key: str) -> Tuple[List[Tuple[re.Pattern[str], str]],
 
     patrones_nombres: Dict[str, Tuple[re.Pattern[str], str]] = {}
     for nombre, ficha in nombres.items():
+        suffix = r"(?:[a-z0-9]*)" if nombre in nombres_truncados else ""
         patrones_nombres[nombre] = (
-            re.compile(rf"(?<![\w\d]){re.escape(nombre)}(?![\w\d])"),
+            re.compile(rf"(?<![a-z0-9]){re.escape(nombre)}{suffix}(?![a-z0-9])"),
             ficha,
         )
     return patrones_numericos, patrones_nombres
@@ -89,7 +94,8 @@ def _compile_patterns(path_key: str) -> Tuple[List[Tuple[re.Pattern[str], str]],
 
 def load_valid_fichas_con_nombres(path: Path | str | None = None) -> Tuple[Dict[str, str], Set[str]]:
     """Return (name->code map, valid numeric codes)."""
-    return _load_fichas(_path_key(path))
+    nombres, codigos, _ = _load_fichas(_path_key(path))
+    return nombres, codigos
 
 
 def get_fichas_codigos(path: Path | str | None = None) -> Set[str]:
