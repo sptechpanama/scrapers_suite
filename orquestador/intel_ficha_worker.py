@@ -8,6 +8,7 @@ import sqlite3
 import time
 import uuid
 import traceback
+import unicodedata
 from datetime import datetime
 from html import unescape
 from pathlib import Path
@@ -59,8 +60,13 @@ def _clean(v: object) -> str:
 
 def _norm(v: object) -> str:
     t = _clean(v).lower()
-    for a, b in [("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"), ("ú", "u"), ("ñ", "n")]:
-        t = t.replace(a, b)
+    if not t:
+        return ""
+    # Normalizacion robusta para columnas/valores con acentos y simbolos (°/º).
+    t = unicodedata.normalize("NFKD", t)
+    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    t = t.replace("°", " ").replace("º", " ").replace("ª", " ")
+    t = t.replace("?", " ")
     t = re.sub(r"[^a-z0-9]+", " ", t)
     return re.sub(r"\s+", " ", t).strip()
 
@@ -534,31 +540,137 @@ def _catalog_map() -> dict[str, dict[str, str]]:
         df = pd.read_excel(src)
     except Exception:
         return {}
-    cmap = {_norm(c): c for c in df.columns}
-    cprov = next((cmap[k] for k in cmap if "oferente" in k or "razon social" in k or "nombre comercial" in k), "")
-    cficha = next((cmap[k] for k in cmap if "ficha" in k), "")
-    cmarca = next((cmap[k] for k in cmap if "marca" in k), "")
-    cmodelo = next((cmap[k] for k in cmap if "modelo" in k or "n de catalogo" in k), "")
-    cpais = next((cmap[k] for k in cmap if "pais" in k), "")
+    cols = [(_norm(c), c) for c in df.columns]
+
+    def _pick_exact(names: list[str]) -> str:
+        wanted = {n.strip() for n in names}
+        for n, c in cols:
+            if n in wanted:
+                return c
+        return ""
+
+    def _pick_contains(required: list[str], excluded: list[str] | None = None) -> str:
+        excl = excluded or []
+        for n, c in cols:
+            if all(tok in n for tok in required) and not any(bad in n for bad in excl):
+                return c
+        return ""
+
+    # Prioridades de columnas para evitar confundir "Numero de Oferente" con "Oferente".
+    cprov = (
+        _pick_exact(["oferente", "proveedor", "razon social", "nombre comercial"])
+        or _pick_contains(["oferente"], excluded=["numero"])
+        or _pick_contains(["proveedor"])
+    )
+    cficha = _pick_contains(["ficha"])
+    cmarca = _pick_exact(["marca"]) or _pick_contains(["marca"])
+    cmodelo = _pick_contains(["modelo"]) or _pick_contains(["catalogo"])
+    cpais = (
+        _pick_contains(["pais", "origen"])
+        or _pick_contains(["origen"])
+        or _pick_contains(["procedencia"])
+    )
     if not cprov:
         return {}
+
+    def _ficha_digits(v: object) -> str:
+        raw = _clean(v)
+        if not raw:
+            return ""
+        m = re.fullmatch(r"\s*(\d+)(?:\.0+)?\s*", raw)
+        if m:
+            return m.group(1)
+        return re.sub(r"\D", "", raw)
+
+    def _score(rec: dict[str, str]) -> int:
+        return int(bool(_clean(rec.get("marca", "")))) + int(bool(_clean(rec.get("modelo", "")))) + int(bool(_clean(rec.get("pais_origen", ""))))
+
     out: dict[str, dict[str, str]] = {}
     for _, r in df.fillna("").iterrows():
         prov = _norm(r.get(cprov, ""))
         if not prov:
             continue
-        fnum = re.sub(r"\D", "", _clean(r.get(cficha, ""))) if cficha else ""
+        rec = {
+            "marca": _clean(r.get(cmarca, "")) if cmarca else "",
+            "modelo": _clean(r.get(cmodelo, "")) if cmodelo else "",
+            "pais_origen": _clean(r.get(cpais, "")) if cpais else "",
+        }
+        rec["__score"] = str(_score(rec))
+
+        fnum = _ficha_digits(r.get(cficha, "")) if cficha else ""
         key = f"{fnum}|{prov}" if fnum else f"|{prov}"
-        if key in out:
-            continue
-        out[key] = {"marca": _clean(r.get(cmarca, "")) if cmarca else "", "modelo": _clean(r.get(cmodelo, "")) if cmodelo else "", "pais_origen": _clean(r.get(cpais, "")) if cpais else ""}
+        if key not in out or int(rec["__score"]) > int(out[key].get("__score", "0")):
+            out[key] = rec
+
+        # Fallback por proveedor (si luego no coincide ficha exacta).
+        pkey = f"prov|{prov}"
+        if pkey not in out or int(rec["__score"]) > int(out[pkey].get("__score", "0")):
+            out[pkey] = rec
     return out
 
 
 def _catalog_lookup(cmap: dict[str, dict[str, str]], ficha: str, proveedor: str) -> dict[str, str]:
+    def _name_score(a: str, b: str) -> float:
+        if not a or not b:
+            return 0.0
+        if a == b:
+            return 1.0
+        ta = [x for x in a.split() if x not in {"s", "a", "sa", "de", "del", "la", "y"}]
+        tb = [x for x in b.split() if x not in {"s", "a", "sa", "de", "del", "la", "y"}]
+        if not ta or not tb:
+            return 0.0
+        sa, sb = set(ta), set(tb)
+        inter = len(sa & sb)
+        base = inter / max(len(sa), len(sb))
+        if a in b or b in a:
+            base += 0.25
+        return min(base, 1.0)
+
     p = _norm(proveedor)
     f = re.sub(r"\D", "", ficha)
-    return cmap.get(f"{f}|{p}") or cmap.get(f"|{p}") or {"marca": "", "modelo": "", "pais_origen": ""}
+    rec = cmap.get(f"{f}|{p}") or cmap.get(f"|{p}")
+    if not rec and p and f:
+        # Fuzzy prioritario dentro de la misma ficha.
+        best_rec: dict[str, str] | None = None
+        best_score = 0.0
+        prefix = f"{f}|"
+        for k, v in cmap.items():
+            if not k.startswith(prefix):
+                continue
+            pk = k[len(prefix):]
+            score = _name_score(p, pk)
+            if score > best_score:
+                best_score = score
+                best_rec = v
+        if best_rec is not None and best_score >= 0.5:
+            rec = best_rec
+
+    if not rec:
+        rec = cmap.get(f"prov|{p}")
+
+    if not rec and p:
+        # Fuzzy fallback global por proveedor (solo si no hubo match por ficha).
+        best: dict[str, str] | None = None
+        best_score = 0.0
+        for k, v in cmap.items():
+            if not k.startswith("prov|"):
+                continue
+            pk = k[5:]
+            if not pk:
+                continue
+            score = _name_score(p, pk)
+            if score > best_score:
+                best = v
+                best_score = score
+        if best is not None and best_score >= 0.75:
+            rec = best
+    if not rec:
+        return {"marca": "", "modelo": "", "pais_origen": ""}
+    return {
+        "marca": _clean(rec.get("marca", "")),
+        "modelo": _clean(rec.get("modelo", "")),
+        "pais_origen": _clean(rec.get("pais_origen", "")),
+    }
 
 
 def _acts_for_ficha(db: Path, ficha: str) -> pd.DataFrame:
@@ -937,6 +1049,9 @@ def main() -> int:
             d_act_oc_ent = (d_act_oc + entrega) if d_act_oc > 0 and entrega > 0 else max(d_act_oc, 0.0)
 
             cat = _catalog_lookup(cmap, ficha, proveedor)
+            marca_val = _clean(cat.get("marca", ""))
+            modelo_val = _clean(cat.get("modelo", ""))
+            pais_val = _clean(cat.get("pais_origen", ""))
             unit_num = float(info.get("unit", 0) or 0)
             pref_num = float(pref or 0)
             fecha_oc_out: object = fecha_oc
@@ -952,6 +1067,16 @@ def main() -> int:
                 obs = (obs + " | " if obs else "") + "Estado DB='Desierto' pero se detecto evidencia de precio/OC en el acto."
                 rev = 0
             if es_desierto:
+                if not _clean(proveedor):
+                    proveedor = "desierto"
+                if not _clean(proveedor_ganador):
+                    proveedor_ganador = "desierto"
+                if not marca_val:
+                    marca_val = "desierto"
+                if not modelo_val:
+                    modelo_val = "desierto"
+                if not pais_val:
+                    pais_val = "desierto"
                 unit_out = "desierto"
                 pref_out = round(pref_num, 6) if pref_num > 0 else "desierto"
                 fecha_oc_out = "desierto"
@@ -995,9 +1120,9 @@ def main() -> int:
                     "proveedor": proveedor,
                     "proveedor_ganador": proveedor_ganador,
                     "es_ganador": 1 if _norm(proveedor) and _norm(proveedor) == _norm(proveedor_ganador) else 0,
-                    "marca": _clean(cat.get("marca", "")),
-                    "modelo": _clean(cat.get("modelo", "")),
-                    "pais_origen": _clean(cat.get("pais_origen", "")),
+                    "marca": marca_val,
+                    "modelo": modelo_val,
+                    "pais_origen": pais_val,
                     "cantidad": round(qty, 6),
                     "precio_unitario_participacion": unit_out,
                     "precio_unitario_referencia": pref_out,
