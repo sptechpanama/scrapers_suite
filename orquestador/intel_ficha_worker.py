@@ -9,6 +9,7 @@ import time
 import uuid
 import traceback
 import unicodedata
+from difflib import SequenceMatcher
 from datetime import datetime
 from html import unescape
 from pathlib import Path
@@ -622,9 +623,10 @@ def _catalog_lookup(cmap: dict[str, dict[str, str]], ficha: str, proveedor: str)
         sa, sb = set(ta), set(tb)
         inter = len(sa & sb)
         base = inter / max(len(sa), len(sb))
+        seq = SequenceMatcher(None, a, b).ratio()
         if a in b or b in a:
             base += 0.25
-        return min(base, 1.0)
+        return min(max(base, seq), 1.0)
 
     p = _norm(proveedor)
     f = re.sub(r"\D", "", ficha)
