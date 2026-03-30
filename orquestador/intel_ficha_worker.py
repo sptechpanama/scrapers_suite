@@ -823,7 +823,9 @@ def main() -> int:
             acto_nombre = _clean(r.get("titulo", "")) or f"Acto {acto_id}"
             entidad = _clean(r.get("entidad", ""))
             descripcion = _clean(r.get("descripcion", ""))
-            proveedor_ganador = _clean(r.get("razon_social", "")) or _clean(r.get("nombre_comercial", ""))
+            razon_social_db = _clean(r.get("razon_social", ""))
+            nombre_comercial_db = _clean(r.get("nombre_comercial", ""))
+            proveedor_ganador = razon_social_db or nombre_comercial_db
             fecha_pub_db = _clean(r.get("fecha_publicacion_db", ""))
             fecha_adj_db = _clean(r.get("fecha_adjudicacion", ""))
             precio_ref_db = _num(r.get("precio_referencia", 0))
@@ -1051,6 +1053,24 @@ def main() -> int:
             d_act_oc_ent = (d_act_oc + entrega) if d_act_oc > 0 and entrega > 0 else max(d_act_oc, 0.0)
 
             cat = _catalog_lookup(cmap, ficha, proveedor)
+            # Fallback por alias: si no encontro por proveedor principal,
+            # probar nombre comercial/razon social de la DB (ej. "BTS, PANAMA").
+            if not any(_clean(cat.get(k, "")) for k in ("marca", "modelo", "pais_origen")):
+                alias_candidates = [nombre_comercial_db, razon_social_db, proveedor_ganador]
+                seen_alias: set[str] = set()
+                for alias in alias_candidates:
+                    alias_txt = _clean(alias)
+                    if not alias_txt:
+                        continue
+                    alias_norm = _norm(alias_txt)
+                    if not alias_norm or alias_norm in seen_alias:
+                        continue
+                    seen_alias.add(alias_norm)
+                    cat_try = _catalog_lookup(cmap, ficha, alias_txt)
+                    if any(_clean(cat_try.get(k, "")) for k in ("marca", "modelo", "pais_origen")):
+                        cat = cat_try
+                        obs = (obs + " | " if obs else "") + f"catalogo_via_alias:{alias_txt}"
+                        break
             marca_val = _clean(cat.get("marca", ""))
             modelo_val = _clean(cat.get("modelo", ""))
             pais_val = _clean(cat.get("pais_origen", ""))
