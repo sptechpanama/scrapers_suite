@@ -7,6 +7,7 @@ import re
 import sqlite3
 import time
 import uuid
+import traceback
 from datetime import datetime
 from html import unescape
 from pathlib import Path
@@ -44,6 +45,7 @@ DETAIL_HEADERS = [
     "fuente_precio","fuente_fecha","enlace_evidencia","unidad_medida","tiempo_entrega_dias","observaciones",
     "estado_revision","nivel_certeza","requiere_revision",
 ]
+DEBUG_HTML_DIR = Path(r"C:\Users\rodri\scrapers_repo\orquestador\debug_html_intel")
 
 
 def _log(msg: str, t0: float) -> None:
@@ -115,6 +117,19 @@ def _abs_url(url: str) -> str:
     return PANAMACOMPRA_BASE_URL.rstrip("/") + "/" + u
 
 
+def _process_code_from_url(url: str) -> str:
+    u = _clean(url)
+    if not u:
+        return ""
+    m = re.search(r"/pliego-de-cargos/([^/]+)/", u, flags=re.I)
+    if m:
+        return _clean(m.group(1))
+    m = re.search(r"/solicitud-de-cotizacion/([^/]+)/", u, flags=re.I)
+    if m:
+        return _clean(m.group(1))
+    return ""
+
+
 def _lines_from_html(html: str) -> list[str]:
     raw = str(html or "")
     if BeautifulSoup is not None:
@@ -171,8 +186,12 @@ def _delivery_days(text: str) -> float:
 
 
 def _href(html: str, must_contain: str, exclude: str = "") -> str:
-    for h in re.findall(r'href=["\']([^"\']+)["\']', html or "", flags=re.I):
+    # Soporta href normal y data-uw-original-href (accesibilidad del sitio).
+    pattern = re.compile(r'(?:href|data-uw-original-href)=["\']([^"\']+)["\']', flags=re.I)
+    for h in pattern.findall(html or ""):
         hc = _clean(h)
+        if not hc:
+            continue
         if must_contain.lower() not in hc.lower():
             continue
         if exclude and exclude.lower() in hc.lower():
@@ -186,6 +205,67 @@ def _days_between(a: str, b: str) -> float:
     if pd.isna(da) or pd.isna(db):
         return 0.0
     return float((db - da).days)
+
+
+def _wait_tipo2_sections(driver: object, html_initial: str, timeout: int = 18) -> str:
+    """En actos tipo 2, espera a que carguen bloques de documentos (SPA) antes de extraer links/fechas."""
+    try:
+        from selenium.webdriver.common.by import By  # type: ignore
+    except Exception:
+        return html_initial
+
+    def _ready(txt_norm: str) -> bool:
+        has_doc_block = (
+            "documentos del acto publico" in txt_norm
+            or "documentos del acto p blico" in txt_norm
+            or "documentos del acto" in txt_norm
+        )
+        has_arch_block = (
+            "archivos de la compra menor" in txt_norm
+            or "documentos de la compra menor" in txt_norm
+        )
+        has_cuadro = (
+            "cuadro de propuesta presentada" in txt_norm
+            or "cuadro de propuestas" in txt_norm
+            or "cuadro de cotizaciones" in txt_norm
+        )
+        return (has_doc_block and has_arch_block) or (has_doc_block and has_cuadro)
+
+    last_html = str(html_initial or "")
+    deadline = time.time() + max(3, timeout)
+    while time.time() < deadline:
+        try:
+            body_text = _norm(driver.find_element(By.TAG_NAME, "body").text)
+        except Exception:
+            body_text = ""
+        try:
+            html_now = str(getattr(driver, "page_source", "") or "")
+        except Exception:
+            html_now = last_html
+        if _ready(body_text):
+            return html_now
+        last_html = html_now or last_html
+        time.sleep(0.7)
+    return last_html
+
+
+def _extract_order_date_from_lines(lines: list[str]) -> str:
+    best = ""
+    best_d = pd.NaT
+    for i, ln in enumerate(lines):
+        if "orden de compra" not in _norm(ln):
+            continue
+        for j in range(i, min(i + 5, len(lines))):
+            tk = _date_token(lines[j])
+            if not tk:
+                continue
+            d = _date(tk)
+            if pd.isna(d):
+                continue
+            if pd.isna(best_d) or d > best_d:
+                best = tk
+                best_d = d
+    return best
 
 def _build_driver() -> tuple[object | None, str]:
     try:
@@ -206,11 +286,92 @@ def _build_driver() -> tuple[object | None, str]:
 
 def _driver_html(driver: object, url: str, timeout: int = 40) -> str:
     try:
+        from selenium.common.exceptions import TimeoutException  # type: ignore
         from selenium.webdriver.common.by import By  # type: ignore
         from selenium.webdriver.support import expected_conditions as EC  # type: ignore
         from selenium.webdriver.support.ui import WebDriverWait  # type: ignore
-        driver.get(url)
-        WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        expected_proc = _process_code_from_url(url).lower()
+        retries = 3
+        for attempt in range(1, retries + 1):
+            driver.get(url)
+            WebDriverWait(driver, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            if expected_proc:
+                try:
+                    WebDriverWait(driver, min(timeout, 15)).until(
+                        lambda d: expected_proc in str(
+                            d.execute_script("return document.body ? document.body.innerText : ''")
+                        ).lower()
+                        or expected_proc in str(
+                            d.execute_script("return document.documentElement ? document.documentElement.innerHTML : ''")
+                        ).lower()
+                    )
+                    break
+                except TimeoutException:
+                    # Fuerza recarga fuerte y reintenta.
+                    try:
+                        driver.execute_script("window.location.reload(true);")
+                    except Exception:
+                        pass
+                    if attempt >= retries:
+                        pass
+                    else:
+                        time.sleep(1.0)
+                        continue
+            break
+
+        # En SPA con hash routes, validar que realmente cargó la ruta solicitada.
+        expected_fragment = ""
+        if "#" in url:
+            expected_fragment = url.split("#", 1)[1].strip().lower()
+        if expected_fragment:
+            try:
+                WebDriverWait(driver, min(timeout, 25)).until(
+                    lambda d: expected_fragment in str(
+                        d.execute_script("return window.location.href || ''")
+                    ).lower()
+                )
+            except TimeoutException:
+                pass
+        try:
+            WebDriverWait(driver, min(timeout, 20)).until(lambda d: d.execute_script("return document.readyState") == "complete")
+        except TimeoutException:
+            pass
+
+        # Espera activa para SPA: no basta con que exista body.
+        deadline = time.time() + timeout
+        tokens = (
+            "informacion del proponente",
+            "aviso de convocatoria",
+            "procesos relacionados",
+            "documentos de la compra menor",
+            "archivos de la compra menor",
+            "cuadro de propuesta presentada",
+            "cuadro de propuestas",
+        )
+        last_html = ""
+        stable_hits = 0
+        while time.time() < deadline:
+            html_now = str(getattr(driver, "page_source", "") or "")
+            try:
+                body_text = _norm(driver.find_element(By.TAG_NAME, "body").text)
+            except Exception:
+                body_text = _norm(html_now)
+
+            has_token = any(t in body_text for t in tokens)
+            has_tables = "<table" in html_now.lower()
+            if has_token or (has_tables and len(html_now) >= 45000):
+                return html_now
+
+            if html_now == last_html:
+                stable_hits += 1
+            else:
+                stable_hits = 0
+            last_html = html_now
+
+            if stable_hits >= 4 and len(html_now) >= 15000:
+                return html_now
+            time.sleep(0.8)
+
         return str(getattr(driver, "page_source", "") or "")
     except Exception:
         return ""
@@ -280,8 +441,38 @@ def _cuadro_min_from_driver(driver: object, cuadro_url: str, ficha: str) -> dict
         from selenium.webdriver.support import expected_conditions as EC  # type: ignore
         from selenium.webdriver.support.ui import WebDriverWait  # type: ignore
         driver.get(cuadro_url)
-        WebDriverWait(driver, 35).until(EC.presence_of_element_located((By.TAG_NAME, "table")))
-        tables = driver.find_elements(By.CSS_SELECTOR, "table.caption-top")
+        WebDriverWait(driver, 45).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+
+        # Espera activa robusta para tabla de propuestas.
+        tables = []
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            tables = driver.find_elements(By.CSS_SELECTOR, "table.caption-top")
+            if tables:
+                break
+            time.sleep(0.8)
+        if not tables:
+            # Un refresh suave puede resolver render tardío.
+            try:
+                driver.execute_script("window.location.reload();")
+                WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            except Exception:
+                pass
+            deadline2 = time.time() + 25
+            while time.time() < deadline2:
+                tables = driver.find_elements(By.CSS_SELECTOR, "table.caption-top")
+                if tables:
+                    break
+                time.sleep(0.8)
+
+        # Fallback: cualquier tabla que tenga columna "Precio Unitario".
+        if not tables:
+            any_tables = driver.find_elements(By.CSS_SELECTOR, "table")
+            for tb in any_tables:
+                headers = [_norm(x.text) for x in tb.find_elements(By.CSS_SELECTOR, "thead th")]
+                if any("precio unitario" in h for h in headers):
+                    tables.append(tb)
+
         candidates: list[dict[str, Any]] = []
         for tb in tables:
             provider = ""
@@ -375,7 +566,7 @@ def _acts_for_ficha(db: Path, ficha: str) -> pd.DataFrame:
     like = f"%{f}%"
     sql = """
     SELECT id, enlace, titulo, entidad, descripcion, ficha_detectada, razon_social, nombre_comercial,
-           fecha AS fecha_publicacion_db, fecha_adjudicacion, precio_referencia, termino_entrega
+           fecha AS fecha_publicacion_db, fecha_adjudicacion, precio_referencia, termino_entrega, estado
     FROM actos_publicos
     WHERE ficha_detectada LIKE ? OR titulo LIKE ? OR descripcion LIKE ?
     ORDER BY id DESC
@@ -413,6 +604,34 @@ def _replace_rows(sheet: str, headers: list[str], ficha: str, new_rows: list[lis
 def _vals(headers: list[str], data: dict[str, Any]) -> list[str]:
     return [str(data.get(h, "") if data.get(h, "") is not None else "") for h in headers]
 
+
+def _should_debug_no_sheets() -> bool:
+    return _clean(os.getenv("INTEL_STUDY_DEBUG_NO_SHEETS", "")).lower() in {"1", "true", "yes", "si"}
+
+
+def _debug_max_acts() -> int:
+    raw = _clean(os.getenv("INTEL_STUDY_DEBUG_MAX_ACTS", ""))
+    if not raw:
+        return 0
+    try:
+        return max(0, int(float(raw)))
+    except Exception:
+        return 0
+
+
+def _dump_debug_html(ficha: str, acto_id: str, label: str, html: str) -> str:
+    try:
+        DEBUG_HTML_DIR.mkdir(parents=True, exist_ok=True)
+        safe_f = re.sub(r"[^0-9A-Za-z_-]+", "_", str(ficha or "ficha"))
+        safe_a = re.sub(r"[^0-9A-Za-z_-]+", "_", str(acto_id or "acto"))
+        safe_l = re.sub(r"[^0-9A-Za-z_-]+", "_", str(label or "raw"))
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = DEBUG_HTML_DIR / f"{safe_f}_{safe_a}_{safe_l}_{ts}.html"
+        out.write_text(str(html or ""), encoding="utf-8", errors="ignore")
+        return str(out)
+    except Exception:
+        return ""
+
 def main() -> int:
     t0 = time.perf_counter()
     _log(f"inicio | spreadsheet={SPREADSHEET_ID}", t0)
@@ -442,6 +661,10 @@ def main() -> int:
 
     _log(f"request={request_id or 'sin-id'} | ficha={ficha} | db={db_path}", t0)
     acts = _acts_for_ficha(db_path, ficha)
+    max_acts = _debug_max_acts()
+    if max_acts > 0:
+        acts = acts.head(max_acts).copy()
+        _log(f"DEBUG activo: limitando a {max_acts} actos", t0)
     _log(f"actos detectados: {len(acts)}", t0)
 
     run_id = str(uuid.uuid4())
@@ -463,16 +686,14 @@ def main() -> int:
             "updated_at": now,
             "error": "Sin actos para la ficha",
         }
-        _replace_rows(RUNS_SHEET, RUNS_HEADERS, ficha, [_vals(RUNS_HEADERS, run_row)])
-        _replace_rows(DETAIL_SHEET, DETAIL_HEADERS, ficha, [])
+        if _should_debug_no_sheets():
+            _log("DEBUG_NO_SHEETS=1 -> run vacio no se escribe a Sheets", t0)
+        else:
+            _replace_rows(RUNS_SHEET, RUNS_HEADERS, ficha, [_vals(RUNS_HEADERS, run_row)])
+            _replace_rows(DETAIL_SHEET, DETAIL_HEADERS, ficha, [])
         _log("run vacio publicado", t0)
         print(json.dumps({"ok": True, "request_id": request_id, "run_id_remote": run_id, "ficha": ficha}), flush=True)
         return 0
-
-    driver, mode = _build_driver()
-    _log(f"selenium={mode}", t0)
-    if driver is None:
-        raise RuntimeError(f"No se pudo iniciar Selenium visible: {mode}")
 
     cmap = _catalog_map()
     _log(f"catalogo claves: {len(cmap)}", t0)
@@ -493,10 +714,57 @@ def main() -> int:
             fecha_adj_db = _clean(r.get("fecha_adjudicacion", ""))
             precio_ref_db = _num(r.get("precio_referencia", 0))
             termino = _clean(r.get("termino_entrega", ""))
+            estado_acto = _clean(r.get("estado", ""))
+            es_desierto = "desierto" in _norm(estado_acto)
 
             _log(f"acto {i+1}/{len(acts)} | id={acto_id}", t0)
+            driver, mode = _build_driver()
+            _log(f"acto id={acto_id} selenium={mode}", t0)
+            if driver is None:
+                rows.append(
+                    {
+                        "request_id": request_id,
+                        "run_id_remote": run_id,
+                        "detail_id": str(uuid.uuid4()),
+                        "ficha": ficha,
+                        "nombre_ficha": nombre,
+                        "acto_id": acto_id,
+                        "acto_nombre": acto_nombre,
+                        "acto_url": acto_url,
+                        "entidad": entidad,
+                        "renglon_texto": descripcion,
+                        "proveedor": proveedor_ganador,
+                        "proveedor_ganador": proveedor_ganador,
+                        "es_ganador": 1,
+                        "marca": "",
+                        "modelo": "",
+                        "pais_origen": "",
+                        "cantidad": 0.0,
+                        "precio_unitario_participacion": 0.0,
+                        "precio_unitario_referencia": 0.0,
+                        "fecha_publicacion": fecha_pub_db,
+                        "fecha_celebracion": "",
+                        "fecha_adjudicacion": fecha_adj_db,
+                        "fecha_orden_compra": "",
+                        "dias_acto_a_oc": 0.0,
+                        "dias_acto_a_oc_mas_entrega": 0.0,
+                        "tipo_flujo": "sin_driver",
+                        "fuente_precio": "",
+                        "fuente_fecha": "",
+                        "enlace_evidencia": acto_url,
+                        "unidad_medida": "",
+                        "tiempo_entrega_dias": _delivery_days(termino),
+                        "observaciones": f"No se pudo iniciar Selenium: {mode}",
+                        "estado_revision": "pendiente",
+                        "nivel_certeza": 0.2,
+                        "requiere_revision": 1,
+                    }
+                )
+                continue
+
             html = _driver_html(driver, acto_url)
             if not html:
+                _log(f"acto id={acto_id} sin html util (url={acto_url})", t0)
                 rows.append(
                     {
                         "request_id": request_id,
@@ -536,10 +804,32 @@ def main() -> int:
                         "requiere_revision": 1,
                     }
                 )
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
                 continue
 
+            expected_proc = _process_code_from_url(acto_url).lower()
+            if expected_proc and expected_proc not in html.lower():
+                _log(
+                    f"acto id={acto_id} WARNING: html no contiene proceso esperado {expected_proc}; posible desalineacion SPA",
+                    t0,
+                )
             lines = _lines_from_html(html)
             has_info = "informacion del proponente" in _norm(" | ".join(lines))
+            if not has_info:
+                # En tipo 2, la SPA a veces pinta "Documentos/Archivos" segundos despues.
+                html_wait = _wait_tipo2_sections(driver, html, timeout=20)
+                if html_wait and len(html_wait) >= len(html):
+                    html = html_wait
+                    lines = _lines_from_html(html)
+                    has_info = "informacion del proponente" in _norm(" | ".join(lines))
+            _log(
+                f"acto id={acto_id} html_len={len(html)} has_info={has_info} "
+                f"table_count_est={html.lower().count('<table')}",
+                t0,
+            )
             tipo = "tipo_1_info_proponente" if has_info else "tipo_2_cuadro_propuestas"
             t1 += 1 if has_info else 0
             t2 += 0 if has_info else 1
@@ -565,6 +855,8 @@ def main() -> int:
                     if _clean(cm.get("um", "")):
                         info["um"] = _clean(cm.get("um", ""))
                     obs = _clean(cm.get("ev", ""))
+                else:
+                    _log(f"acto id={acto_id} tipo2 sin enlace cuadro de propuestas", t0)
 
             if not proveedor:
                 proveedor = proveedor_ganador
@@ -627,6 +919,14 @@ def main() -> int:
                                 fecha_oc = tk
             except Exception:
                 pass
+            if not fecha_oc:
+                fecha_oc = _extract_order_date_from_lines(lines)
+            if not fecha_oc:
+                # Fallback regex sobre HTML por si la tabla no parsea bien en pandas.
+                for m in re.finditer(r"orden\s+de\s+compra[\s\S]{0,350}?(\d{2}-\d{2}-\d{4})", html or "", flags=re.I):
+                    tk = _clean(m.group(1))
+                    if tk and (not fecha_oc or _date(tk) > _date(fecha_oc)):
+                        fecha_oc = tk
 
             qty = float(info.get("qty", 0) or 0)
             pref = float(info.get("ref", 0) or 0)
@@ -637,7 +937,49 @@ def main() -> int:
             d_act_oc_ent = (d_act_oc + entrega) if d_act_oc > 0 and entrega > 0 else max(d_act_oc, 0.0)
 
             cat = _catalog_lookup(cmap, ficha, proveedor)
+            unit_num = float(info.get("unit", 0) or 0)
+            pref_num = float(pref or 0)
+            fecha_oc_out: object = fecha_oc
+            unit_out: object = round(unit_num, 6)
+            pref_out: object = round(pref_num, 6)
+            fuente_precio_out = fuente_precio
+            estado_revision = "pendiente"
+            nivel_certeza = 0.45
             rev = 1 if (_num(info.get("unit", 0)) <= 0 or not _clean(proveedor)) else 0
+            if es_desierto and (unit_num > 0 or _clean(fecha_oc)):
+                # Si hay evidencia objetiva de precio/OC, priorizar evidencia sobre estado historico.
+                es_desierto = False
+                obs = (obs + " | " if obs else "") + "Estado DB='Desierto' pero se detecto evidencia de precio/OC en el acto."
+                rev = 0
+            if es_desierto:
+                unit_out = "desierto"
+                pref_out = round(pref_num, 6) if pref_num > 0 else "desierto"
+                fecha_oc_out = "desierto"
+                fuente_precio_out = fuente_precio or "estado_desierto"
+                estado_revision = "desierto"
+                nivel_certeza = 0.99
+                rev = 0
+                obs = (obs + " | " if obs else "") + "Acto marcado como desierto en DB."
+
+            _log(
+                "acto id={aid} tipo={tipo} prov={prov} unit={unit:.4f} ref={ref:.4f} qty={qty:.4f} "
+                "f_cele={fcele} f_oc={foc} rev={rev}".format(
+                    aid=acto_id,
+                    tipo=tipo,
+                    prov=_clean(proveedor) or "-",
+                    unit=float(info.get("unit", 0) or 0),
+                    ref=float(pref),
+                    qty=float(qty),
+                    fcele=_clean(fecha_cele) or "-",
+                    foc=_clean(fecha_oc) or "-",
+                    rev=rev,
+                ),
+                t0,
+            )
+            if rev:
+                dump_path = _dump_debug_html(ficha, acto_id, "needs_review", html)
+                if dump_path:
+                    _log(f"acto id={acto_id} debug_html={dump_path}", t0)
             rows.append(
                 {
                     "request_id": request_id,
@@ -657,31 +999,45 @@ def main() -> int:
                     "modelo": _clean(cat.get("modelo", "")),
                     "pais_origen": _clean(cat.get("pais_origen", "")),
                     "cantidad": round(qty, 6),
-                    "precio_unitario_participacion": round(float(info.get("unit", 0) or 0), 6),
-                    "precio_unitario_referencia": round(pref, 6),
+                    "precio_unitario_participacion": unit_out,
+                    "precio_unitario_referencia": pref_out,
                     "fecha_publicacion": fecha_pub,
                     "fecha_celebracion": fecha_cele,
                     "fecha_adjudicacion": fecha_adj,
-                    "fecha_orden_compra": fecha_oc,
+                    "fecha_orden_compra": fecha_oc_out,
                     "dias_acto_a_oc": round(d_act_oc, 4),
                     "dias_acto_a_oc_mas_entrega": round(d_act_oc_ent, 4),
                     "tipo_flujo": tipo,
-                    "fuente_precio": fuente_precio,
+                    "fuente_precio": fuente_precio_out,
                     "fuente_fecha": fuente_fecha,
                     "enlace_evidencia": evidencia,
                     "unidad_medida": _clean(info.get("um", "")),
                     "tiempo_entrega_dias": round(entrega, 4),
                     "observaciones": obs,
-                    "estado_revision": "pendiente" if rev else "autocompletado",
-                    "nivel_certeza": 0.45 if rev else 0.95,
+                    "estado_revision": estado_revision if es_desierto else ("pendiente" if rev else "autocompletado"),
+                    "nivel_certeza": nivel_certeza if es_desierto else (0.45 if rev else 0.95),
                     "requiere_revision": rev,
                 }
             )
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+            saved = rows[-1]
+            _log(
+                "stored acto id={aid} unit={unit} ref={ref} fecha_oc={foc} estado_rev={est}".format(
+                    aid=acto_id,
+                    unit=saved.get("precio_unitario_participacion", ""),
+                    ref=saved.get("precio_unitario_referencia", ""),
+                    foc=saved.get("fecha_orden_compra", ""),
+                    est=saved.get("estado_revision", ""),
+                ),
+                t0,
+            )
+            try:
+                driver.quit()
+            except Exception:
+                pass
+    except Exception as exc:
+        _log(f"ERROR durante loop de actos: {exc}", t0)
+        _log(traceback.format_exc(), t0)
+        raise
 
     finished = datetime.now().isoformat(timespec="seconds")
     run_row = {
@@ -701,10 +1057,12 @@ def main() -> int:
         "error": "",
     }
 
-    _replace_rows(RUNS_SHEET, RUNS_HEADERS, ficha, [_vals(RUNS_HEADERS, run_row)])
-    _replace_rows(DETAIL_SHEET, DETAIL_HEADERS, ficha, [_vals(DETAIL_HEADERS, x) for x in rows])
-
-    _log(f"publicado en Sheets | detalle={len(rows)} | tipo1={t1} | tipo2={t2}", t0)
+    if _should_debug_no_sheets():
+        _log("DEBUG_NO_SHEETS=1 -> no se escriben resultados a Sheets", t0)
+    else:
+        _replace_rows(RUNS_SHEET, RUNS_HEADERS, ficha, [_vals(RUNS_HEADERS, run_row)])
+        _replace_rows(DETAIL_SHEET, DETAIL_HEADERS, ficha, [_vals(DETAIL_HEADERS, x) for x in rows])
+        _log(f"publicado en Sheets | detalle={len(rows)} | tipo1={t1} | tipo2={t2}", t0)
     print(json.dumps({"ok": True, "request_id": request_id, "run_id_remote": run_id, "ficha": ficha, "total_items": len(rows), "tipo1": t1, "tipo2": t2}, ensure_ascii=False), flush=True)
     return 0
 
