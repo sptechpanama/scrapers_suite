@@ -65,6 +65,8 @@ CFG = {
     "sheets_data": ["ap_sin_requisitos", "ap_sin_ficha", "ap_con_ct", "cl_prioritarios"],
     "sheet_desc": "cl_descartes",
     "sheet_prio": "cl_prioritarios",
+    "sheet_ct_rir": "ap_ct_rir",
+    "sheet_ct_rir_fichas": "ct_rir_fichas",
 
     # ---- Web (listado y selectores) ----
     "url_list": "https://www.panamacompra.gob.pa/Inicio/#/busqueda-avanzada",
@@ -214,6 +216,7 @@ PAL_CONS = PAL['Palabras de Construcción'].dropna().tolist()
 PAL_MED  = PAL['Palabras Médicas'].dropna().tolist()
 PAL_OTRAS= PAL['Otras Palabras'].dropna().tolist()
 MEDS = load_meds(CFG["xlsx_meds"])
+FICHAS_CT_RIR_DYNAMIC = set()
 
 # =========================
 # GOOGLE SHEETS (mini SDK)
@@ -285,6 +288,51 @@ def gs_sheet_id(title):
         if s["properties"]["title"] == title:
             return s["properties"]["sheetId"]
     return None
+
+
+def ensure_sheet_exists(title: str, rows: int = 4000, cols: int = 30) -> bool:
+    if gs_sheet_id(title) is not None:
+        return True
+    try:
+        exec_with_backoff(
+            GSVC.spreadsheets().batchUpdate(
+                spreadsheetId=SSID,
+                body={"requests": [{"addSheet": {"properties": {"title": title, "gridProperties": {"rowCount": rows, "columnCount": cols}}}}]},
+            ),
+            label=f"addSheet {title}",
+        )
+        SHEET_CACHE.pop(title, None)
+        LOG("SHEETS", f"{title}: hoja creada")
+        return True
+    except HttpError as exc:
+        if getattr(exc.resp, "status", None) == 400 and "already exists" in str(exc).lower():
+            return True
+        LOG("SHEETS", f"{title}: no se pudo crear ({type(exc).__name__})")
+        return False
+
+
+def _normalize_ficha_code(value) -> str:
+    digits = re.sub(r"\D+", "", str(value or ""))
+    if not digits:
+        return ""
+    normalized = digits.lstrip("0")
+    return normalized or "0"
+
+
+def load_ct_rir_fichas() -> set[str]:
+    sheet_name = CFG.get("sheet_ct_rir_fichas", "ct_rir_fichas")
+    if not ensure_sheet_exists(sheet_name, rows=2000, cols=3):
+        return set()
+    values = gs_get(f"{sheet_name}!A1:A")
+    out: set[str] = set()
+    for row in values:
+        if not row:
+            continue
+        token = _normalize_ficha_code(row[0])
+        if token:
+            out.add(token)
+    LOG("CT_RIR", f"fichas configuradas={len(out)}")
+    return out
 
 def find_idx(headers, name):
     if not headers: return None
@@ -525,7 +573,7 @@ def purge_by_fecha(sheet):
     LOG("PURGE", f"{sheet}: actos={len(vals)-1} | ok={ok} | fail={fail} | borrados={len(dels)}")
 
 def purge_all():
-    for s in ["ap_sin_requisitos","ap_sin_ficha","ap_con_ct","cl_prioritarios","cl_descartes"]:
+    for s in ["ap_sin_requisitos","ap_sin_ficha","ap_con_ct",CFG["sheet_ct_rir"],"cl_prioritarios","cl_descartes"]:
         purge_by_fecha(s)
 
 
@@ -704,10 +752,60 @@ def _wait_any_xpath(driver, xps, to=25):
         return False
     WebDriverWait(driver, to).until(any_present)
 
+
+def _expected_acto_code_from_link(link: str) -> str:
+    key = extract_acto_key_from_url(link or "")
+    if ":" not in key:
+        return ""
+    return key.split(":", 1)[1].strip().upper()
+
+
+def _navigate_detail_fresh(driver, link: str, expected_acto: str) -> None:
+    """
+    PanamaCompra funciona como SPA (hash routing). Navegar entre URLs consecutivas
+    puede dejar el DOM anterior "pegado". Forzamos paso por about:blank para
+    garantizar recarga limpia y luego validamos que el acto esperado exista en
+    el texto renderizado antes de extraer.
+    """
+    try:
+        driver.get("about:blank")
+    except TimeoutException:
+        try:
+            driver.execute_script("window.stop();")
+        except Exception:
+            pass
+    driver.get(link)
+
+    if not expected_acto:
+        return
+
+    expected = expected_acto.upper()
+
+    def _has_expected(drv):
+        try:
+            return bool(
+                drv.execute_script(
+                    "return !!(document.body && document.body.innerText && "
+                    "document.body.innerText.toUpperCase().includes(arguments[0]));",
+                    expected,
+                )
+            )
+        except Exception:
+            return False
+
+    try:
+        WebDriverWait(driver, 12).until(_has_expected)
+    except TimeoutException:
+        LOG("SCRAPE", f"acto {expected} no visible tras carga inicial; refresh forzado")
+        driver.refresh()
+        WebDriverWait(driver, 12).until(_has_expected)
+
+
 def scrape(page: PageTools, link: str):
     xp = CFG["xpath_map"]
+    expected_acto = _expected_acto_code_from_link(link)
     try:
-        page.d.get(link)
+        _navigate_detail_fresh(page.d, link, expected_acto)
     except TimeoutException:
         try:
             page.d.execute_script("window.stop();")
@@ -792,6 +890,9 @@ def clasifica(info):
 # MAIN (flujo completo)
 # =========================
 def main():
+    global FICHAS_CT_RIR_DYNAMIC
+    ensure_sheet_exists(CFG["sheet_ct_rir"])
+    FICHAS_CT_RIR_DYNAMIC = load_ct_rir_fichas()
     purge_all()
 
     _, all_links = read_links_from_sheets(CFG["sheets_data"])
@@ -915,9 +1016,9 @@ def main():
     LOG("DONE", f"nuevos={len(nuevos)} | existentes={len(existentes_norm)} | descartes={len(descartados_norm)}")
 
     if not nuevos:
-        move_rows_by_checkbox(['ap_sin_requisitos','ap_sin_ficha','ap_con_ct'], CFG["sheet_prio"], "Prioritario")
-        move_rows_by_checkbox(['ap_sin_requisitos','ap_sin_ficha','ap_con_ct'], CFG["sheet_desc"], "Descartar")
-        for sh in ['ap_sin_requisitos','ap_sin_ficha','ap_con_ct']:
+        move_rows_by_checkbox(['ap_sin_requisitos','ap_sin_ficha','ap_con_ct',CFG["sheet_ct_rir"]], CFG["sheet_prio"], "Prioritario")
+        move_rows_by_checkbox(['ap_sin_requisitos','ap_sin_ficha','ap_con_ct',CFG["sheet_ct_rir"]], CFG["sheet_desc"], "Descartar")
+        for sh in ['ap_sin_requisitos','ap_sin_ficha','ap_con_ct',CFG["sheet_ct_rir"]]:
             reset_checkboxes(sh)
             update_fechas_sheet(sh)
         LOG("DONE", "sin nuevos; mantenimiento completo")
@@ -926,7 +1027,7 @@ def main():
     # === SCRAPE DETALLE (sólo para nuevos) ===
     driver = start_browser()
     PT = PageTools(driver)
-    datos_ct, datos_sr, datos_sf, datos_rs = [], [], [], []
+    datos_ct, datos_sr, datos_sf, datos_rs, datos_ct_rir = [], [], [], [], []
     for key in nuevos:
         link = map_key_raw[key]
         LOG("SCRAPE", link)
@@ -979,6 +1080,10 @@ def main():
         if categoria == "ct": datos_ct.append(info)
         elif categoria == "sr": datos_sr.append(info)
         else: datos_sf.append(info)
+        if FICHAS_CT_RIR_DYNAMIC:
+            fichas_base = info.get("fichas_base") or []
+            if any(code in FICHAS_CT_RIR_DYNAMIC for code in fichas_base):
+                datos_ct_rir.append(info)
 
     try: driver.quit()
     except: pass
@@ -1086,18 +1191,19 @@ def main():
     append_df('ap_con_ct', df_prepare(datos_ct))
     append_df('ap_sin_requisitos', df_prepare(datos_sr))
     append_df('ap_sin_ficha', df_prepare(datos_sf))
+    append_df(CFG["sheet_ct_rir"], df_prepare(datos_ct_rir))
 
     # Movimientos por checkboxes y limpieza final (ajustado a ap_*)
-    move_rows_by_checkbox(['ap_sin_ficha','ap_sin_requisitos','ap_con_ct'], CFG["sheet_prio"], "Prioritario")
-    move_rows_by_checkbox(['ap_sin_ficha','ap_sin_requisitos','ap_con_ct'], CFG["sheet_desc"], "Descartar")
+    move_rows_by_checkbox(['ap_sin_ficha','ap_sin_requisitos','ap_con_ct',CFG["sheet_ct_rir"]], CFG["sheet_prio"], "Prioritario")
+    move_rows_by_checkbox(['ap_sin_ficha','ap_sin_requisitos','ap_con_ct',CFG["sheet_ct_rir"]], CFG["sheet_desc"], "Descartar")
 
-    for sh in ['ap_sin_requisitos','ap_sin_ficha','ap_con_ct','cl_prioritarios','cl_descartes']:
+    for sh in ['ap_sin_requisitos','ap_sin_ficha','ap_con_ct',CFG["sheet_ct_rir"],'cl_prioritarios','cl_descartes']:
         purge_by_fecha(sh)
-    for sh in ['ap_sin_requisitos','ap_sin_ficha','ap_con_ct']:
+    for sh in ['ap_sin_requisitos','ap_sin_ficha','ap_con_ct',CFG["sheet_ct_rir"]]:
         reset_checkboxes(sh)
         update_fechas_sheet(sh)
 
-    LOG("DONE", f"CT={len(datos_ct)} | SinReq={len(datos_sr)} | SinFicha={len(datos_sf)} | Ignorados_RS={len(datos_rs)}")
+    LOG("DONE", f"CT={len(datos_ct)} | SinReq={len(datos_sr)} | SinFicha={len(datos_sf)} | CT_RIR={len(datos_ct_rir)} | Ignorados_RS={len(datos_rs)}")
 
 if __name__ == "__main__":
     main()
