@@ -67,6 +67,11 @@ CFG = {
     "sheet_prio": "cl_prioritarios",
     "sheet_ct_rir": "ap_ct_rir",
     "sheet_ct_rir_fichas": "ct_rir_fichas",
+    # Reparación incremental de filas históricas "pegadas" (SPA stale DOM).
+    "repair_enabled": True,
+    "repair_target_sheet": "ap_sin_ficha",
+    "repair_tuple_threshold": 8,
+    "repair_max_rows_per_run": 500,
 
     # ---- Web (listado y selectores) ----
     "url_list": "https://www.panamacompra.gob.pa/Inicio/#/busqueda-avanzada",
@@ -532,7 +537,7 @@ def move_rows_by_checkbox(sources, target, col_chk):
         gs_append(target, to_app)
         delete_rows(src, to_del)
         total += len(to_app)
-        LOG("MOVE", f"{src} → {target}: {len(to_app)}")
+        LOG("MOVE", f"{src} -> {target}: {len(to_app)}")
     LOG("MOVE", f"Total movidas a {target}: {total}")
 
 def purge_by_fecha(sheet):
@@ -886,6 +891,116 @@ def scrape(page: PageTools, link: str):
 def clasifica(info):
     return "sr" if info["has_sr"] else ("rs" if info["has_rs"] else ("ct" if info["has_ct"] else "sf"))
 
+
+def _set_row_value_by_header(hdr_map: dict[str, int], row: list[str], header_name: str, value):
+    idx = hdr_map.get(str(header_name or "").strip().lower())
+    if idx is None:
+        return
+    if idx >= len(row):
+        row.extend([""] * (idx + 1 - len(row)))
+    row[idx] = "" if value is None else str(value)
+
+
+def _fill_items_into_row(hdr: list[str], row: list[str], items: list[str]):
+    for idx_h, col in enumerate(hdr):
+        name = str(col or "").strip().lower()
+        if not name.startswith("item_"):
+            continue
+        try:
+            n = int(name.split("_", 1)[1])
+        except Exception:
+            continue
+        value = ""
+        if isinstance(items, list) and n >= 1 and len(items) >= n:
+            value = str(items[n - 1] or "")
+        if idx_h >= len(row):
+            row.extend([""] * (idx_h + 1 - len(row)))
+        row[idx_h] = value
+
+
+def repair_suspicious_rows(sheet: str, page_tools: "PageTools", threshold: int = 8, max_rows: int = 120):
+    vals = gs_get(f"{sheet}!A1:ZZ")
+    if not vals or len(vals) <= 1:
+        LOG("REPAIR", f"{sheet}: sin datos para reparar")
+        return
+
+    hdr = [str(x).strip() for x in vals[0]]
+    hmap = {h.lower(): i for i, h in enumerate(hdr)}
+    i_enlace = hmap.get("enlace")
+    i_titulo = hmap.get("titulo")
+    i_pub = hmap.get("publicacion")
+    i_precio = hmap.get("precio_referencia")
+    i_fecha = hmap.get("fecha")
+    if None in (i_enlace, i_titulo, i_pub, i_precio, i_fecha):
+        LOG("REPAIR", f"{sheet}: faltan columnas base; omito reparación")
+        return
+
+    rows = [list(r[:len(hdr)]) + [""] * max(len(hdr) - len(r), 0) for r in vals[1:]]
+    freq = {}
+    for row in rows:
+        key = (
+            str(row[i_titulo] if i_titulo < len(row) else "").strip(),
+            str(row[i_pub] if i_pub < len(row) else "").strip(),
+            str(row[i_precio] if i_precio < len(row) else "").strip(),
+            str(row[i_fecha] if i_fecha < len(row) else "").strip(),
+        )
+        freq[key] = freq.get(key, 0) + 1
+
+    suspicious_keys = {k for k, c in freq.items() if c >= max(2, int(threshold))}
+    if not suspicious_keys:
+        LOG("REPAIR", f"{sheet}: sin bloques sospechosos")
+        return
+
+    targets = []
+    for r1b, row in enumerate(rows, start=2):
+        link = str(row[i_enlace] if i_enlace < len(row) else "").strip()
+        if not link:
+            continue
+        key = (
+            str(row[i_titulo] if i_titulo < len(row) else "").strip(),
+            str(row[i_pub] if i_pub < len(row) else "").strip(),
+            str(row[i_precio] if i_precio < len(row) else "").strip(),
+            str(row[i_fecha] if i_fecha < len(row) else "").strip(),
+        )
+        if key in suspicious_keys:
+            targets.append((r1b, row, link))
+
+    if not targets:
+        LOG("REPAIR", f"{sheet}: claves sospechosas sin enlaces válidos")
+        return
+
+    targets = targets[: max(1, int(max_rows))]
+    LOG("REPAIR", f"{sheet}: sospechosas={len(targets)} (threshold={threshold}, max={max_rows})")
+
+    updated = 0
+    failed = 0
+    for r1b, row, link in targets:
+        try:
+            info = scrape(page_tools, link)
+        except Exception as exc:
+            failed += 1
+            LOG("REPAIR", f"fila {r1b}: fallo scrape {type(exc).__name__}")
+            continue
+
+        out = list(row[:len(hdr)]) + [""] * max(len(hdr) - len(row), 0)
+        _set_row_value_by_header(hmap, out, "publicacion", info.get("publicacion", ""))
+        _set_row_value_by_header(hmap, out, "titulo", info.get("titulo", ""))
+        price_num = precio_num(info.get("precio_referencia", ""))
+        _set_row_value_by_header(hmap, out, "precio_referencia", "" if price_num is None else f"{price_num:.2f}")
+        _set_row_value_by_header(hmap, out, "fecha", info.get("fecha", ""))
+        _set_row_value_by_header(hmap, out, "entidad", info.get("entidad", ""))
+        _set_row_value_by_header(hmap, out, "unidad solicitante", info.get("unidad solicitante", ""))
+        _set_row_value_by_header(hmap, out, "termino_entrega", info.get("termino_entrega", ""))
+        _set_row_value_by_header(hmap, out, "ficha_detectada", info.get("ficha_detectada", ""))
+        _set_row_value_by_header(hmap, out, "descripcion", info.get("descripcion", ""))
+        _fill_items_into_row(hdr, out, info.get("items", []))
+
+        rng = f"{sheet}!A{r1b}:{_col_letter(len(hdr))}{r1b}"
+        gs_update(rng, [out[:len(hdr)]])
+        updated += 1
+
+    LOG("REPAIR", f"{sheet}: actualizadas={updated} | fallidas={failed}")
+
 # =========================
 # MAIN (flujo completo)
 # =========================
@@ -1016,6 +1131,17 @@ def main():
     LOG("DONE", f"nuevos={len(nuevos)} | existentes={len(existentes_norm)} | descartes={len(descartados_norm)}")
 
     if not nuevos:
+        if CFG.get("repair_enabled"):
+            try:
+                repair_sheet = str(CFG.get("repair_target_sheet") or "ap_sin_ficha")
+                repair_suspicious_rows(
+                    repair_sheet,
+                    PT,
+                    threshold=int(CFG.get("repair_tuple_threshold", 8)),
+                    max_rows=int(CFG.get("repair_max_rows_per_run", 120)),
+                )
+            except Exception as exc:
+                LOG("REPAIR", f"error en reparación incremental: {type(exc).__name__}: {exc}")
         move_rows_by_checkbox(['ap_sin_requisitos','ap_sin_ficha','ap_con_ct',CFG["sheet_ct_rir"]], CFG["sheet_prio"], "Prioritario")
         move_rows_by_checkbox(['ap_sin_requisitos','ap_sin_ficha','ap_con_ct',CFG["sheet_ct_rir"]], CFG["sheet_desc"], "Descartar")
         for sh in ['ap_sin_requisitos','ap_sin_ficha','ap_con_ct',CFG["sheet_ct_rir"]]:
@@ -1084,6 +1210,18 @@ def main():
             fichas_base = info.get("fichas_base") or []
             if any(code in FICHAS_CT_RIR_DYNAMIC for code in fichas_base):
                 datos_ct_rir.append(info)
+
+    if CFG.get("repair_enabled"):
+        try:
+            repair_sheet = str(CFG.get("repair_target_sheet") or "ap_sin_ficha")
+            repair_suspicious_rows(
+                repair_sheet,
+                PT,
+                threshold=int(CFG.get("repair_tuple_threshold", 8)),
+                max_rows=int(CFG.get("repair_max_rows_per_run", 120)),
+            )
+        except Exception as exc:
+            LOG("REPAIR", f"error en reparación incremental: {type(exc).__name__}: {exc}")
 
     try: driver.quit()
     except: pass
@@ -1207,3 +1345,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
