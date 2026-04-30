@@ -61,6 +61,8 @@ CFG = {
     "sheets_data": ["cl_abiertas", "cl_abiertas_rir_sin_requisitos", "cl_abiertas_rir_con_ct", "cl_prioritarios"],
     "sheet_desc": "cl_descartes",
     "sheet_prio": "cl_prioritarios",
+    "sheet_ct_rir": "cl_abiertas_ct_rir",
+    "sheet_ct_rir_fichas": "ct_rir_fichas",
 
     # ---- Web (listado y selectores) ----
     "url_list": "https://www.panamacompra.gob.pa/Inicio/#/cotizaciones-en-linea/cotizaciones-en-linea",
@@ -162,6 +164,7 @@ PAL_CONS = PAL['Palabras de Construcción'].dropna().tolist()
 PAL_MED  = PAL['Palabras Médicas'].dropna().tolist()
 PAL_OTRAS= PAL['Otras Palabras'].dropna().tolist()
 MEDS = load_meds(CFG["xlsx_meds"])
+FICHAS_CT_RIR_DYNAMIC = set()
 
 # =========================
 # GOOGLE SHEETS (mini SDK)
@@ -439,6 +442,51 @@ def gs_sheet_id(title):
             return s["properties"]["sheetId"]
     return None
 
+
+def ensure_sheet_exists(title: str, rows: int = 4000, cols: int = 30) -> bool:
+    if gs_sheet_id(title) is not None:
+        return True
+    try:
+        exec_with_backoff(
+            GSVC.spreadsheets().batchUpdate(
+                spreadsheetId=SSID,
+                body={"requests": [{"addSheet": {"properties": {"title": title, "gridProperties": {"rowCount": rows, "columnCount": cols}}}}]},
+            ),
+            label=f"addSheet {title}",
+        )
+        SHEET_CACHE.pop(title, None)
+        LOG("SHEETS", f"{title}: hoja creada")
+        return True
+    except HttpError as exc:
+        if getattr(exc.resp, "status", None) == 400 and "already exists" in str(exc).lower():
+            return True
+        LOG("SHEETS", f"{title}: no se pudo crear ({type(exc).__name__})")
+        return False
+
+
+def _normalize_ficha_code(value) -> str:
+    digits = re.sub(r"\D+", "", str(value or ""))
+    if not digits:
+        return ""
+    normalized = digits.lstrip("0")
+    return normalized or "0"
+
+
+def load_ct_rir_fichas() -> set[str]:
+    sheet_name = CFG.get("sheet_ct_rir_fichas", "ct_rir_fichas")
+    if not ensure_sheet_exists(sheet_name, rows=2000, cols=3):
+        return set()
+    values = gs_get(f"{sheet_name}!A1:A")
+    out: set[str] = set()
+    for row in values:
+        if not row:
+            continue
+        token = _normalize_ficha_code(row[0])
+        if token:
+            out.add(token)
+    LOG("CT_RIR", f"fichas configuradas={len(out)}")
+    return out
+
 def find_idx(headers, name):
     if not headers: return None
     try:
@@ -679,7 +727,7 @@ def purge_by_fecha(sheet):
     LOG("PURGE", f"{sheet}: actos={len(vals)-1} | ok={ok} | fail={fail} | borrados={len(dels)}")
 
 def purge_all():
-    for s in ["cl_abiertas","cl_abiertas_rir_sin_requisitos","cl_abiertas_rir_con_ct","cl_prioritarios","cl_descartes"]:
+    for s in ["cl_abiertas","cl_abiertas_rir_sin_requisitos","cl_abiertas_rir_con_ct",CFG["sheet_ct_rir"],"cl_prioritarios","cl_descartes"]:
         purge_by_fecha(s)
 
 # =========================
@@ -944,6 +992,9 @@ def clasifica(info):
 # MAIN (flujo completo)
 # =========================
 def main():
+    global FICHAS_CT_RIR_DYNAMIC
+    ensure_sheet_exists(CFG["sheet_ct_rir"])
+    FICHAS_CT_RIR_DYNAMIC = load_ct_rir_fichas()
     _flush_failed_appends()
     purge_all()
 
@@ -1044,9 +1095,9 @@ def main():
     LOG("DONE", f"nuevos={len(nuevos)} | existentes={len(existentes_norm)} | descartes={len(descartados_norm)}")
 
     if not nuevos:
-        move_rows_by_checkbox(["cl_abiertas","cl_abiertas_rir_sin_requisitos","cl_abiertas_rir_con_ct"], CFG["sheet_prio"], "Prioritario")
-        move_rows_by_checkbox(["cl_abiertas","cl_abiertas_rir_sin_requisitos","cl_abiertas_rir_con_ct"], CFG["sheet_desc"], "Descartar")
-        for sh in ['cl_abiertas','cl_abiertas_rir_sin_requisitos','cl_abiertas_rir_con_ct']:
+        move_rows_by_checkbox(["cl_abiertas","cl_abiertas_rir_sin_requisitos","cl_abiertas_rir_con_ct",CFG["sheet_ct_rir"]], CFG["sheet_prio"], "Prioritario")
+        move_rows_by_checkbox(["cl_abiertas","cl_abiertas_rir_sin_requisitos","cl_abiertas_rir_con_ct",CFG["sheet_ct_rir"]], CFG["sheet_desc"], "Descartar")
+        for sh in ['cl_abiertas','cl_abiertas_rir_sin_requisitos','cl_abiertas_rir_con_ct',CFG["sheet_ct_rir"]]:
             reset_checkboxes(sh)
             update_fechas_sheet(sh)
         LOG("DONE", "sin nuevos; mantenimiento completo")
@@ -1055,7 +1106,7 @@ def main():
     # === SCRAPE DETALLE (sólo para nuevos) ===
     driver = start_browser()
     PT = PageTools(driver)
-    datos_ct, datos_sr, datos_sf, datos_rs = [], [], [], []
+    datos_ct, datos_sr, datos_sf, datos_rs, datos_ct_rir = [], [], [], [], []
     for key in nuevos:
         link = map_key_raw[key]
         LOG("SCRAPE", link)
@@ -1102,6 +1153,11 @@ def main():
         elif categoria == "sr": datos_sr.append(info)
         else: datos_sf.append(info)
 
+        if FICHAS_CT_RIR_DYNAMIC:
+            fichas_base = info.get("fichas_base") or []
+            if any(code in FICHAS_CT_RIR_DYNAMIC for code in fichas_base):
+                datos_ct_rir.append(info)
+
     try: driver.quit()
     except: pass
 
@@ -1140,7 +1196,7 @@ def main():
         ]
         if df.empty:
             ensure_header(sheet, base)
-            return
+            return [], base
 
         # Orden requerido: ... ficha_detectada, Prioritario, Descartar, descripcion, item_1..item_n
         item_cols = [c for c in df.columns if c.startswith("item_")]
@@ -1158,23 +1214,51 @@ def main():
             df['Descartar'] = df['Descartar'].replace("", "")
 
         ensure_header(sheet, desired)
-        gs_append(sheet, df[desired].values.tolist())
+        rows_out = df[desired].values.tolist()
+        gs_append(sheet, rows_out)
+        return rows_out, desired
 
     append_df('cl_abiertas_rir_con_ct', df_prepare(datos_ct))
     append_df('cl_abiertas_rir_sin_requisitos', df_prepare(datos_sr))
     append_df('cl_abiertas', df_prepare(datos_sf))
+    ct_rir_rows, ct_rir_cols = append_df(CFG["sheet_ct_rir"], df_prepare(datos_ct_rir))
 
     # Movimientos por checkboxes y limpieza final
-    move_rows_by_checkbox(['cl_abiertas','cl_abiertas_rir_sin_requisitos','cl_abiertas_rir_con_ct'], CFG["sheet_prio"], "Prioritario")
-    move_rows_by_checkbox(['cl_abiertas','cl_abiertas_rir_sin_requisitos','cl_abiertas_rir_con_ct'], CFG["sheet_desc"], "Descartar")
+    move_rows_by_checkbox(['cl_abiertas','cl_abiertas_rir_sin_requisitos','cl_abiertas_rir_con_ct',CFG["sheet_ct_rir"]], CFG["sheet_prio"], "Prioritario")
+    move_rows_by_checkbox(['cl_abiertas','cl_abiertas_rir_sin_requisitos','cl_abiertas_rir_con_ct',CFG["sheet_ct_rir"]], CFG["sheet_desc"], "Descartar")
 
-    for sh in ['cl_abiertas','cl_abiertas_rir_sin_requisitos','cl_abiertas_rir_con_ct','cl_prioritarios','cl_descartes']:
+    for sh in ['cl_abiertas','cl_abiertas_rir_sin_requisitos','cl_abiertas_rir_con_ct',CFG["sheet_ct_rir"],'cl_prioritarios','cl_descartes']:
         purge_by_fecha(sh)
-    for sh in ['cl_abiertas','cl_abiertas_rir_sin_requisitos','cl_abiertas_rir_con_ct']:
+    for sh in ['cl_abiertas','cl_abiertas_rir_sin_requisitos','cl_abiertas_rir_con_ct',CFG["sheet_ct_rir"]]:
         reset_checkboxes(sh)
         update_fechas_sheet(sh)
 
-    LOG("DONE", f"CT={len(datos_ct)} | SinReq={len(datos_sr)} | SinFicha={len(datos_sf)} | Ignorados_RS={len(datos_rs)}")
+    if ct_rir_rows:
+        col_idx = {col: idx for idx, col in enumerate(ct_rir_cols)}
+        preview_limit = 100
+        preview_rows = []
+        for row in ct_rir_rows[:preview_limit]:
+            preview_rows.append(
+                {
+                    "ficha_detectada": str(row[col_idx.get("ficha_detectada", -1)]).strip() if col_idx.get("ficha_detectada", -1) >= 0 else "",
+                    "titulo": str(row[col_idx.get("titulo", -1)]).strip() if col_idx.get("titulo", -1) >= 0 else "",
+                    "entidad": str(row[col_idx.get("entidad", -1)]).strip() if col_idx.get("entidad", -1) >= 0 else "",
+                    "fecha": str(row[col_idx.get("fecha", -1)]).strip() if col_idx.get("fecha", -1) >= 0 else "",
+                    "precio_referencia": str(row[col_idx.get("precio_referencia", -1)]).strip() if col_idx.get("precio_referencia", -1) >= 0 else "",
+                    "enlace": str(row[col_idx.get("enlace", -1)]).strip() if col_idx.get("enlace", -1) >= 0 else "",
+                    "hoja_origen": CFG["sheet_ct_rir"],
+                }
+            )
+        payload = {
+            "job": "clv",
+            "sheet": CFG["sheet_ct_rir"],
+            "count": len(ct_rir_rows),
+            "rows": preview_rows,
+            "truncated": len(ct_rir_rows) > preview_limit,
+        }
+        print("CT_RIR_SUMMARY_JSON=" + json.dumps(payload, ensure_ascii=False), flush=True)
+
+    LOG("DONE", f"CT={len(datos_ct)} | SinReq={len(datos_sr)} | SinFicha={len(datos_sf)} | CT_RIR={len(datos_ct_rir)} | Ignorados_RS={len(datos_rs)}")
 
 if __name__ == "__main__":
     main()

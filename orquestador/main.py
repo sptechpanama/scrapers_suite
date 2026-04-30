@@ -7,11 +7,14 @@ import logging
 import os
 import queue
 import re
+import smtplib
+import ssl
 import subprocess
 import threading
 import time
 from collections import deque
 from datetime import datetime
+from email.message import EmailMessage
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -134,12 +137,16 @@ JOB_NAME_LABELS = {
     "clv": "Cotizaciones Abiertas",
     "clrir": "Cotizaciones Programadas",
     "rir1": "Licitaciones",
+    "intel_estudio_ficha": "Estudio de ficha (Inteligencia CT)",
 }
 
 JOB_LABEL_TITLES = {
     CONFIG_WATCH_JOB_ID: "monitor de configuracion",
     MANUAL_WATCH_JOB_ID: "monitor de solicitudes manuales",
 }
+
+CT_RIR_EMAIL_DEFAULT_FROM = "rjsp100493@gmail.com"
+CT_RIR_EMAIL_DEFAULT_TO = ["soporte@sptech.com", "rjsp100493@gmail.com"]
 
 class JobConfig(BaseModel):
     name: str
@@ -382,6 +389,175 @@ def _extract_result_json(stdout: str) -> Optional[Dict[str, str]]:
             return payload
         return None
     return None
+
+
+def _extract_ct_rir_summary(stdout: str) -> Optional[Dict[str, object]]:
+    if not stdout:
+        return None
+    for line in stdout.splitlines()[::-1]:
+        line = line.strip()
+        if not line.startswith("CT_RIR_SUMMARY_JSON="):
+            continue
+        raw = line.split("CT_RIR_SUMMARY_JSON=", 1)[-1].strip()
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(payload, dict):
+            return payload
+        return None
+    return None
+
+
+def _ct_rir_email_config() -> tuple[str, str, list[str]]:
+    sender = str(
+        os.environ.get("ORQUESTADOR_CT_RIR_EMAIL_FROM", CT_RIR_EMAIL_DEFAULT_FROM)
+    ).strip()
+    password = str(os.environ.get("ORQUESTADOR_CT_RIR_EMAIL_APP_PASSWORD", "")).strip()
+    password = password.replace(" ", "")
+    raw_recipients = str(
+        os.environ.get(
+            "ORQUESTADOR_CT_RIR_EMAIL_TO",
+            ",".join(CT_RIR_EMAIL_DEFAULT_TO),
+        )
+    ).strip()
+    recipients = [item.strip() for item in raw_recipients.split(",") if item.strip()]
+    return sender, password, recipients
+
+
+def _build_ct_rir_unique_key(entry: Dict[str, object]) -> str:
+    sheet = str(entry.get("hoja_origen") or entry.get("sheet") or "").strip().lower()
+    enlace = str(entry.get("enlace") or "").strip().lower()
+    if sheet and enlace:
+        return f"{sheet}|{enlace}"
+    titulo = str(entry.get("titulo") or "").strip().lower()
+    entidad = str(entry.get("entidad") or "").strip().lower()
+    fecha = str(entry.get("fecha") or "").strip().lower()
+    ficha = str(entry.get("ficha_detectada") or "").strip().lower()
+    return f"{sheet}|{titulo}|{entidad}|{fecha}|{ficha}"
+
+
+def _queue_ct_rir_notifications(job_name: str, stdout: str, finished_at: datetime) -> int:
+    summary = _extract_ct_rir_summary(stdout)
+    if not summary:
+        return 0
+    rows = summary.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return 0
+
+    state = load_state()
+    pending_entries = state.setdefault("ct_rir_email_pending", [])
+    sent_keys = state.setdefault("ct_rir_email_sent_keys", {})
+    pending_keys = {
+        str(item.get("unique_key") or "")
+        for item in pending_entries
+        if isinstance(item, dict)
+    }
+
+    queued = 0
+    for raw_entry in rows:
+        if not isinstance(raw_entry, dict):
+            continue
+        entry = {
+            "job": job_name,
+            "sheet": str(summary.get("sheet") or raw_entry.get("hoja_origen") or "").strip(),
+            "hoja_origen": str(raw_entry.get("hoja_origen") or summary.get("sheet") or "").strip(),
+            "ficha_detectada": str(raw_entry.get("ficha_detectada") or "").strip(),
+            "titulo": str(raw_entry.get("titulo") or "").strip(),
+            "entidad": str(raw_entry.get("entidad") or "").strip(),
+            "fecha": str(raw_entry.get("fecha") or "").strip(),
+            "precio_referencia": str(raw_entry.get("precio_referencia") or "").strip(),
+            "enlace": str(raw_entry.get("enlace") or "").strip(),
+            "queued_at": finished_at.isoformat(timespec="seconds"),
+        }
+        unique_key = _build_ct_rir_unique_key(entry)
+        if not unique_key or unique_key in sent_keys or unique_key in pending_keys:
+            continue
+        entry["unique_key"] = unique_key
+        pending_entries.append(entry)
+        pending_keys.add(unique_key)
+        queued += 1
+
+    if queued:
+        state["ct_rir_email_pending"] = pending_entries[-500:]
+        state["ct_rir_email_last_queue"] = {
+            "job": job_name,
+            "count": queued,
+            "queued_at": finished_at.isoformat(timespec="seconds"),
+        }
+        save_state(state)
+    return queued
+
+
+def _send_pending_ct_rir_email() -> tuple[bool, str, int]:
+    state = load_state()
+    pending_entries = state.get("ct_rir_email_pending", [])
+    if not isinstance(pending_entries, list) or not pending_entries:
+        return True, "", 0
+
+    sender, password, recipients = _ct_rir_email_config()
+    if not sender or not password or not recipients:
+        return False, "Configuracion incompleta de correo CT_RIR", 0
+
+    ordered_entries = [item for item in pending_entries if isinstance(item, dict)]
+    if not ordered_entries:
+        return True, "", 0
+
+    lines: list[str] = []
+    lines.append("Se detectaron nuevos actos en Criterios Tecnicos RIR.")
+    lines.append("")
+    grouped: dict[str, list[dict]] = {}
+    for entry in ordered_entries:
+        sheet = str(entry.get("hoja_origen") or entry.get("sheet") or "sin_hoja").strip()
+        grouped.setdefault(sheet, []).append(entry)
+
+    for sheet_name, entries in grouped.items():
+        lines.append(f"[{sheet_name}] {len(entries)} acto(s)")
+        for idx, entry in enumerate(entries, start=1):
+            lines.append(f"{idx}. Ficha: {entry.get('ficha_detectada', '') or 'No Detectada'}")
+            lines.append(f"   Titulo: {entry.get('titulo', '')}")
+            lines.append(f"   Entidad: {entry.get('entidad', '')}")
+            lines.append(f"   Fecha: {entry.get('fecha', '')}")
+            lines.append(f"   Precio: {entry.get('precio_referencia', '')}")
+            lines.append(f"   Enlace: {entry.get('enlace', '')}")
+            lines.append("")
+
+    body = "\n".join(lines).strip() + "\n"
+    now_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    subject = f"CT RIR: {len(ordered_entries)} acto(s) nuevo(s) detectado(s) - {now_local}"
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = ", ".join(recipients)
+    msg.set_content(body)
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context, timeout=30) as server:
+        server.login(sender, password)
+        server.send_message(msg)
+
+    sent_keys = state.setdefault("ct_rir_email_sent_keys", {})
+    sent_at = datetime.now().isoformat(timespec="seconds")
+    for entry in ordered_entries:
+        key = str(entry.get("unique_key") or "").strip()
+        if key:
+            sent_keys[key] = sent_at
+    if len(sent_keys) > 5000:
+        kept_keys = sorted(sent_keys.keys())[-3000:]
+        state["ct_rir_email_sent_keys"] = {key: sent_keys[key] for key in kept_keys}
+
+    state["ct_rir_email_pending"] = []
+    state["ct_rir_email_last_sent"] = {
+        "count": len(ordered_entries),
+        "sent_at": sent_at,
+        "recipients": recipients,
+        "subject": subject,
+    }
+    save_state(state)
+    return True, "", len(ordered_entries)
 
 
 def _extract_generated_excel_name(stdout: str) -> str:
@@ -729,6 +905,27 @@ def run_job(job: JobConfig, execution: Optional[ExecutionRequest] = None) -> tup
                             detail=upload_error,
                         )
                         return "error", upload_error
+            if job.name in {"clv", "clrir", "rir1"}:
+                try:
+                    queued = _queue_ct_rir_notifications(job.name, stdout, end_time)
+                    if queued:
+                        ok, detail, sent_count = _send_pending_ct_rir_email()
+                        if ok and sent_count:
+                            logging.info(
+                                "Correo CT_RIR enviado por orquestador con %s acto(s) nuevos",
+                                sent_count,
+                            )
+                        elif not ok:
+                            logging.warning(
+                                "No se pudo enviar correo CT_RIR tras %s: %s",
+                                job.name,
+                                detail or "sin detalle",
+                            )
+                except Exception:  # pylint: disable=broad-except
+                    logging.exception(
+                        "No se pudo procesar notificacion CT_RIR para el job %s",
+                        job.name,
+                    )
             update_last_run(job.name, "success", started_at=start_time, finished_at=end_time)
             return "success", ""
         else:
@@ -1008,6 +1205,27 @@ def run_job_interruptible(
                             detail=upload_error,
                         )
                         return "error", upload_error
+            if job.name in {"clv", "clrir", "rir1"}:
+                try:
+                    queued = _queue_ct_rir_notifications(job.name, result.stdout, end_time)
+                    if queued:
+                        ok, detail, sent_count = _send_pending_ct_rir_email()
+                        if ok and sent_count:
+                            logging.info(
+                                "Correo CT_RIR enviado por orquestador con %s acto(s) nuevos",
+                                sent_count,
+                            )
+                        elif not ok:
+                            logging.warning(
+                                "No se pudo enviar correo CT_RIR tras %s: %s",
+                                job.name,
+                                detail or "sin detalle",
+                            )
+                except Exception:  # pylint: disable=broad-except
+                    logging.exception(
+                        "No se pudo procesar notificacion CT_RIR para el job %s",
+                        job.name,
+                    )
             update_last_run(job.name, "success", started_at=start_time, finished_at=end_time)
             return "success", ""
 

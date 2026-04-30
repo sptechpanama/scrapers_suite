@@ -5,7 +5,7 @@
 # - Mantiene toda la operativa (paginación, purga, CT/SR/RS/meds, checkboxes, fechas)
 # - Ajustado al HTML pegado: "Precio de referencia" + espera flexible (cualquiera de los XPaths de precio/título)
 
-import sys, re, time, unicodedata, os
+import sys, re, time, unicodedata, os, json
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse, unquote
@@ -1262,7 +1262,7 @@ def main():
 
         if df.empty:
             ensure_header(sheet, base)
-            return
+            return [], base
 
         # Orden requerido: ... ficha_detectada, Prioritario, Descartar, descripcion, item_1..item_n
         item_cols = [c for c in df.columns if c.startswith("item_")]
@@ -1325,11 +1325,12 @@ def main():
             gs_append(sheet, rows_out)
         else:
             LOG("SHEETS", f"{sheet}: sin filas nuevas para append")
+        return rows_out, desired
 
     append_df('ap_con_ct', df_prepare(datos_ct))
     append_df('ap_sin_requisitos', df_prepare(datos_sr))
     append_df('ap_sin_ficha', df_prepare(datos_sf))
-    append_df(CFG["sheet_ct_rir"], df_prepare(datos_ct_rir))
+    ct_rir_rows, ct_rir_cols = append_df(CFG["sheet_ct_rir"], df_prepare(datos_ct_rir))
 
     # Movimientos por checkboxes y limpieza final (ajustado a ap_*)
     move_rows_by_checkbox(['ap_sin_ficha','ap_sin_requisitos','ap_con_ct',CFG["sheet_ct_rir"]], CFG["sheet_prio"], "Prioritario")
@@ -1340,6 +1341,31 @@ def main():
     for sh in ['ap_sin_requisitos','ap_sin_ficha','ap_con_ct',CFG["sheet_ct_rir"]]:
         reset_checkboxes(sh)
         update_fechas_sheet(sh)
+
+    if ct_rir_rows:
+        col_idx = {col: idx for idx, col in enumerate(ct_rir_cols)}
+        preview_limit = 100
+        preview_rows = []
+        for row in ct_rir_rows[:preview_limit]:
+            preview_rows.append(
+                {
+                    "ficha_detectada": str(row[col_idx.get("ficha_detectada", -1)]).strip() if col_idx.get("ficha_detectada", -1) >= 0 else "",
+                    "titulo": str(row[col_idx.get("titulo", -1)]).strip() if col_idx.get("titulo", -1) >= 0 else "",
+                    "entidad": str(row[col_idx.get("entidad", -1)]).strip() if col_idx.get("entidad", -1) >= 0 else "",
+                    "fecha": str(row[col_idx.get("fecha", -1)]).strip() if col_idx.get("fecha", -1) >= 0 else "",
+                    "precio_referencia": str(row[col_idx.get("precio_referencia", -1)]).strip() if col_idx.get("precio_referencia", -1) >= 0 else "",
+                    "enlace": str(row[col_idx.get("enlace", -1)]).strip() if col_idx.get("enlace", -1) >= 0 else "",
+                    "hoja_origen": CFG["sheet_ct_rir"],
+                }
+            )
+        payload = {
+            "job": "rir1",
+            "sheet": CFG["sheet_ct_rir"],
+            "count": len(ct_rir_rows),
+            "rows": preview_rows,
+            "truncated": len(ct_rir_rows) > preview_limit,
+        }
+        print("CT_RIR_SUMMARY_JSON=" + json.dumps(payload, ensure_ascii=False), flush=True)
 
     LOG("DONE", f"CT={len(datos_ct)} | SinReq={len(datos_sr)} | SinFicha={len(datos_sf)} | CT_RIR={len(datos_ct_rir)} | Ignorados_RS={len(datos_rs)}")
 
