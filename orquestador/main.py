@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import ctypes
 import json
 import itertools
 import logging
@@ -27,7 +28,7 @@ from apscheduler.events import (
 )
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, field_validator
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -164,25 +165,33 @@ class JobConfig(BaseModel):
     days_of_week: List[str]
     times: List[str]
 
-    @validator("times", each_item=True)
-    def _check_time_format(cls, value: str) -> str:
-        parts = value.split(":")
-        if len(parts) != 2:
-            raise ValueError("time must be in HH:MM format")
-        hour, minute = parts
-        if not hour.isdigit() or not minute.isdigit():
-            raise ValueError("hour and minute must be numeric")
-        h, m = int(hour), int(minute)
-        if not (0 <= h <= 23 and 0 <= m <= 59):
-            raise ValueError("hour must be 0-23 and minute 0-59")
-        return f"{h:02d}:{m:02d}"
+    @field_validator("times")
+    @classmethod
+    def _check_time_format(cls, values: List[str]) -> List[str]:
+        normalized_values: List[str] = []
+        for value in values:
+            parts = value.split(":")
+            if len(parts) != 2:
+                raise ValueError("time must be in HH:MM format")
+            hour, minute = parts
+            if not hour.isdigit() or not minute.isdigit():
+                raise ValueError("hour and minute must be numeric")
+            h, m = int(hour), int(minute)
+            if not (0 <= h <= 23 and 0 <= m <= 59):
+                raise ValueError("hour must be 0-23 and minute 0-59")
+            normalized_values.append(f"{h:02d}:{m:02d}")
+        return normalized_values
 
-    @validator("days_of_week", each_item=True)
-    def _normalize_days(cls, value: str) -> str:
-        normalized = value.strip().lower()
-        if normalized not in {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}:
-            raise ValueError("days_of_week must use three-letter lowercase abbreviations")
-        return normalized
+    @field_validator("days_of_week")
+    @classmethod
+    def _normalize_days(cls, values: List[str]) -> List[str]:
+        normalized_values: List[str] = []
+        for value in values:
+            normalized = value.strip().lower()
+            if normalized not in {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}:
+                raise ValueError("days_of_week must use three-letter lowercase abbreviations")
+            normalized_values.append(normalized)
+        return normalized_values
 
 
 class OrchestratorConfig(BaseModel):
@@ -1351,12 +1360,32 @@ def compose_note(existing: Optional[str], addition: str) -> str:
 def _is_pid_running(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+
+        process_handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not process_handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not ctypes.windll.kernel32.GetExitCodeProcess(
+                process_handle, ctypes.byref(exit_code)
+            ):
+                return False
+            return exit_code.value == STILL_ACTIVE
+        finally:
+            ctypes.windll.kernel32.CloseHandle(process_handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
+    except SystemError:
+        return False
     except OSError:
         return False
     return True
