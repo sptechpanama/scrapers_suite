@@ -104,7 +104,15 @@ JOB_TIMEOUT_SECONDS_DEFAULTS = {
     "clrir": 5400,
     "rir1": 5400,
     "cotizacion_panama": 1200,
-    "sunday_db_minsa": 5400,
+    "sunday_db_minsa": 14400,
+}
+
+JOB_STARTUP_CATCHUP_SECONDS_DEFAULTS = {
+    "sunday_db_minsa": 86400,
+}
+
+REQUIRED_FALLBACK_JOB_NAMES = {
+    "sunday_db_minsa",
 }
 
 MAX_QUEUE_LOG_ITEMS = 12
@@ -137,6 +145,7 @@ JOB_NAME_LABELS = {
     "clv": "Cotizaciones Abiertas",
     "clrir": "Cotizaciones Programadas",
     "rir1": "Licitaciones",
+    "sunday_db_minsa": "Base PanamáCompra + MINSA",
     "intel_estudio_ficha": "Estudio de ficha (Inteligencia CT)",
 }
 
@@ -259,6 +268,24 @@ def build_config_signature(config: OrchestratorConfig) -> tuple:
     return tuple(signature)
 
 
+def _merge_required_jobs(
+    primary_jobs: List[JobConfig],
+    fallback_jobs: List[JobConfig],
+) -> tuple[List[JobConfig], List[str]]:
+    merged = list(primary_jobs)
+    merged_names = {job.name for job in merged}
+    injected: List[str] = []
+    for job in fallback_jobs:
+        if job.name not in REQUIRED_FALLBACK_JOB_NAMES:
+            continue
+        if job.name in merged_names:
+            continue
+        merged.append(job)
+        merged_names.add(job.name)
+        injected.append(job.name)
+    return merged, injected
+
+
 def load_config() -> OrchestratorConfig:
     sheet_jobs: List[JobConfig] = []
     sheet_had_rows = False
@@ -280,9 +307,6 @@ def load_config() -> OrchestratorConfig:
     except Exception:  # pylint: disable=broad-except
         logging.exception("Error al obtener la configuracion desde Google Sheets")
 
-    if sheet_jobs:
-        return OrchestratorConfig(jobs=sheet_jobs)
-
     fallback_config: OrchestratorConfig
     fallback_job_dicts: List[dict]
     fallback_source: str
@@ -300,6 +324,25 @@ def load_config() -> OrchestratorConfig:
         fallback_source = "valores por defecto definidos en el código"
 
     logging.info("Configuracion tomada desde %s", fallback_source)
+
+    if sheet_jobs:
+        merged_jobs, injected_names = _merge_required_jobs(sheet_jobs, fallback_config.jobs)
+        if injected_names:
+            logging.warning(
+                "Se agregan jobs requeridos ausentes en Google Sheets: %s",
+                ", ".join(injected_names),
+            )
+            try:
+                push_jobs_to_sheet([job.dict() for job in merged_jobs])
+                logging.info(
+                    "Configuracion del orquestador actualizada en Google Sheets con jobs requeridos (%s)",
+                    ", ".join(injected_names),
+                )
+            except Exception:  # pylint: disable=broad-except
+                logging.exception(
+                    "No se pudo reflejar en Google Sheets los jobs requeridos faltantes"
+                )
+        return OrchestratorConfig(jobs=merged_jobs)
 
     # if not sheet_had_rows and fallback_job_dicts:
     #     try:
@@ -716,13 +759,31 @@ def _mark_cron_slot_caught_up(job_name: str, scheduled_at: datetime) -> None:
     save_state(state)
 
 
+def resolve_startup_catchup_seconds(job_name: str) -> int:
+    env_key = f"ORQUESTADOR_STARTUP_CATCHUP_{job_name.upper()}"
+    env_value = os.environ.get(env_key)
+    if env_value is not None:
+        try:
+            parsed = int(env_value)
+            if parsed >= 0:
+                return parsed
+        except ValueError:
+            logging.warning(
+                "Catch-up invalido en %s=%r; se usara valor por defecto",
+                env_key,
+                env_value,
+            )
+    return int(JOB_STARTUP_CATCHUP_SECONDS_DEFAULTS.get(job_name, CRON_STARTUP_CATCHUP_SECONDS))
+
+
 def _maybe_enqueue_recent_cron_catchup(
     job: JobConfig,
     *,
     time_str: str,
     enqueue_func,
 ) -> None:
-    if CRON_STARTUP_CATCHUP_SECONDS <= 0:
+    catchup_seconds = resolve_startup_catchup_seconds(job.name)
+    if catchup_seconds <= 0:
         return
 
     try:
@@ -737,7 +798,7 @@ def _maybe_enqueue_recent_cron_catchup(
 
     scheduled_at = now_ref.replace(hour=hour, minute=minute, second=0, microsecond=0)
     delta_seconds = (now_ref - scheduled_at).total_seconds()
-    if delta_seconds < 0 or delta_seconds > CRON_STARTUP_CATCHUP_SECONDS:
+    if delta_seconds < 0 or delta_seconds > catchup_seconds:
         return
 
     if _job_already_ran_for_slot(job.name, scheduled_at):
@@ -758,10 +819,11 @@ def _maybe_enqueue_recent_cron_catchup(
 
     _mark_cron_slot_caught_up(job.name, scheduled_at)
     logging.info(
-        "Job %s perdio la hora %s por %ss al cargar/reprogramar; se encola ejecucion inmediata.",
+        "Job %s perdio la hora %s por %ss al cargar/reprogramar; se encola ejecucion inmediata (ventana catch-up %ss).",
         job.name,
         time_str,
         int(delta_seconds),
+        catchup_seconds,
     )
     enqueue_func(job, "cron")
 
