@@ -41,6 +41,11 @@ if str(COMMON_DIR) not in sys.path:
     sys.path.append(str(COMMON_DIR))
 
 from ficha_utils import detectar_fichas_tokens
+from keyword_watch import (
+    DEFAULT_RS_SP_KEYWORDS,
+    normalize_keyword_term,
+    summarize_keyword_rows,
+)
 
 # =========================
 # CONFIGURACIÓN (CFG)
@@ -63,6 +68,7 @@ CFG = {
     "sheet_prio": "cl_prioritarios",
     "sheet_ct_rir": "cl_prog_ct_rir",
     "sheet_ct_rir_fichas": "ct_rir_fichas",
+    "sheet_rs_sp_keywords": "pc_palabras_clave",
 
     # ---- Web (listado y selectores) ----
     "url_list": "https://www.panamacompra.gob.pa/Inicio/#/cotizaciones-en-linea/cotizaciones-en-linea",
@@ -384,6 +390,33 @@ def load_ct_rir_fichas() -> set[str]:
         if token:
             out.add(token)
     LOG("CT_RIR", f"fichas configuradas={len(out)}")
+    return out
+
+
+def load_rs_sp_keywords() -> list[str]:
+    sheet_name = CFG.get("sheet_rs_sp_keywords", "pc_palabras_clave")
+    defaults = [normalize_keyword_term(term) for term in DEFAULT_RS_SP_KEYWORDS if normalize_keyword_term(term)]
+    if not ensure_sheet_exists(sheet_name, rows=2000, cols=3):
+        return defaults
+
+    values = gs_get(f"{sheet_name}!A1:A", use_cache=False)
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in values:
+        if not row:
+            continue
+        token = normalize_keyword_term(row[0])
+        if token and token not in seen:
+            out.append(token)
+            seen.add(token)
+
+    if not out and defaults:
+        try:
+            gs_update(f"{sheet_name}!A1:A{len(defaults)}", [[term] for term in defaults])
+            out = list(defaults)
+        except Exception:
+            out = list(defaults)
+    LOG("RS_SP", f"palabras configuradas={len(out)}")
     return out
 
 def find_idx(headers, name):
@@ -897,6 +930,7 @@ def main():
     global FICHAS_CT_RIR_DYNAMIC
     ensure_sheet_exists(CFG["sheet_ct_rir"])
     FICHAS_CT_RIR_DYNAMIC = load_ct_rir_fichas()
+    rs_sp_keywords = load_rs_sp_keywords()
     purge_all()
 
     _, all_links = read_links_from_sheets(CFG["sheets_data"])
@@ -1120,9 +1154,9 @@ def main():
         gs_append(sheet, rows_out)
         return rows_out, desired
 
-    append_df('cl_prog_con_ct', df_prepare(datos_ct))
-    append_df('cl_prog_sin_requisitos', df_prepare(datos_sr))
-    append_df('cl_prog_sin_ficha', df_prepare(datos_sf))
+    prog_ct_rows, prog_ct_cols = append_df('cl_prog_con_ct', df_prepare(datos_ct))
+    prog_sr_rows, prog_sr_cols = append_df('cl_prog_sin_requisitos', df_prepare(datos_sr))
+    prog_sf_rows, prog_sf_cols = append_df('cl_prog_sin_ficha', df_prepare(datos_sf))
     ct_rir_rows, ct_rir_cols = append_df(CFG["sheet_ct_rir"], df_prepare(datos_ct_rir))
 
     # Movimientos por checkboxes y limpieza final
@@ -1160,6 +1194,42 @@ def main():
             "truncated": len(ct_rir_rows) > preview_limit,
         }
         print("CT_RIR_SUMMARY_JSON=" + json.dumps(payload, ensure_ascii=False), flush=True)
+
+    rs_sp_matches = []
+    for sheet_name, rows_out, cols_out in [
+        ("cl_prog_con_ct", prog_ct_rows, prog_ct_cols),
+        ("cl_prog_sin_requisitos", prog_sr_rows, prog_sr_cols),
+        ("cl_prog_sin_ficha", prog_sf_rows, prog_sf_cols),
+    ]:
+        summary = summarize_keyword_rows(
+            rows=rows_out,
+            cols=cols_out,
+            keyword_terms=rs_sp_keywords,
+            source_sheet=sheet_name,
+            job_name="clrir",
+        )
+        if summary:
+            rs_sp_matches.append(summary)
+
+    if rs_sp_matches:
+        total_count = 0
+        combined_rows = []
+        truncated = False
+        for summary in rs_sp_matches:
+            total_count += int(summary.get("count") or 0)
+            combined_rows.extend(summary.get("rows") or [])
+            truncated = truncated or bool(summary.get("truncated"))
+        if len(combined_rows) > 100:
+            combined_rows = combined_rows[:100]
+            truncated = True
+        payload = {
+            "job": "clrir",
+            "sheet": "rs_sp_multi",
+            "count": total_count,
+            "rows": combined_rows,
+            "truncated": truncated,
+        }
+        print("RS_SP_SUMMARY_JSON=" + json.dumps(payload, ensure_ascii=False), flush=True)
 
 
     LOG("DONE", f"CT={len(datos_ct)} | SinReq={len(datos_sr)} | SinFicha={len(datos_sf)} | CT_RIR={len(datos_ct_rir)} | Ignorados_RS={len(datos_rs)}")
