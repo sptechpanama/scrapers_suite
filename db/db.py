@@ -32,7 +32,7 @@ CFG = {
     "sheet_db": "DB",
 
     # ---- Web (listado) ----
-    "url_list": "https://www.panamacompra.gob.pa/Inicio/#/busqueda-avanzada",
+    "url_list": "https://www.panamacompra.gob.pa/Inicio/#/busqueda-avanzada?q=Qf9tnOiEmcw12bjVnIsIiW5kTOukTN6kTN6MjMUVDMtUDMtYjMwIjI6ICamJCLioFMwAjLwAjOwAjO3EDVxATLwETL1IDMyIiOiQmZiwSMtojIhJHct92Y0JCLwojIhl2YulmdvJHciwCM6IybkFGdzVmIsIiI6Iibvl2YwlmcjNXZkJye",
     "host": "www.panamacompra.gob.pa",
 
     # anchors de pliego
@@ -513,20 +513,70 @@ class PageTools:
         try: return self.d.find_element(By.XPATH, "//tabla-busqueda-avanzada-v3//table/tbody")
         except Exception: return None
     def click_next(self):
+        next_xpath = "//ul[contains(@class,'pagination')]//a[@aria-label='Next']"
         try:
-            nxt = self.d.find_element(By.XPATH, "//ul[contains(@class,'pagination')]//a[@aria-label='Next']")
+            nxt = WebDriverWait(self.d, 10).until(
+                EC.presence_of_element_located((By.XPATH, next_xpath))
+            )
+        except TimeoutException:
+            return False
+        except NoSuchElementException:
+            return False
+
+        try:
             li = nxt.find_element(By.XPATH, "./ancestor::li[1]")
             disabled = ("disabled" in (nxt.get_attribute("class") or "").lower()) or \
                        ("disabled" in (li.get_attribute("class") or "").lower()) or \
                        ((nxt.get_attribute("aria-disabled") or "").lower() == "true")
-            if disabled: return False
-            try: self.d.execute_script("arguments[0].scrollIntoView();", nxt); time.sleep(0.15); self.d.execute_script("window.scrollBy(0,-160);")
-            except: pass
-            try: nxt.click()
-            except ElementClickInterceptedException: self.d.execute_script("arguments[0].click();", nxt)
-            return True
-        except NoSuchElementException:
-            return False
+            if disabled:
+                return False
+        except Exception:
+            pass
+
+        for attempt in range(3):
+            try:
+                nxt = self.d.find_element(By.XPATH, next_xpath)
+                self.d.execute_script(
+                    "arguments[0].scrollIntoView({block:'center', inline:'center'});",
+                    nxt,
+                )
+                time.sleep(0.2)
+                self.d.execute_script("window.scrollBy(0,-120);")
+            except Exception:
+                pass
+
+            try:
+                WebDriverWait(self.d, 5).until(
+                    lambda d: nxt.is_displayed() and nxt.is_enabled()
+                )
+            except Exception:
+                pass
+
+            try:
+                nxt.click()
+                return True
+            except (ElementClickInterceptedException, ElementNotInteractableException):
+                try:
+                    self.d.execute_script(
+                        """
+                        const el = arguments[0];
+                        el.focus();
+                        el.dispatchEvent(new MouseEvent('mouseover', {bubbles:true}));
+                        el.dispatchEvent(new MouseEvent('mousedown', {bubbles:true}));
+                        el.dispatchEvent(new MouseEvent('mouseup', {bubbles:true}));
+                        el.click();
+                        """,
+                        nxt,
+                    )
+                    return True
+                except Exception:
+                    time.sleep(0.5 * (attempt + 1))
+            except StaleElementReferenceException:
+                time.sleep(0.4)
+            except Exception:
+                time.sleep(0.5 * (attempt + 1))
+
+        return False
 
 def filtrar_nuevos_enlaces(nuevos_links):
     """
