@@ -13,12 +13,14 @@ import ssl
 import subprocess
 import threading
 import time
+import unicodedata
 from collections import deque
 from datetime import datetime
 from email.message import EmailMessage
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional
+from urllib.parse import urlparse, unquote
 
 from apscheduler.events import (
     EVENT_JOB_ERROR,
@@ -159,6 +161,43 @@ CT_RIR_EMAIL_DEFAULT_FROM = "rjsp100493@gmail.com"
 CT_RIR_EMAIL_DEFAULT_TO = ["soporte@sptech.com", "rjsp100493@gmail.com"]
 RS_SP_EMAIL_DEFAULT_FROM = "rjsp100493@gmail.com"
 RS_SP_EMAIL_DEFAULT_TO = ["rjsp100493@gmail.com"]
+PANAMACOMPRA_SPREADSHEET_ID = os.environ.get(
+    "ORQUESTADOR_PANAMACOMPRA_SPREADSHEET_ID",
+    "17hOfP-vMdJ4D7xym1cUp7vAcd8XJPErpY3V-9Ui2tCo",
+)
+PANAMACOMPRA_CT_RIR_FICHAS_SHEET = "ct_rir_fichas"
+PANAMACOMPRA_RS_SP_KEYWORDS_SHEET = "pc_palabras_clave"
+PANAMACOMPRA_CT_RIR_DIRECT_SHEETS = {
+    "cl_abiertas_ct_rir",
+    "cl_prog_ct_rir",
+    "ap_ct_rir",
+}
+PANAMACOMPRA_CT_RIR_SCAN_SHEETS = [
+    "cl_abiertas",
+    "cl_abiertas_rir_sin_requisitos",
+    "cl_abiertas_rir_con_ct",
+    "cl_abiertas_ct_rir",
+    "cl_prog_sin_ficha",
+    "cl_prog_sin_requisitos",
+    "cl_prog_con_ct",
+    "cl_prog_ct_rir",
+    "ap_sin_ficha",
+    "ap_sin_requisitos",
+    "ap_con_ct",
+    "ap_ct_rir",
+]
+PANAMACOMPRA_RS_SP_SCAN_SHEETS = [
+    "cl_abiertas",
+    "cl_abiertas_rir_sin_requisitos",
+    "cl_abiertas_rir_con_ct",
+    "cl_prog_sin_ficha",
+    "cl_prog_sin_requisitos",
+    "cl_prog_con_ct",
+    "ap_sin_ficha",
+    "ap_sin_requisitos",
+    "ap_con_ct",
+]
+PANAMACOMPRA_DEFAULT_RS_SP_KEYWORDS = ("chiller", "york", "daikin")
 
 class JobConfig(BaseModel):
     name: str
@@ -549,6 +588,284 @@ def _build_rs_sp_unique_key(entry: Dict[str, object]) -> str:
     return f"{sheet}|{titulo}|{entidad}|{fecha}|{palabras}"
 
 
+def _normalize_text(value: object) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    text = "".join(
+        ch for ch in unicodedata.normalize("NFKD", text) if not unicodedata.combining(ch)
+    )
+    text = re.sub(r"[^0-9a-z]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _normalize_keyword_term(value: object) -> str:
+    return _normalize_text(value)
+
+
+def _normalize_ficha_code(value: object) -> str:
+    digits = re.sub(r"\D+", "", str(value or ""))
+    if not digits:
+        return ""
+    normalized = digits.lstrip("0")
+    return normalized or "0"
+
+
+def _extract_ficha_codes_from_label(value: object) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in re.findall(r"\d+", str(value or "")):
+        code = _normalize_ficha_code(token)
+        if code and code not in seen:
+            seen.add(code)
+            out.append(code)
+    return out
+
+
+def _normalize_url_key(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    netloc = (parsed.netloc or "").lower()
+    path = re.sub(r"/{2,}", "/", unquote(parsed.path or "")).rstrip("/").lower()
+    fragment = re.sub(r"/{2,}", "/", unquote(parsed.fragment or "")).rstrip("/").lower()
+    query = (parsed.query or "").strip().lower()
+    return f"{netloc}|{path}|{fragment}|{query}"
+
+
+def _build_module_act_key(entry: Dict[str, object]) -> str:
+    enlace_key = _normalize_url_key(entry.get("enlace"))
+    if enlace_key:
+        return enlace_key
+    titulo = _normalize_text(entry.get("titulo"))
+    entidad = _normalize_text(entry.get("entidad"))
+    fecha = str(entry.get("fecha") or "").strip().lower()
+    return f"{titulo}|{entidad}|{fecha}"
+
+
+def _truthy_cell(value: object) -> bool:
+    return _normalize_text(value) in {"true", "1", "si", "sí", "x", "yes"}
+
+
+_PANAMACOMPRA_SHEETS_SERVICE = None
+
+
+def _get_panamacompra_service():
+    global _PANAMACOMPRA_SHEETS_SERVICE
+    if _PANAMACOMPRA_SHEETS_SERVICE is not None:
+        return _PANAMACOMPRA_SHEETS_SERVICE
+
+    candidate_paths = [
+        os.environ.get("ORQUESTADOR_PANAMACOMPRA_SERVICE_ACCOUNT_FILE", "").strip(),
+        str(BASE_DIR.parent / "credentials" / "service-account.json"),
+        str(SERVICE_ACCOUNT_FILE),
+    ]
+    creds_path = next((path for path in candidate_paths if path and Path(path).exists()), None)
+    if not creds_path:
+        raise FileNotFoundError("No se encontro credencial para leer PanamaCompra")
+
+    creds = Credentials.from_service_account_file(
+        creds_path,
+        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    )
+    _PANAMACOMPRA_SHEETS_SERVICE = build(
+        "sheets", "v4", credentials=creds, cache_discovery=False
+    )
+    return _PANAMACOMPRA_SHEETS_SERVICE
+
+
+def _read_panamacompra_sheet(sheet_name: str) -> list[list[str]]:
+    service = _get_panamacompra_service()
+    return (
+        service.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=PANAMACOMPRA_SPREADSHEET_ID,
+            range=f"'{sheet_name}'!A1:ZZ",
+        )
+        .execute()
+        .get("values", [])
+    )
+
+
+def _column_index_map(headers: list[object]) -> dict[str, int]:
+    mapping: dict[str, int] = {}
+    for idx, header in enumerate(headers):
+        key = _normalize_text(header)
+        if key and key not in mapping:
+            mapping[key] = idx
+    return mapping
+
+
+def _row_value(row: list[object], mapping: dict[str, int], key: str) -> str:
+    idx = mapping.get(key)
+    if idx is None or idx >= len(row):
+        return ""
+    return str(row[idx] or "").strip()
+
+
+def _load_ct_rir_fichas_for_notifications() -> set[str]:
+    values = _read_panamacompra_sheet(PANAMACOMPRA_CT_RIR_FICHAS_SHEET)
+    out: set[str] = set()
+    for row in values:
+        if not row:
+            continue
+        token = _normalize_ficha_code(row[0])
+        if token:
+            out.add(token)
+    return out
+
+
+def _load_rs_sp_keywords_for_notifications() -> list[str]:
+    values = _read_panamacompra_sheet(PANAMACOMPRA_RS_SP_KEYWORDS_SHEET)
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in values:
+        if not row:
+            continue
+        token = _normalize_keyword_term(row[0])
+        if token and token not in seen:
+            seen.add(token)
+            out.append(token)
+    if out and out[0] == "palabra clave":
+        out = out[1:]
+    if not out:
+        out = [
+            _normalize_keyword_term(term)
+            for term in PANAMACOMPRA_DEFAULT_RS_SP_KEYWORDS
+            if _normalize_keyword_term(term)
+        ]
+    return out
+
+
+def _match_keywords_in_text(text: object, keywords: list[str]) -> list[str]:
+    normalized = _normalize_text(text)
+    if not normalized:
+        return []
+    matches: list[str] = []
+    for keyword in keywords:
+        if not keyword:
+            continue
+        pattern = rf"(?<![0-9a-z]){r'\s+'.join(re.escape(part) for part in keyword.split())}(?![0-9a-z])"
+        if re.search(pattern, normalized):
+            matches.append(keyword)
+    return matches
+
+
+def _scan_ct_rir_candidates() -> list[dict[str, object]]:
+    fichas = _load_ct_rir_fichas_for_notifications()
+    if not fichas:
+        return []
+
+    candidates: dict[str, dict[str, object]] = {}
+    for sheet_name in PANAMACOMPRA_CT_RIR_SCAN_SHEETS:
+        values = _read_panamacompra_sheet(sheet_name)
+        if not values:
+            continue
+        headers = values[0]
+        mapping = _column_index_map(headers)
+        for row in values[1:]:
+            if _truthy_cell(_row_value(row, mapping, "descartar")):
+                continue
+
+            titulo = _row_value(row, mapping, "titulo")
+            enlace = _row_value(row, mapping, "enlace")
+            entidad = _row_value(row, mapping, "entidad")
+            fecha = _row_value(row, mapping, "fecha")
+            precio = _row_value(row, mapping, "precio_referencia")
+            ficha_label = _row_value(row, mapping, "ficha_detectada")
+            if not titulo and not enlace:
+                continue
+
+            relevant = False
+            if sheet_name in PANAMACOMPRA_CT_RIR_DIRECT_SHEETS:
+                relevant = True
+            else:
+                relevant = any(code in fichas for code in _extract_ficha_codes_from_label(ficha_label))
+            if not relevant:
+                continue
+
+            entry = {
+                "hoja_origen": sheet_name,
+                "ficha_detectada": ficha_label or "No Detectada",
+                "titulo": titulo,
+                "entidad": entidad,
+                "fecha": fecha,
+                "precio_referencia": precio,
+                "enlace": enlace,
+            }
+            act_key = _build_module_act_key(entry)
+            if not act_key:
+                continue
+            previous = candidates.get(act_key)
+            if previous is None or (
+                previous.get("hoja_origen") not in PANAMACOMPRA_CT_RIR_DIRECT_SHEETS
+                and sheet_name in PANAMACOMPRA_CT_RIR_DIRECT_SHEETS
+            ):
+                candidates[act_key] = entry
+    return list(candidates.values())
+
+
+def _scan_rs_sp_candidates() -> list[dict[str, object]]:
+    keywords = _load_rs_sp_keywords_for_notifications()
+    if not keywords:
+        return []
+
+    candidates: dict[str, dict[str, object]] = {}
+    for sheet_name in PANAMACOMPRA_RS_SP_SCAN_SHEETS:
+        values = _read_panamacompra_sheet(sheet_name)
+        if not values:
+            continue
+        headers = values[0]
+        mapping = _column_index_map(headers)
+        text_keys = [key for key in mapping if key in {"titulo", "descripcion"} or key.startswith("item")]
+        if not text_keys:
+            continue
+        for row in values[1:]:
+            if _truthy_cell(_row_value(row, mapping, "descartar")):
+                continue
+
+            titulo = _row_value(row, mapping, "titulo")
+            enlace = _row_value(row, mapping, "enlace")
+            entidad = _row_value(row, mapping, "entidad")
+            fecha = _row_value(row, mapping, "fecha")
+            precio = _row_value(row, mapping, "precio_referencia")
+            if not titulo and not enlace:
+                continue
+
+            text_parts = [_row_value(row, mapping, key) for key in text_keys]
+            matched = _match_keywords_in_text(" ".join(text_parts), keywords)
+            if not matched:
+                continue
+
+            entry = {
+                "hoja_origen": sheet_name,
+                "palabras_clave": ", ".join(matched),
+                "titulo": titulo,
+                "entidad": entidad,
+                "fecha": fecha,
+                "precio_referencia": precio,
+                "enlace": enlace,
+            }
+            act_key = _build_module_act_key(entry)
+            if not act_key:
+                continue
+            previous = candidates.get(act_key)
+            if previous:
+                merged = sorted(
+                    {
+                        *[token.strip() for token in str(previous.get("palabras_clave") or "").split(",") if token.strip()],
+                        *matched,
+                    }
+                )
+                previous["palabras_clave"] = ", ".join(merged)
+            else:
+                candidates[act_key] = entry
+    return list(candidates.values())
+
+
 def _queue_ct_rir_notifications(job_name: str, stdout: str, finished_at: datetime) -> int:
     summary = _extract_ct_rir_summary(stdout)
     if not summary:
@@ -790,6 +1107,84 @@ def _send_pending_rs_sp_email() -> tuple[bool, str, int]:
     }
     save_state(state)
     return True, "", len(ordered_entries)
+
+
+def _queue_scan_based_notifications(job_name: str, module_name: str, finished_at: datetime) -> int:
+    scanner = _scan_ct_rir_candidates if module_name == "ct_rir" else _scan_rs_sp_candidates
+    unique_builder = _build_ct_rir_unique_key if module_name == "ct_rir" else _build_rs_sp_unique_key
+    pending_key_name = f"{module_name}_email_pending"
+    sent_key_name = f"{module_name}_email_sent_keys"
+    seen_key_name = f"{module_name}_module_seen_keys"
+    baseline_key_name = f"{module_name}_module_baseline"
+
+    candidates = scanner()
+    state = load_state()
+    seen_keys = state.get(seen_key_name)
+    if not isinstance(seen_keys, dict):
+        seen_keys = {}
+    pending_entries = state.setdefault(pending_key_name, [])
+    sent_keys = state.setdefault(sent_key_name, {})
+    pending_unique_keys = {
+        str(item.get("unique_key") or "")
+        for item in pending_entries
+        if isinstance(item, dict)
+    }
+
+    candidate_by_act: dict[str, dict[str, object]] = {}
+    for entry in candidates:
+        act_key = _build_module_act_key(entry)
+        if act_key:
+            candidate_by_act[act_key] = entry
+
+    if not seen_keys:
+        baseline_stamp = finished_at.isoformat(timespec="seconds")
+        state[seen_key_name] = {act_key: baseline_stamp for act_key in candidate_by_act}
+        state[baseline_key_name] = {
+            "initialized_at": baseline_stamp,
+            "count": len(candidate_by_act),
+            "job": job_name,
+        }
+        save_state(state)
+        logging.info(
+            "Notificaciones %s: baseline inicial creado con %s acto(s)",
+            module_name.upper(),
+            len(candidate_by_act),
+        )
+        return 0
+
+    queued = 0
+    seen_updated = dict(seen_keys)
+    for act_key, entry in candidate_by_act.items():
+        if act_key in seen_updated:
+            continue
+        payload = dict(entry)
+        payload["job"] = job_name
+        payload["queued_at"] = finished_at.isoformat(timespec="seconds")
+        unique_key = unique_builder(payload)
+        if not unique_key or unique_key in sent_keys or unique_key in pending_unique_keys:
+            seen_updated[act_key] = finished_at.isoformat(timespec="seconds")
+            continue
+        payload["unique_key"] = unique_key
+        pending_entries.append(payload)
+        pending_unique_keys.add(unique_key)
+        seen_updated[act_key] = finished_at.isoformat(timespec="seconds")
+        queued += 1
+
+    if len(seen_updated) > 12000:
+        ordered_items = list(seen_updated.items())[-8000:]
+        seen_updated = {key: value for key, value in ordered_items}
+
+    if queued:
+        state[pending_key_name] = pending_entries[-500:]
+        state[f"{module_name}_email_last_queue"] = {
+            "job": job_name,
+            "count": queued,
+            "queued_at": finished_at.isoformat(timespec="seconds"),
+            "mode": "sheet_scan",
+        }
+    state[seen_key_name] = seen_updated
+    save_state(state)
+    return queued
 
 
 def _extract_generated_excel_name(stdout: str) -> str:
@@ -1197,6 +1592,46 @@ def run_job(job: JobConfig, execution: Optional[ExecutionRequest] = None) -> tup
                         "No se pudo procesar notificacion RS_SP para el job %s",
                         job.name,
                     )
+                try:
+                    queued = _queue_scan_based_notifications(job.name, "ct_rir", end_time)
+                    if queued:
+                        ok, detail, sent_count = _send_pending_ct_rir_email()
+                        if ok and sent_count:
+                            logging.info(
+                                "Correo CT_RIR enviado por escaneo de hojas con %s acto(s) nuevos",
+                                sent_count,
+                            )
+                        elif not ok:
+                            logging.warning(
+                                "No se pudo enviar correo CT_RIR por escaneo tras %s: %s",
+                                job.name,
+                                detail or "sin detalle",
+                            )
+                except Exception:  # pylint: disable=broad-except
+                    logging.exception(
+                        "No se pudo procesar escaneo CT_RIR para el job %s",
+                        job.name,
+                    )
+                try:
+                    queued = _queue_scan_based_notifications(job.name, "rs_sp", end_time)
+                    if queued:
+                        ok, detail, sent_count = _send_pending_rs_sp_email()
+                        if ok and sent_count:
+                            logging.info(
+                                "Correo RS_SP enviado por escaneo de hojas con %s acto(s) nuevos",
+                                sent_count,
+                            )
+                        elif not ok:
+                            logging.warning(
+                                "No se pudo enviar correo RS_SP por escaneo tras %s: %s",
+                                job.name,
+                                detail or "sin detalle",
+                            )
+                except Exception:  # pylint: disable=broad-except
+                    logging.exception(
+                        "No se pudo procesar escaneo RS_SP para el job %s",
+                        job.name,
+                    )
             update_last_run(job.name, "success", started_at=start_time, finished_at=end_time)
             return "success", ""
         else:
@@ -1515,6 +1950,46 @@ def run_job_interruptible(
                 except Exception:  # pylint: disable=broad-except
                     logging.exception(
                         "No se pudo procesar notificacion RS_SP para el job %s",
+                        job.name,
+                    )
+                try:
+                    queued = _queue_scan_based_notifications(job.name, "ct_rir", end_time)
+                    if queued:
+                        ok, detail, sent_count = _send_pending_ct_rir_email()
+                        if ok and sent_count:
+                            logging.info(
+                                "Correo CT_RIR enviado por escaneo de hojas con %s acto(s) nuevos",
+                                sent_count,
+                            )
+                        elif not ok:
+                            logging.warning(
+                                "No se pudo enviar correo CT_RIR por escaneo tras %s: %s",
+                                job.name,
+                                detail or "sin detalle",
+                            )
+                except Exception:  # pylint: disable=broad-except
+                    logging.exception(
+                        "No se pudo procesar escaneo CT_RIR para el job %s",
+                        job.name,
+                    )
+                try:
+                    queued = _queue_scan_based_notifications(job.name, "rs_sp", end_time)
+                    if queued:
+                        ok, detail, sent_count = _send_pending_rs_sp_email()
+                        if ok and sent_count:
+                            logging.info(
+                                "Correo RS_SP enviado por escaneo de hojas con %s acto(s) nuevos",
+                                sent_count,
+                            )
+                        elif not ok:
+                            logging.warning(
+                                "No se pudo enviar correo RS_SP por escaneo tras %s: %s",
+                                job.name,
+                                detail or "sin detalle",
+                            )
+                except Exception:  # pylint: disable=broad-except
+                    logging.exception(
+                        "No se pudo procesar escaneo RS_SP para el job %s",
                         job.name,
                     )
             update_last_run(job.name, "success", started_at=start_time, finished_at=end_time)
