@@ -199,6 +199,10 @@ PANAMACOMPRA_RS_SP_SCAN_SHEETS = [
 ]
 PANAMACOMPRA_DEFAULT_RS_SP_KEYWORDS = ("chiller", "york", "daikin")
 
+
+class SingleInstanceRunningError(RuntimeError):
+    """Se lanza cuando ya existe otra instancia operativa del orquestador."""
+
 class JobConfig(BaseModel):
     name: str
     python: str
@@ -2088,16 +2092,24 @@ def _is_pid_running(pid: int) -> bool:
 
 def acquire_single_instance_guard() -> None:
     current_pid = os.getpid()
+    current_parent_pid = os.getppid()
     if PID_PATH.exists():
         try:
             existing_pid = int(PID_PATH.read_text(encoding="utf-8").strip())
         except Exception:
             existing_pid = 0
         if existing_pid and existing_pid != current_pid and _is_pid_running(existing_pid):
-            raise RuntimeError(
-                f"Ya existe una instancia activa del orquestador (PID {existing_pid}). "
-                "Cierra esa instancia antes de iniciar una nueva."
-            )
+            if os.name == "nt" and existing_pid == current_parent_pid:
+                logging.info(
+                    "Guard de instancia: se detecta handoff del launcher venv (PID padre %s -> hijo %s).",
+                    existing_pid,
+                    current_pid,
+                )
+            else:
+                raise SingleInstanceRunningError(
+                    f"Ya existe una instancia activa del orquestador (PID {existing_pid}). "
+                    "Cierra esa instancia antes de iniciar una nueva."
+                )
 
     PID_PATH.write_text(str(current_pid), encoding="utf-8")
 
@@ -2687,6 +2699,9 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
+    except SingleInstanceRunningError as exc:
+        logging.warning("%s", exc)
+        raise SystemExit(0)
     except Exception as exc:
         logging.exception("Orquestador detenido por excepcion no controlada: %s", exc)
         while True:
