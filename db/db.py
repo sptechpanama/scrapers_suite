@@ -359,11 +359,52 @@ def db_init():
                 num_participantes TEXT
             );
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS db_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TEXT
+            );
+        """)
         conn.commit()
         conn.close()
         LOG("DB", "Base de datos y tabla creadas o ya existentes (con UNIQUE en enlace).")
     except Error as e:
         LOG("DB", f"Error creando tabla: {e}")
+
+
+def db_set_metadata(key: str, value: str) -> None:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        now_iso = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        cur.execute(
+            """
+            INSERT INTO db_metadata(key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (str(key), str(value), now_iso),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        LOG("DB", f"Error guardando metadata {key}: {e}")
+
+
+def db_get_latest_data_update() -> str:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(fecha_actualizacion) FROM actos_publicos")
+        row = cur.fetchone()
+        conn.close()
+        return str(row[0]).strip() if row and row[0] is not None else ""
+    except Exception as e:
+        LOG("DB", f"Error leyendo ultima actualizacion de datos: {e}")
+        return ""
 
 def asegurar_columnas_dinamicas(df):
     """
@@ -1151,6 +1192,11 @@ def collect_links_by_state(driver, url_with_state_param):
 
 def main():
     db_init()
+    run_started_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    db_set_metadata("last_run_started_at", run_started_at)
+    db_set_metadata("last_run_status", "running")
+    db_set_metadata("last_run_script", str(Path(__file__).resolve()))
+    links_adj, links_des = [], []
     rows_all_adj, rows_all_des = [], []  # ✅ listas acumuladoras
     # Header (sin columnas dinámicas)
     base_cols = [
@@ -1308,6 +1354,14 @@ def main():
         db_insert_rows(df_all)
     else:
         LOG("DB", "0 filas nuevas")
+
+    latest_data_update = db_get_latest_data_update()
+    db_set_metadata("last_run_completed_at", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    db_set_metadata("last_run_status", "success")
+    db_set_metadata("last_rows_written", str(len(df_all)))
+    db_set_metadata("last_new_links_count", str(len(links_adj) + len(links_des)))
+    if latest_data_update:
+        db_set_metadata("last_data_update_at", latest_data_update)
 
 
 if __name__ == "__main__":
