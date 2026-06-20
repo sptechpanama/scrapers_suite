@@ -239,6 +239,7 @@ from googleapiclient.errors import HttpError
 creds = Credentials.from_service_account_file(CFG["svc_key"])
 GSVC = build('sheets','v4',credentials=creds)
 SSID = CFG["spreadsheet_id"]
+SHEET_CACHE: dict[str, list[list[str]]] = {}
 
 
 def call_with_backoff(action, label: str = "Sheets", max_attempts: int = 5, base_delay: float = 2.0):
