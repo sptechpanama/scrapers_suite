@@ -9,6 +9,7 @@ import time
 import uuid
 import traceback
 import unicodedata
+from contextlib import closing
 from difflib import SequenceMatcher
 from datetime import datetime
 from html import unescape
@@ -95,7 +96,7 @@ def _date(v: object) -> pd.Timestamp:
     t = _clean(v)
     if not t:
         return pd.NaT
-    d = pd.to_datetime(t, errors="coerce", dayfirst=True)
+    d = pd.to_datetime(t, errors="coerce", dayfirst=not bool(re.match(r"^\d{4}[\-/]", t)))
     if pd.isna(d):
         d = pd.to_datetime(t, errors="coerce")
     return d
@@ -611,6 +612,15 @@ def _catalog_map() -> dict[str, dict[str, str]]:
 
 
 def _catalog_lookup(cmap: dict[str, dict[str, str]], ficha: str, proveedor: str) -> dict[str, str]:
+    def _ficha_digits(v: object) -> str:
+        raw = _clean(v)
+        if not raw:
+            return ""
+        m = re.fullmatch(r"\s*(\d+)(?:\.0+)?\s*", raw)
+        if m:
+            return m.group(1)
+        return re.sub(r"\D", "", raw)
+
     def _name_score(a: str, b: str) -> float:
         if not a or not b:
             return 0.0
@@ -629,7 +639,7 @@ def _catalog_lookup(cmap: dict[str, dict[str, str]], ficha: str, proveedor: str)
         return min(max(base, seq), 1.0)
 
     p = _norm(proveedor)
-    f = re.sub(r"\D", "", ficha)
+    f = _ficha_digits(ficha)
     rec = cmap.get(f"{f}|{p}") or cmap.get(f"|{p}")
     if not rec and p and f:
         # Fuzzy prioritario dentro de la misma ficha.
@@ -675,27 +685,154 @@ def _catalog_lookup(cmap: dict[str, dict[str, str]], ficha: str, proveedor: str)
     }
 
 
-def _acts_for_ficha(db: Path, ficha: str) -> pd.DataFrame:
+def _detection_score_for_ficha(raw_json: object, ficha: str, legacy_value: object = "") -> float:
+    """Devuelve la mejor confianza de la ficha sin contar varias evidencias dos veces."""
+    best = 0.0
+    try:
+        parsed = json.loads(_clean(raw_json)) if _clean(raw_json) else []
+    except Exception:
+        parsed = []
+    if isinstance(parsed, dict):
+        parsed = parsed.get("fichas") or parsed.get("detecciones") or [parsed]
+    if isinstance(parsed, list):
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            code = re.sub(r"\D", "", str(item.get("code") or item.get("ficha") or ""))
+            if code != str(ficha):
+                continue
+            best = max(best, _num(item.get("score", 0)))
+    if best <= 0 and any(re.sub(r"\D", "", token) == str(ficha) for token in _extract_tokens(legacy_value)):
+        best = 70.0
+    return min(100.0, max(0.0, best))
+
+
+def _filter_acts_by_payload(df: pd.DataFrame, filters: dict[str, Any] | None, ficha: str) -> pd.DataFrame:
+    if df.empty or not filters:
+        return df
+    out = df.copy()
+    date_map = {
+        "publicacion": "publicacion",
+        "celebracion": "fecha",
+        "adjudicacion": "fecha_adjudicacion",
+        "actualizacion": "fecha_actualizacion",
+    }
+    date_column = date_map.get(_clean(filters.get("tipo_fecha", "")).lower(), "publicacion")
+    start = pd.to_datetime(_clean(filters.get("fecha_desde", "")), errors="coerce")
+    end = pd.to_datetime(_clean(filters.get("fecha_hasta", "")), errors="coerce")
+    if date_column in out.columns and (not pd.isna(start) or not pd.isna(end)):
+        # Extrae la primera fecha del texto para rangos del tipo "01-01-2026 a 05-01-2026".
+        raw_dates = out[date_column].fillna("").astype(str).str.extract(
+            r"(\d{1,2}[\-/]\d{1,2}[\-/]\d{4}|\d{4}[\-/]\d{1,2}[\-/]\d{1,2})",
+            expand=False,
+        )
+        iso_mask = raw_dates.fillna("").str.match(r"^\d{4}[\-/]")
+        parsed_dates = pd.Series(pd.NaT, index=raw_dates.index, dtype="datetime64[ns]")
+        if iso_mask.any():
+            parsed_dates.loc[iso_mask] = pd.to_datetime(raw_dates.loc[iso_mask], errors="coerce")
+        if (~iso_mask).any():
+            parsed_dates.loc[~iso_mask] = pd.to_datetime(
+                raw_dates.loc[~iso_mask], errors="coerce", dayfirst=True
+            )
+        if not pd.isna(start):
+            out = out.loc[parsed_dates >= start].copy()
+            parsed_dates = parsed_dates.loc[out.index]
+        if not pd.isna(end):
+            out = out.loc[parsed_dates <= end].copy()
+
+    states = {_norm(value) for value in (filters.get("estados") or []) if _clean(value)}
+    if states and "estado" in out.columns:
+        out = out[out["estado"].map(_norm).isin(states)].copy()
+    entities = {_norm(value) for value in (filters.get("entidades") or []) if _clean(value)}
+    if entities and "entidad" in out.columns:
+        out = out[out["entidad"].map(_norm).isin(entities)].copy()
+
+    min_amount = _num(filters.get("monto_minimo", 0))
+    max_amount = _num(filters.get("monto_maximo", 0))
+    amounts = out.get("precio_referencia", pd.Series(0, index=out.index)).map(_num)
+    if min_amount > 0:
+        out = out.loc[amounts >= min_amount].copy()
+        amounts = amounts.loc[out.index]
+    if max_amount > 0:
+        out = out.loc[amounts <= max_amount].copy()
+
+    min_awarded = _num(filters.get("adjudicado_minimo", 0))
+    max_awarded = _num(filters.get("adjudicado_maximo", 0))
+    awarded = out.get("total_items_ofertados", pd.Series(0, index=out.index)).map(_num)
+    if min_awarded > 0:
+        out = out.loc[awarded >= min_awarded].copy()
+        awarded = awarded.loc[out.index]
+    if max_awarded > 0:
+        out = out.loc[awarded <= max_awarded].copy()
+
+    threshold = _num(filters.get("score_minimo", 0))
+    if threshold > 0 and "fichas_detectadas_json" in out.columns:
+        scores = out.apply(
+            lambda row: _detection_score_for_ficha(
+                row.get("fichas_detectadas_json", ""), ficha, row.get("ficha_detectada", "")
+            ),
+            axis=1,
+        )
+        out = out.loc[scores >= threshold].copy()
+
+    groups = [_norm(value) for value in (filters.get("busqueda") or []) if _clean(value)]
+    if groups:
+        text_series = (
+            out.get("titulo", pd.Series("", index=out.index)).fillna("").astype(str)
+            + " "
+            + out.get("descripcion", pd.Series("", index=out.index)).fillna("").astype(str)
+            + " "
+            + out.get("entidad", pd.Series("", index=out.index)).fillna("").astype(str)
+        ).map(_norm)
+        masks = [text_series.str.contains(group, regex=False, na=False) for group in groups]
+        combined = masks[0]
+        if _clean(filters.get("modo_busqueda", "OR")).upper() == "AND":
+            for mask in masks[1:]:
+                combined &= mask
+        else:
+            for mask in masks[1:]:
+                combined |= mask
+        out = out.loc[combined].copy()
+    return out
+
+
+def _acts_for_ficha(db: Path, ficha: str, filters: dict[str, Any] | None = None) -> pd.DataFrame:
     f = re.sub(r"\D", "", ficha)
     like = f"%{f}%"
-    sql = """
-    SELECT id, enlace, titulo, entidad, descripcion, ficha_detectada, razon_social, nombre_comercial,
-           fecha AS fecha_publicacion_db, fecha_adjudicacion, precio_referencia, termino_entrega, estado
+    with closing(sqlite3.connect(db)) as conn:
+        available_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(actos_publicos)").fetchall()
+        }
+        awarded_column = (
+            "total_items_ofertados"
+            if "total_items_ofertados" in available_columns
+            else "'' AS total_items_ofertados"
+        )
+        sql = f"""
+    SELECT id, enlace, titulo, entidad, descripcion, ficha_detectada, fichas_detectadas_json,
+           razon_social, nombre_comercial, publicacion, fecha, fecha_adjudicacion, fecha_actualizacion,
+           precio_referencia, {awarded_column}, termino_entrega, estado
     FROM actos_publicos
-    WHERE ficha_detectada LIKE ? OR titulo LIKE ? OR descripcion LIKE ?
+    WHERE ficha_detectada LIKE ? OR fichas_detectadas_json LIKE ? OR titulo LIKE ? OR descripcion LIKE ?
     ORDER BY id DESC
     """
-    with sqlite3.connect(db) as conn:
-        df = pd.read_sql_query(sql, conn, params=(like, like, like))
+        df = pd.read_sql_query(sql, conn, params=(like, like, like, like))
     if df.empty:
         return df
     def has_ficha(v: object) -> bool:
         return any(re.sub(r"\D", "", tk) == f for tk in _extract_tokens(v))
-    out = df[df["ficha_detectada"].map(has_ficha)].copy()
+    json_match = df["fichas_detectadas_json"].map(
+        lambda raw: _detection_score_for_ficha(raw, f, "") > 0
+    )
+    out = df[df["ficha_detectada"].map(has_ficha) | json_match].copy()
     if out.empty:
         txt = df["titulo"].fillna("").astype(str) + " " + df["descripcion"].fillna("").astype(str)
         out = df[txt.str.contains(f, case=False, regex=False, na=False)].copy()
-    return out.drop_duplicates(subset=["id"])
+    out = out.drop_duplicates(subset=["id"])
+    out = _filter_acts_by_payload(out, filters, f)
+    # Mantiene el nombre utilizado por el resto del worker, corrigiendo su origen real.
+    out["fecha_publicacion_db"] = out.get("publicacion", "")
+    return out
 
 
 def _replace_rows(sheet: str, headers: list[str], ficha: str, new_rows: list[list[str]]) -> None:
@@ -774,12 +911,13 @@ def main() -> int:
         raise RuntimeError("No se encontro panamacompra.db local")
 
     _log(f"request={request_id or 'sin-id'} | ficha={ficha} | db={db_path}", t0)
-    acts = _acts_for_ficha(db_path, ficha)
+    filters = payload.get("filters") if isinstance(payload.get("filters"), dict) else {}
+    acts = _acts_for_ficha(db_path, ficha, filters)
     max_acts = _debug_max_acts()
     if max_acts > 0:
         acts = acts.head(max_acts).copy()
         _log(f"DEBUG activo: limitando a {max_acts} actos", t0)
-    _log(f"actos detectados: {len(acts)}", t0)
+    _log(f"actos detectados en el alcance solicitado: {len(acts)} | filtros={json.dumps(filters, ensure_ascii=False)}", t0)
 
     run_id = str(uuid.uuid4())
     now = datetime.now().isoformat(timespec="seconds")

@@ -1,0 +1,7 @@
+{
+  "drive_file_id": "1TQYzsflXlE-5OwYKmTx0bTZ0rD9Ayivs",
+  "publish_targets": [
+    "%USERPROFILE%\\GEAPP\\panamacompra.db",
+    "%USERPROFILE%\\OneDrive\\cl\\panamacompra.db"
+  ]
+}
