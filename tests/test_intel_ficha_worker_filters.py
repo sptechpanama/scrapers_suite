@@ -14,7 +14,11 @@ import pandas as pd
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "orquestador"))
 
-from intel_ficha_worker import _acts_for_ficha, _filter_acts_by_payload  # noqa: E402
+from intel_ficha_worker import (  # noqa: E402
+    _acts_for_ficha,
+    _filter_acts_by_payload,
+    _study_filters_from_payload,
+)
 
 
 class WorkerFilterTests(unittest.TestCase):
@@ -108,6 +112,86 @@ class WorkerFilterTests(unittest.TestCase):
                 connection.commit()
             result = _acts_for_ficha(database, "43358")
             self.assertEqual(result["id"].tolist(), [7])
+
+    def test_historical_scope_is_default_and_ignores_visual_filters(self) -> None:
+        scope, filters = _study_filters_from_payload(
+            {
+                "filters": {
+                    "fecha_desde": "2026-01-01",
+                    "fecha_hasta": "2026-12-31",
+                }
+            }
+        )
+        self.assertEqual(scope, "historico_completo")
+        self.assertEqual(filters, {})
+
+        scope, filters = _study_filters_from_payload(
+            {
+                "study_scope": "analisis_actual",
+                "filters": {"fecha_desde": "2026-01-01"},
+            }
+        )
+        self.assertEqual(scope, "analisis_actual")
+        self.assertEqual(filters, {"fecha_desde": "2026-01-01"})
+
+    def test_acts_for_ficha_uses_normalized_analytics_relation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_database = Path(temp_dir) / "source.db"
+            analytics_database = Path(temp_dir) / "analytics.db"
+            with closing(sqlite3.connect(source_database)) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE actos_publicos (
+                        id INTEGER, enlace TEXT, titulo TEXT, entidad TEXT, descripcion TEXT,
+                        ficha_detectada TEXT, fichas_detectadas_json TEXT, razon_social TEXT,
+                        nombre_comercial TEXT, publicacion TEXT, fecha TEXT,
+                        fecha_adjudicacion TEXT, fecha_actualizacion TEXT,
+                        precio_referencia TEXT, termino_entrega TEXT, estado TEXT
+                    )
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO actos_publicos VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        99,
+                        "https://example.test/99",
+                        "INSUMO RESPIRATORIO",
+                        "CSS",
+                        "La fila operacional aún no fue reclasificada",
+                        "",
+                        "",
+                        "GANADOR",
+                        "GANADOR",
+                        "2025-05-01",
+                        "2025-05-05",
+                        "2025-05-10",
+                        "2025-05-11",
+                        "1000",
+                        "30 días",
+                        "Adjudicado",
+                    ),
+                )
+                connection.commit()
+            with closing(sqlite3.connect(analytics_database)) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE intel_actos_fichas (
+                        source_id TEXT, enlace TEXT, ficha TEXT
+                    )
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO intel_actos_fichas VALUES (?,?,?)",
+                    ("99", "https://example.test/99", "43358"),
+                )
+                connection.commit()
+
+            result = _acts_for_ficha(
+                source_database,
+                "43358",
+                analytics_db=analytics_database,
+            )
+            self.assertEqual(result["id"].tolist(), [99])
 
 
 if __name__ == "__main__":

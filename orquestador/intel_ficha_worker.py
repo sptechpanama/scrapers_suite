@@ -796,9 +796,66 @@ def _filter_acts_by_payload(df: pd.DataFrame, filters: dict[str, Any] | None, fi
     return out
 
 
-def _acts_for_ficha(db: Path, ficha: str, filters: dict[str, Any] | None = None) -> pd.DataFrame:
+def _analytics_refs_for_ficha(
+    analytics_db: Path | None,
+    ficha: str,
+) -> tuple[set[str], set[str]]:
+    """Lee la relación normalizada ficha→acto usada por Inteligencia v3.
+
+    La capa analítica es más confiable que volver a buscar el código dentro de
+    textos libres. Si no está disponible, el worker conserva su búsqueda
+    histórica como respaldo.
+    """
+    if analytics_db is None or not analytics_db.exists():
+        return set(), set()
+    try:
+        with closing(sqlite3.connect(analytics_db)) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='intel_actos_fichas'"
+            ).fetchone()
+            if not exists:
+                return set(), set()
+            rows = conn.execute(
+                """
+                SELECT CAST(source_id AS TEXT), COALESCE(enlace, '')
+                FROM intel_actos_fichas
+                WHERE ficha = ?
+                """,
+                (str(ficha),),
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        return set(), set()
+
+    source_ids = {_clean(row[0]) for row in rows if _clean(row[0])}
+    links = {_clean(row[1]) for row in rows if _clean(row[1])}
+    return source_ids, links
+
+
+def _study_filters_from_payload(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Determina si el estudio usa historial completo o el análisis visible."""
+    raw_scope = _norm(payload.get("study_scope", "historico_completo"))
+    if raw_scope in {
+        "analisis actual",
+        "analisis_actual",
+        "filtros actuales",
+        "filtros_actuales",
+    }:
+        filters = payload.get("filters")
+        return "analisis_actual", filters if isinstance(filters, dict) else {}
+    return "historico_completo", {}
+
+
+def _acts_for_ficha(
+    db: Path,
+    ficha: str,
+    filters: dict[str, Any] | None = None,
+    *,
+    analytics_db: Path | None = None,
+) -> pd.DataFrame:
     f = re.sub(r"\D", "", ficha)
     like = f"%{f}%"
+    relation_ids, relation_links = _analytics_refs_for_ficha(analytics_db, f)
     with closing(sqlite3.connect(db)) as conn:
         available_columns = {
             str(row[1]) for row in conn.execute("PRAGMA table_info(actos_publicos)").fetchall()
@@ -808,30 +865,102 @@ def _acts_for_ficha(db: Path, ficha: str, filters: dict[str, Any] | None = None)
             if "total_items_ofertados" in available_columns
             else "'' AS total_items_ofertados"
         )
-        sql = f"""
+        base_select = f"""
     SELECT id, enlace, titulo, entidad, descripcion, ficha_detectada, fichas_detectadas_json,
            razon_social, nombre_comercial, publicacion, fecha, fecha_adjudicacion, fecha_actualizacion,
            precio_referencia, {awarded_column}, termino_entrega, estado
     FROM actos_publicos
-    WHERE ficha_detectada LIKE ? OR fichas_detectadas_json LIKE ? OR titulo LIKE ? OR descripcion LIKE ?
-    ORDER BY id DESC
     """
-        df = pd.read_sql_query(sql, conn, params=(like, like, like, like))
+        # Con relación analítica disponible solo buscamos detecciones
+        # estructuradas recientes que aún no hayan entrado a esa capa. El
+        # barrido de textos grandes (items/source JSON) queda como fallback
+        # cuando la analítica no existe, evitando escanear cientos de MB en
+        # cada estudio.
+        text_candidates = (
+            ("ficha_detectada", "fichas_detectadas_json")
+            if relation_ids or relation_links
+            else (
+                "ficha_detectada",
+                "fichas_detectadas_json",
+                "titulo",
+                "descripcion",
+                "items_json",
+                "source_record_json",
+            )
+        )
+        text_columns = [
+            column
+            for column in text_candidates
+            if column in available_columns
+        ]
+        frames: list[pd.DataFrame] = []
+        if text_columns:
+            where_text = " OR ".join(f"{column} LIKE ?" for column in text_columns)
+            frames.append(
+                pd.read_sql_query(
+                    f"{base_select} WHERE {where_text}",
+                    conn,
+                    params=tuple(like for _ in text_columns),
+                )
+            )
+
+        # SQLite suele limitar la cantidad de parámetros por sentencia. Se
+        # consulta por bloques para cubrir fichas con cientos o miles de actos.
+        relation_id_list = sorted(relation_ids)
+        for start in range(0, len(relation_id_list), 700):
+            chunk = relation_id_list[start : start + 700]
+            placeholders = ",".join("?" for _ in chunk)
+            frames.append(
+                pd.read_sql_query(
+                    f"{base_select} WHERE CAST(id AS TEXT) IN ({placeholders})",
+                    conn,
+                    params=tuple(chunk),
+                )
+            )
+        relation_link_list = sorted(relation_links)
+        for start in range(0, len(relation_link_list), 500):
+            chunk = relation_link_list[start : start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            frames.append(
+                pd.read_sql_query(
+                    f"{base_select} WHERE enlace IN ({placeholders})",
+                    conn,
+                    params=tuple(chunk),
+                )
+            )
+
+    non_empty_frames = [frame for frame in frames if not frame.empty]
+    if not non_empty_frames:
+        return pd.DataFrame()
+    df = pd.concat(non_empty_frames, ignore_index=True)
+    df = df.drop_duplicates(subset=["id", "enlace"], keep="first")
     if df.empty:
         return df
+
     def has_ficha(v: object) -> bool:
         return any(re.sub(r"\D", "", tk) == f for tk in _extract_tokens(v))
+
     json_match = df["fichas_detectadas_json"].map(
         lambda raw: _detection_score_for_ficha(raw, f, "") > 0
     )
-    out = df[df["ficha_detectada"].map(has_ficha) | json_match].copy()
+    relation_match = (
+        df["id"].astype(str).isin(relation_ids)
+        | df["enlace"].fillna("").astype(str).isin(relation_links)
+    )
+    out = df[
+        df["ficha_detectada"].map(has_ficha)
+        | json_match
+        | relation_match
+    ].copy()
     if out.empty:
         txt = df["titulo"].fillna("").astype(str) + " " + df["descripcion"].fillna("").astype(str)
         out = df[txt.str.contains(f, case=False, regex=False, na=False)].copy()
-    out = out.drop_duplicates(subset=["id"])
+    out = out.drop_duplicates(subset=["id", "enlace"], keep="first")
     out = _filter_acts_by_payload(out, filters, f)
     # Mantiene el nombre utilizado por el resto del worker, corrigiendo su origen real.
     out["fecha_publicacion_db"] = out.get("publicacion", "")
+    out.attrs["analytics_relation_ids"] = len(relation_ids)
+    out.attrs["analytics_relation_links"] = len(relation_links)
     return out
 
 
@@ -910,14 +1039,43 @@ def main() -> int:
     if db_path is None:
         raise RuntimeError("No se encontro panamacompra.db local")
 
-    _log(f"request={request_id or 'sin-id'} | ficha={ficha} | db={db_path}", t0)
-    filters = payload.get("filters") if isinstance(payload.get("filters"), dict) else {}
-    acts = _acts_for_ficha(db_path, ficha, filters)
+    analytics_candidates = [
+        (
+            Path(_clean(payload.get("analytics_db_path", "")))
+            if _clean(payload.get("analytics_db_path", ""))
+            else None
+        ),
+        Path(r"C:\Users\rodri\scrapers_repo\data\db\inteligencia_proveedores.db"),
+    ]
+    analytics_db_path = next(
+        (path for path in analytics_candidates if path and path.exists()),
+        None,
+    )
+    study_scope, filters = _study_filters_from_payload(payload)
+    _log(
+        f"request={request_id or 'sin-id'} | ficha={ficha} | db={db_path} "
+        f"| analytics_db={analytics_db_path or 'no disponible'} "
+        f"| alcance={study_scope}",
+        t0,
+    )
+    acts = _acts_for_ficha(
+        db_path,
+        ficha,
+        filters,
+        analytics_db=analytics_db_path,
+    )
     max_acts = _debug_max_acts()
     if max_acts > 0:
         acts = acts.head(max_acts).copy()
         _log(f"DEBUG activo: limitando a {max_acts} actos", t0)
-    _log(f"actos detectados en el alcance solicitado: {len(acts)} | filtros={json.dumps(filters, ensure_ascii=False)}", t0)
+    _log(
+        "actos detectados en el alcance solicitado: "
+        f"{len(acts)} | referencias_analiticas="
+        f"{acts.attrs.get('analytics_relation_ids', 0)} ids/"
+        f"{acts.attrs.get('analytics_relation_links', 0)} enlaces "
+        f"| filtros={json.dumps(filters, ensure_ascii=False)}",
+        t0,
+    )
 
     run_id = str(uuid.uuid4())
     now = datetime.now().isoformat(timespec="seconds")
