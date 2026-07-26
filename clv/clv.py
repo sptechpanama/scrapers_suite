@@ -46,6 +46,18 @@ from keyword_watch import (
     normalize_keyword_term,
     summarize_keyword_rows,
 )
+from cl_lifecycle import (
+    RETRY_STATES as CL_RETRY_STATES,
+    apply_observation as apply_cl_observation,
+    cl_key_for as cl_lifecycle_key,
+    inspect_closed_cl,
+    load_known_links as load_cl_known_links,
+    load_retry_records as load_cl_retry_records,
+    persist_local as persist_cl_local,
+    record_from_mapping as cl_record_from_mapping,
+    should_inspect_cl as cl_should_inspect,
+    sync_pending_to_postgres as sync_cl_postgres,
+)
 
 # =========================
 # CONFIGURACIÓN (CFG)
@@ -582,17 +594,51 @@ def delete_rows(sheet, rows_1b):
     sid = gs_sheet_id(sheet)
     if sid is None or not rows_1b:
         return
-    req = [{
-        "deleteDimension": {
-            "range": {"sheetId": sid, "dimension": "ROWS", "startIndex": r - 1, "endIndex": r}
-        }
-    } for r in sorted({r for r in rows_1b if r >= 2}, reverse=True)]
-    if req:
+    row_indexes = sorted({r for r in rows_1b if r >= 2}, reverse=True)
+    if not row_indexes:
+        return
+    total_deleted = 0
+    batch_size = 300
+    for idx in range(0, len(row_indexes), batch_size):
+        batch = row_indexes[idx : idx + batch_size]
+        req = [{
+            "deleteDimension": {
+                "range": {"sheetId": sid, "dimension": "ROWS", "startIndex": r - 1, "endIndex": r}
+            }
+        } for r in batch]
         exec_with_backoff(
             GSVC.spreadsheets().batchUpdate(spreadsheetId=SSID, body={"requests": req}),
             label=f"delete {sheet}",
         )
-        LOG("SHEETS", f"{sheet}: -{len(req)} filas")
+        total_deleted += len(req)
+    SHEET_CACHE.pop(sheet, None)
+    LOG("SHEETS", f"{sheet}: -{total_deleted} filas")
+
+
+def _sheet_row_has_meaningful_data(header, row) -> bool:
+    if not header or not row:
+        return False
+    normalized = [str(col).strip().lower() for col in header]
+    content_idx = []
+    for idx, col in enumerate(normalized):
+        if col in {"fecha de actualización", "fecha de actualizacion", "prioritario", "descartar"}:
+            continue
+        if col in {
+            "publicacion",
+            "enlace",
+            "titulo",
+            "precio_referencia",
+            "fecha",
+            "entidad",
+            "unidad solicitante",
+            "termino_entrega",
+            "descripcion",
+        } or col.startswith("item_"):
+            content_idx.append(idx)
+    for idx in content_idx:
+        if idx < len(row) and str(row[idx]).strip():
+            return True
+    return False
 
 def reset_checkboxes(sheet):
     vals = gs_get(f"{sheet}!A1:ZZ")
@@ -722,6 +768,189 @@ def move_rows_by_checkbox(sources, target, col_chk):
         LOG("MOVE", f"{src} → {target}: {len(to_app)}")
     LOG("MOVE", f"Total movidas a {target}: {total}")
 
+
+CL_LIFECYCLE_SHEETS = [
+    "cl_abiertas",
+    "cl_abiertas_rir_sin_requisitos",
+    "cl_abiertas_rir_con_ct",
+    CFG["sheet_ct_rir"],
+    "cl_prioritarios",
+    "cl_descartes",
+]
+
+
+def _row_mapping(header, row):
+    padded = list(row) + [""] * max(0, len(header) - len(row))
+    return {
+        str(column).strip(): padded[index] if index < len(padded) else ""
+        for index, column in enumerate(header)
+        if str(column).strip()
+    }
+
+
+def _merge_cl_record(current, incoming):
+    if not current:
+        return dict(incoming)
+    merged = dict(current)
+    for key, value in incoming.items():
+        if key == "source_sheets":
+            sources = {
+                part.strip()
+                for raw in (current.get(key, ""), value)
+                for part in str(raw or "").split(",")
+                if part.strip()
+            }
+            merged[key] = ",".join(sorted(sources))
+        elif value not in (None, "", 0, 0.0, "[]"):
+            merged[key] = value
+    return merged
+
+
+def process_closed_cl_lifecycle(driver, *, active_listing_links=None):
+    """
+    Registra las CL visibles y da un destino durable a cada CL vencida.
+
+    Regla de seguridad: una CL solo pasa a ``cerrada_sin_propuestas`` cuando
+    el Cuadro de Cotizaciones del número esperado cargó y el portal confirmó
+    cero. Timeout/XPath/formato desconocido quedan pendientes para reintento.
+    """
+    records = {}
+    expired_keys = set()
+    sheet_rows_by_key = {}
+
+    for sheet in CL_LIFECYCLE_SHEETS:
+        vals = gs_get(f"{sheet}!A1:ZZ")
+        if not vals:
+            continue
+        header = vals[0]
+        enlace_idx = find_idx(header, "enlace")
+        fecha_idx = find_idx(header, "fecha")
+        if enlace_idx is None:
+            continue
+        for row_number, row in enumerate(vals[1:], start=2):
+            if enlace_idx >= len(row) or not str(row[enlace_idx]).strip():
+                continue
+            mapping = _row_mapping(header, row)
+            record = cl_record_from_mapping(
+                mapping,
+                source_sheets=[sheet],
+                estado="abierta",
+            )
+            key = record.get("cl_key") or cl_lifecycle_key(record.get("enlace", ""))
+            if not key:
+                continue
+            records[key] = _merge_cl_record(records.get(key), record)
+            sheet_rows_by_key.setdefault(key, {}).setdefault(sheet, []).append(row_number)
+            fecha_value = row[fecha_idx] if fecha_idx is not None and fecha_idx < len(row) else ""
+            if cl_should_inspect(
+                fecha_value,
+                record.get("enlace", ""),
+                active_listing_links=active_listing_links,
+            ):
+                expired_keys.add(key)
+
+    # Persistir primero el inventario: si el proceso cae durante Selenium, no
+    # se pierde la existencia de las CL que todavía estaban en Sheets.
+    if records:
+        persist_cl_local(list(records.values()))
+        LOG(
+            "CL-LIFE",
+            f"inventario durable={len(records)} | vencidas por verificar={len(expired_keys)}",
+        )
+
+    queue = {}
+    for key in sorted(expired_keys):
+        record = dict(records[key])
+        record["estado_derivado"] = "cerrada_pendiente_verificacion"
+        queue[key] = record
+
+    # Los pendientes ya archivados no permanecen en la hoja de abiertas. Se
+    # recuperan desde SQLite y se reintentan con backoff en futuras corridas.
+    for record in load_cl_retry_records(limit=30):
+        key = str(record.get("cl_key") or "")
+        if key and key not in queue:
+            queue[key] = record
+
+    finalized_records = []
+    observations = []
+    verified_sheet_keys = set()
+    counters = {
+        "cerrada_sin_propuestas": 0,
+        "cerrada_con_propuestas": 0,
+        "pendiente": 0,
+        "error": 0,
+    }
+
+    for index, (key, record) in enumerate(queue.items(), start=1):
+        enlace = str(record.get("enlace") or "").strip()
+        numero = str(record.get("numero_cl") or "").strip()
+        LOG("CL-LIFE", f"verificando {index}/{len(queue)} | {numero or enlace}")
+        observation = inspect_closed_cl(driver, enlace, timeout=35)
+        updated, observation_row = apply_cl_observation(record, observation)
+        finalized_records.append(updated)
+        observations.append(observation_row)
+        if key in expired_keys:
+            verified_sheet_keys.add(key)
+
+        if observation.status == "cerrada_sin_propuestas":
+            counters["cerrada_sin_propuestas"] += 1
+            LOG("CL-LIFE", f"{numero}: SIN PROPUESTAS confirmado")
+        elif observation.status == "cerrada_con_propuestas":
+            counters["cerrada_con_propuestas"] += 1
+            LOG(
+                "CL-LIFE",
+                f"{numero}: {observation.proposal_count} proponente(s) confirmado(s)",
+            )
+        elif observation.status in CL_RETRY_STATES:
+            counters["pendiente"] += 1
+            LOG(
+                "CL-LIFE",
+                f"{numero}: pendiente ({observation.evidence_type or observation.status})",
+            )
+        else:
+            counters["error"] += 1
+            LOG("CL-LIFE", f"{numero}: error no clasificable")
+
+    if finalized_records:
+        # La escritura local es la barrera transaccional. Solo después se
+        # retiran de las hojas activas.
+        persist_cl_local(finalized_records, observations)
+
+    rows_to_delete_by_sheet = {}
+    for key in verified_sheet_keys:
+        for sheet, row_numbers in sheet_rows_by_key.get(key, {}).items():
+            rows_to_delete_by_sheet.setdefault(sheet, set()).update(row_numbers)
+    for sheet, row_numbers in rows_to_delete_by_sheet.items():
+        # Una sola eliminación por hoja evita que los índices originales se
+        # desplacen entre llamadas cuando vencieron varias CL a la vez.
+        delete_rows(sheet, sorted(row_numbers, reverse=True))
+
+    try:
+        sync_result = sync_cl_postgres()
+        if sync_result.get("configured"):
+            LOG(
+                "CL-LIFE",
+                "Supabase sincronizado: "
+                f"{sync_result.get('records', 0)} CL / "
+                f"{sync_result.get('observations', 0)} observaciones",
+            )
+        else:
+            LOG("CL-LIFE", "Supabase no configurado; cambios conservados localmente")
+    except Exception as exc:
+        # La copia local queda con postgres_synced=0 y se reenviará en la
+        # próxima corrida. Nunca se pierde el cierre por una caída de red.
+        LOG("CL-LIFE", f"Supabase pendiente: {type(exc).__name__}: {exc}")
+
+    LOG(
+        "CL-LIFE",
+        "resumen cierre | "
+        f"sin propuestas={counters['cerrada_sin_propuestas']} | "
+        f"con propuestas={counters['cerrada_con_propuestas']} | "
+        f"pendientes={counters['pendiente']} | errores={counters['error']}",
+    )
+    return counters
+
+
 def purge_by_fecha(sheet):
     vals = gs_get(f"{sheet}!A1:ZZ")
     if not vals:
@@ -732,7 +961,7 @@ def purge_by_fecha(sheet):
     if iF is None:
         LOG("PURGE", f"{sheet}: SIN 'fecha'")
         return
-    ahora, dels, ok, fail = pd.Timestamp.now(), [], 0, 0
+    ahora, dels, ok, fail, blank = pd.Timestamp.now(), [], 0, 0, 0
     def parse_fecha(s):
         if s is None or not str(s).strip(): return pd.NaT
         t = re.sub(r"\s+a\s+", " a ", str(s).replace("–", "-").replace("—", "-"), flags=re.I)
@@ -751,13 +980,17 @@ def purge_by_fecha(sheet):
             return base + pd.Timedelta(hours=hh, minutes=mm)
         return base + pd.Timedelta(hours=23, minutes=59)
     for r1, row in enumerate(vals[1:], start=2):
+        if not _sheet_row_has_meaningful_data(hdr, row):
+            blank += 1
+            dels.append(r1)
+            continue
         if iF < len(row):
             dt = parse_fecha(row[iF])
             ok += int(pd.notna(dt)); fail += int(pd.isna(dt))
             if pd.notna(dt) and dt < ahora:
                 dels.append(r1)
     delete_rows(sheet, dels)
-    LOG("PURGE", f"{sheet}: actos={len(vals)-1} | ok={ok} | fail={fail} | borrados={len(dels)}")
+    LOG("PURGE", f"{sheet}: actos={len(vals)-1} | ok={ok} | fail={fail} | vacias={blank} | borrados={len(dels)}")
 
 def purge_all():
     for s in ["cl_abiertas","cl_abiertas_rir_sin_requisitos","cl_abiertas_rir_con_ct",CFG["sheet_ct_rir"],"cl_prioritarios","cl_descartes"]:
@@ -1030,16 +1263,10 @@ def main():
     FICHAS_CT_RIR_DYNAMIC = load_ct_rir_fichas()
     rs_sp_keywords = load_rs_sp_keywords()
     _flush_failed_appends()
-    purge_all()
-
-    _, all_links = read_links_from_sheets(CFG["sheets_data"])
-    desc_vals = gs_get(f"{CFG['sheet_desc']}!A1:ZZ")
-    descartes = {r[find_idx(desc_vals[0], 'enlace')].strip() for r in desc_vals[1:]} if desc_vals and find_idx(desc_vals[0], 'enlace') is not None else set()
 
     from selenium.common.exceptions import WebDriverException
     driver = start_browser()
     PT = PageTools(driver)
-
     # Navegación al listado con reintentos
     for i in range(5):
         try:
@@ -1069,6 +1296,7 @@ def main():
     WebDriverWait(driver, 30).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, CFG["css_links"])))
 
     links, seen = [], set()
+    listing_complete = False
 
     #page_counter = 0
     while True:
@@ -1111,12 +1339,27 @@ def main():
                 if u not in seen:
                     seen.add(u); links.append(u); add2 += 1
             LOG("PAGE", f"captura final: +{add2} | total={len(links)}")
+            listing_complete = bool(last)
+            if next_disabled and not last:
+                LOG(
+                    "CL-LIFE",
+                    "listado incompleto; no se usarán ausencias del día como señal de cierre",
+                )
             LOG("PAGE", "fin de paginación")
             break
 
     LOG("DONE", f"enlaces extraídos={len(links)}")
+    process_closed_cl_lifecycle(
+        driver,
+        active_listing_links=links if listing_complete else None,
+    )
     try: driver.quit()
     except: pass
+
+    _, all_links = read_links_from_sheets(CFG["sheets_data"])
+    all_links.update(load_cl_known_links())
+    desc_vals = gs_get(f"{CFG['sheet_desc']}!A1:ZZ")
+    descartes = {r[find_idx(desc_vals[0], 'enlace')].strip() for r in desc_vals[1:]} if desc_vals and find_idx(desc_vals[0], 'enlace') is not None else set()
 
     # De-duplicación y filtro de nuevos
     map_key_raw = {}
@@ -1141,6 +1384,7 @@ def main():
     driver = start_browser()
     PT = PageTools(driver)
     datos_ct, datos_sr, datos_sf, datos_rs, datos_ct_rir = [], [], [], [], []
+    lifecycle_new_records = []
     for key in nuevos:
         link = map_key_raw[key]
         LOG("SCRAPE", link)
@@ -1179,18 +1423,40 @@ def main():
             else:
                 LOG("SCRAPE", f"DESCARTADO ({mot})")
             gs_append(CFG["sheet_desc"], [[link, info.get("fecha","")]])
+            lifecycle_new_records.append(
+                cl_record_from_mapping(
+                    info,
+                    source_sheets=[CFG["sheet_desc"]],
+                    estado="abierta",
+                )
+            )
             if mot == "RS": datos_rs.append(info)
             continue
 
         categoria = clasifica(info)
-        if categoria == "ct": datos_ct.append(info)
-        elif categoria == "sr": datos_sr.append(info)
-        else: datos_sf.append(info)
+        source_sheets = []
+        if categoria == "ct":
+            datos_ct.append(info)
+            source_sheets.append("cl_abiertas_rir_con_ct")
+        elif categoria == "sr":
+            datos_sr.append(info)
+            source_sheets.append("cl_abiertas_rir_sin_requisitos")
+        else:
+            datos_sf.append(info)
+            source_sheets.append("cl_abiertas")
 
         if FICHAS_CT_RIR_DYNAMIC:
             fichas_base = info.get("fichas_base") or []
             if any(code in FICHAS_CT_RIR_DYNAMIC for code in fichas_base):
                 datos_ct_rir.append(info)
+                source_sheets.append(CFG["sheet_ct_rir"])
+        lifecycle_new_records.append(
+            cl_record_from_mapping(
+                info,
+                source_sheets=source_sheets,
+                estado="abierta",
+            )
+        )
 
     try: driver.quit()
     except: pass
@@ -1218,6 +1484,19 @@ def main():
         df.drop(columns=["fichas_base"], inplace=True, errors="ignore")
 
         df.fillna("", inplace=True)
+        content_cols = [
+            c for c in df.columns
+            if c in {"publicacion", "enlace", "titulo", "precio_referencia", "fecha", "entidad", "unidad solicitante", "termino_entrega", "descripcion"}
+            or c.startswith("item_")
+        ]
+        if content_cols:
+            mask = pd.Series(False, index=df.index)
+            for col in content_cols:
+                mask = mask | df[col].astype(str).str.strip().ne("")
+            removed = int((~mask).sum())
+            if removed:
+                LOG("SANITY", f"descartadas {removed} fila(s) vacias antes de subir")
+            df = df.loc[mask].copy()
         return df
 
     def append_df(sheet, df):
@@ -1257,12 +1536,22 @@ def main():
     abiertas_sf_rows, abiertas_sf_cols = append_df('cl_abiertas', df_prepare(datos_sf))
     ct_rir_rows, ct_rir_cols = append_df(CFG["sheet_ct_rir"], df_prepare(datos_ct_rir))
 
+    if lifecycle_new_records:
+        persist_cl_local(lifecycle_new_records)
+        try:
+            sync_result = sync_cl_postgres()
+            if sync_result.get("configured"):
+                LOG(
+                    "CL-LIFE",
+                    f"nuevas CL sincronizadas a Supabase: {sync_result.get('records', 0)}",
+                )
+        except Exception as exc:
+            LOG("CL-LIFE", f"nuevas CL pendientes de Supabase: {type(exc).__name__}: {exc}")
+
     # Movimientos por checkboxes y limpieza final
     move_rows_by_checkbox(['cl_abiertas','cl_abiertas_rir_sin_requisitos','cl_abiertas_rir_con_ct',CFG["sheet_ct_rir"]], CFG["sheet_prio"], "Prioritario")
     move_rows_by_checkbox(['cl_abiertas','cl_abiertas_rir_sin_requisitos','cl_abiertas_rir_con_ct',CFG["sheet_ct_rir"]], CFG["sheet_desc"], "Descartar")
 
-    for sh in ['cl_abiertas','cl_abiertas_rir_sin_requisitos','cl_abiertas_rir_con_ct',CFG["sheet_ct_rir"],'cl_prioritarios','cl_descartes']:
-        purge_by_fecha(sh)
     for sh in ['cl_abiertas','cl_abiertas_rir_sin_requisitos','cl_abiertas_rir_con_ct',CFG["sheet_ct_rir"]]:
         reset_checkboxes(sh)
         update_fechas_sheet(sh)

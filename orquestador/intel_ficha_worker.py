@@ -5,10 +5,12 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import time
 import uuid
 import traceback
 import unicodedata
+from contextlib import closing
 from difflib import SequenceMatcher
 from datetime import datetime
 from html import unescape
@@ -21,6 +23,19 @@ try:
 except Exception:  # pragma: no cover - fallback en entornos sin bs4
     BeautifulSoup = None  # type: ignore[assignment]
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from common.ficha_line_items import (  # noqa: E402
+    FichaProfile,
+    bind_offers_to_matches,
+    build_ficha_profile,
+    extract_line_items_from_html,
+    extract_offer_lines_from_html,
+    match_ficha_to_lines,
+)
+from common.ficha_utils import get_catalog  # noqa: E402
 from sheets_bridge import (
     SPREADSHEET_ID,
     _clear_data_rows,
@@ -34,6 +49,10 @@ PANAMACOMPRA_BASE_URL = "https://www.panamacompra.gob.pa/Inicio/"
 FICHA_TOKEN_RE = re.compile(r"\b\d{3,8}\*?\b")
 RUNS_SHEET = os.environ.get("INTEL_STUDY_RUNS_SHEET", "intel_study_runs_remote")
 DETAIL_SHEET = os.environ.get("INTEL_STUDY_DETAIL_SHEET", "intel_study_detail_remote")
+LINE_DETAIL_SHEET = os.environ.get(
+    "INTEL_STUDY_LINE_DETAIL_SHEET",
+    "intel_study_line_items_remote",
+)
 
 RUNS_HEADERS = [
     "request_id","run_id_remote","ficha","nombre_ficha","estado_run","fecha_inicio","fecha_fin",
@@ -46,6 +65,14 @@ DETAIL_HEADERS = [
     "fecha_adjudicacion","fecha_orden_compra","dias_acto_a_oc","dias_acto_a_oc_mas_entrega","tipo_flujo",
     "fuente_precio","fuente_fecha","enlace_evidencia","unidad_medida","tiempo_entrega_dias","observaciones",
     "estado_revision","nivel_certeza","requiere_revision",
+]
+LINE_DETAIL_HEADERS = [
+    "request_id","run_id_remote","line_detail_id","ficha","nombre_ficha","acto_id",
+    "acto_nombre","acto_url","entidad","renglon_id","renglon_numero","renglon_texto",
+    "match_method","match_score","match_evidence","match_requires_review","cantidad",
+    "unidad_medida","precio_referencia_unitario","precio_referencia_total","proveedor",
+    "precio_participacion_unitario","precio_participacion_total","binding_method",
+    "binding_score","fuente_renglon","enlace_evidencia","created_at",
 ]
 DEBUG_HTML_DIR = Path(r"C:\Users\rodri\scrapers_repo\orquestador\debug_html_intel")
 
@@ -95,7 +122,7 @@ def _date(v: object) -> pd.Timestamp:
     t = _clean(v)
     if not t:
         return pd.NaT
-    d = pd.to_datetime(t, errors="coerce", dayfirst=True)
+    d = pd.to_datetime(t, errors="coerce", dayfirst=not bool(re.match(r"^\d{4}[\-/]", t)))
     if pd.isna(d):
         d = pd.to_datetime(t, errors="coerce")
     return d
@@ -611,6 +638,15 @@ def _catalog_map() -> dict[str, dict[str, str]]:
 
 
 def _catalog_lookup(cmap: dict[str, dict[str, str]], ficha: str, proveedor: str) -> dict[str, str]:
+    def _ficha_digits(v: object) -> str:
+        raw = _clean(v)
+        if not raw:
+            return ""
+        m = re.fullmatch(r"\s*(\d+)(?:\.0+)?\s*", raw)
+        if m:
+            return m.group(1)
+        return re.sub(r"\D", "", raw)
+
     def _name_score(a: str, b: str) -> float:
         if not a or not b:
             return 0.0
@@ -629,7 +665,7 @@ def _catalog_lookup(cmap: dict[str, dict[str, str]], ficha: str, proveedor: str)
         return min(max(base, seq), 1.0)
 
     p = _norm(proveedor)
-    f = re.sub(r"\D", "", ficha)
+    f = _ficha_digits(ficha)
     rec = cmap.get(f"{f}|{p}") or cmap.get(f"|{p}")
     if not rec and p and f:
         # Fuzzy prioritario dentro de la misma ficha.
@@ -675,27 +711,283 @@ def _catalog_lookup(cmap: dict[str, dict[str, str]], ficha: str, proveedor: str)
     }
 
 
-def _acts_for_ficha(db: Path, ficha: str) -> pd.DataFrame:
+def _detection_score_for_ficha(raw_json: object, ficha: str, legacy_value: object = "") -> float:
+    """Devuelve la mejor confianza de la ficha sin contar varias evidencias dos veces."""
+    best = 0.0
+    try:
+        parsed = json.loads(_clean(raw_json)) if _clean(raw_json) else []
+    except Exception:
+        parsed = []
+    if isinstance(parsed, dict):
+        parsed = parsed.get("fichas") or parsed.get("detecciones") or [parsed]
+    if isinstance(parsed, list):
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            code = re.sub(r"\D", "", str(item.get("code") or item.get("ficha") or ""))
+            if code != str(ficha):
+                continue
+            best = max(best, _num(item.get("score", 0)))
+    if best <= 0 and any(re.sub(r"\D", "", token) == str(ficha) for token in _extract_tokens(legacy_value)):
+        best = 70.0
+    return min(100.0, max(0.0, best))
+
+
+def _filter_acts_by_payload(df: pd.DataFrame, filters: dict[str, Any] | None, ficha: str) -> pd.DataFrame:
+    if df.empty or not filters:
+        return df
+    out = df.copy()
+    date_map = {
+        "publicacion": "publicacion",
+        "celebracion": "fecha",
+        "adjudicacion": "fecha_adjudicacion",
+        "actualizacion": "fecha_actualizacion",
+    }
+    date_column = date_map.get(_clean(filters.get("tipo_fecha", "")).lower(), "publicacion")
+    start = pd.to_datetime(_clean(filters.get("fecha_desde", "")), errors="coerce")
+    end = pd.to_datetime(_clean(filters.get("fecha_hasta", "")), errors="coerce")
+    if date_column in out.columns and (not pd.isna(start) or not pd.isna(end)):
+        # Extrae la primera fecha del texto para rangos del tipo "01-01-2026 a 05-01-2026".
+        raw_dates = out[date_column].fillna("").astype(str).str.extract(
+            r"(\d{1,2}[\-/]\d{1,2}[\-/]\d{4}|\d{4}[\-/]\d{1,2}[\-/]\d{1,2})",
+            expand=False,
+        )
+        iso_mask = raw_dates.fillna("").str.match(r"^\d{4}[\-/]")
+        parsed_dates = pd.Series(pd.NaT, index=raw_dates.index, dtype="datetime64[ns]")
+        if iso_mask.any():
+            parsed_dates.loc[iso_mask] = pd.to_datetime(raw_dates.loc[iso_mask], errors="coerce")
+        if (~iso_mask).any():
+            parsed_dates.loc[~iso_mask] = pd.to_datetime(
+                raw_dates.loc[~iso_mask], errors="coerce", dayfirst=True
+            )
+        if not pd.isna(start):
+            out = out.loc[parsed_dates >= start].copy()
+            parsed_dates = parsed_dates.loc[out.index]
+        if not pd.isna(end):
+            out = out.loc[parsed_dates <= end].copy()
+
+    states = {_norm(value) for value in (filters.get("estados") or []) if _clean(value)}
+    if states and "estado" in out.columns:
+        out = out[out["estado"].map(_norm).isin(states)].copy()
+    entities = {_norm(value) for value in (filters.get("entidades") or []) if _clean(value)}
+    if entities and "entidad" in out.columns:
+        out = out[out["entidad"].map(_norm).isin(entities)].copy()
+
+    min_amount = _num(filters.get("monto_minimo", 0))
+    max_amount = _num(filters.get("monto_maximo", 0))
+    amounts = out.get("precio_referencia", pd.Series(0, index=out.index)).map(_num)
+    if min_amount > 0:
+        out = out.loc[amounts >= min_amount].copy()
+        amounts = amounts.loc[out.index]
+    if max_amount > 0:
+        out = out.loc[amounts <= max_amount].copy()
+
+    min_awarded = _num(filters.get("adjudicado_minimo", 0))
+    max_awarded = _num(filters.get("adjudicado_maximo", 0))
+    awarded = out.get("total_items_ofertados", pd.Series(0, index=out.index)).map(_num)
+    if min_awarded > 0:
+        out = out.loc[awarded >= min_awarded].copy()
+        awarded = awarded.loc[out.index]
+    if max_awarded > 0:
+        out = out.loc[awarded <= max_awarded].copy()
+
+    threshold = _num(filters.get("score_minimo", 0))
+    if threshold > 0 and "fichas_detectadas_json" in out.columns:
+        scores = out.apply(
+            lambda row: _detection_score_for_ficha(
+                row.get("fichas_detectadas_json", ""), ficha, row.get("ficha_detectada", "")
+            ),
+            axis=1,
+        )
+        out = out.loc[scores >= threshold].copy()
+
+    groups = [_norm(value) for value in (filters.get("busqueda") or []) if _clean(value)]
+    if groups:
+        text_series = (
+            out.get("titulo", pd.Series("", index=out.index)).fillna("").astype(str)
+            + " "
+            + out.get("descripcion", pd.Series("", index=out.index)).fillna("").astype(str)
+            + " "
+            + out.get("entidad", pd.Series("", index=out.index)).fillna("").astype(str)
+        ).map(_norm)
+        masks = [text_series.str.contains(group, regex=False, na=False) for group in groups]
+        combined = masks[0]
+        if _clean(filters.get("modo_busqueda", "OR")).upper() == "AND":
+            for mask in masks[1:]:
+                combined &= mask
+        else:
+            for mask in masks[1:]:
+                combined |= mask
+        out = out.loc[combined].copy()
+    return out
+
+
+def _analytics_refs_for_ficha(
+    analytics_db: Path | None,
+    ficha: str,
+) -> tuple[set[str], set[str]]:
+    """Lee la relación normalizada ficha→acto usada por Inteligencia v3.
+
+    La capa analítica es más confiable que volver a buscar el código dentro de
+    textos libres. Si no está disponible, el worker conserva su búsqueda
+    histórica como respaldo.
+    """
+    if analytics_db is None or not analytics_db.exists():
+        return set(), set()
+    try:
+        with closing(sqlite3.connect(analytics_db)) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='intel_actos_fichas'"
+            ).fetchone()
+            if not exists:
+                return set(), set()
+            rows = conn.execute(
+                """
+                SELECT CAST(source_id AS TEXT), COALESCE(enlace, '')
+                FROM intel_actos_fichas
+                WHERE ficha = ?
+                """,
+                (str(ficha),),
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        return set(), set()
+
+    source_ids = {_clean(row[0]) for row in rows if _clean(row[0])}
+    links = {_clean(row[1]) for row in rows if _clean(row[1])}
+    return source_ids, links
+
+
+def _study_filters_from_payload(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Determina si el estudio usa historial completo o el análisis visible."""
+    raw_scope = _norm(payload.get("study_scope", "historico_completo"))
+    if raw_scope in {
+        "analisis actual",
+        "analisis_actual",
+        "filtros actuales",
+        "filtros_actuales",
+    }:
+        filters = payload.get("filters")
+        return "analisis_actual", filters if isinstance(filters, dict) else {}
+    return "historico_completo", {}
+
+
+def _acts_for_ficha(
+    db: Path,
+    ficha: str,
+    filters: dict[str, Any] | None = None,
+    *,
+    analytics_db: Path | None = None,
+) -> pd.DataFrame:
     f = re.sub(r"\D", "", ficha)
     like = f"%{f}%"
-    sql = """
-    SELECT id, enlace, titulo, entidad, descripcion, ficha_detectada, razon_social, nombre_comercial,
-           fecha AS fecha_publicacion_db, fecha_adjudicacion, precio_referencia, termino_entrega, estado
+    relation_ids, relation_links = _analytics_refs_for_ficha(analytics_db, f)
+    with closing(sqlite3.connect(db)) as conn:
+        available_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(actos_publicos)").fetchall()
+        }
+        awarded_column = (
+            "total_items_ofertados"
+            if "total_items_ofertados" in available_columns
+            else "'' AS total_items_ofertados"
+        )
+        base_select = f"""
+    SELECT id, enlace, titulo, entidad, descripcion, ficha_detectada, fichas_detectadas_json,
+           razon_social, nombre_comercial, publicacion, fecha, fecha_adjudicacion, fecha_actualizacion,
+           precio_referencia, {awarded_column}, termino_entrega, estado
     FROM actos_publicos
-    WHERE ficha_detectada LIKE ? OR titulo LIKE ? OR descripcion LIKE ?
-    ORDER BY id DESC
     """
-    with sqlite3.connect(db) as conn:
-        df = pd.read_sql_query(sql, conn, params=(like, like, like))
+        # Con relación analítica disponible solo buscamos detecciones
+        # estructuradas recientes que aún no hayan entrado a esa capa. El
+        # barrido de textos grandes (items/source JSON) queda como fallback
+        # cuando la analítica no existe, evitando escanear cientos de MB en
+        # cada estudio.
+        text_candidates = (
+            ("ficha_detectada", "fichas_detectadas_json")
+            if relation_ids or relation_links
+            else (
+                "ficha_detectada",
+                "fichas_detectadas_json",
+                "titulo",
+                "descripcion",
+                "items_json",
+                "source_record_json",
+            )
+        )
+        text_columns = [
+            column
+            for column in text_candidates
+            if column in available_columns
+        ]
+        frames: list[pd.DataFrame] = []
+        if text_columns:
+            where_text = " OR ".join(f"{column} LIKE ?" for column in text_columns)
+            frames.append(
+                pd.read_sql_query(
+                    f"{base_select} WHERE {where_text}",
+                    conn,
+                    params=tuple(like for _ in text_columns),
+                )
+            )
+
+        # SQLite suele limitar la cantidad de parámetros por sentencia. Se
+        # consulta por bloques para cubrir fichas con cientos o miles de actos.
+        relation_id_list = sorted(relation_ids)
+        for start in range(0, len(relation_id_list), 700):
+            chunk = relation_id_list[start : start + 700]
+            placeholders = ",".join("?" for _ in chunk)
+            frames.append(
+                pd.read_sql_query(
+                    f"{base_select} WHERE CAST(id AS TEXT) IN ({placeholders})",
+                    conn,
+                    params=tuple(chunk),
+                )
+            )
+        relation_link_list = sorted(relation_links)
+        for start in range(0, len(relation_link_list), 500):
+            chunk = relation_link_list[start : start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            frames.append(
+                pd.read_sql_query(
+                    f"{base_select} WHERE enlace IN ({placeholders})",
+                    conn,
+                    params=tuple(chunk),
+                )
+            )
+
+    non_empty_frames = [frame for frame in frames if not frame.empty]
+    if not non_empty_frames:
+        return pd.DataFrame()
+    df = pd.concat(non_empty_frames, ignore_index=True)
+    df = df.drop_duplicates(subset=["id", "enlace"], keep="first")
     if df.empty:
         return df
+
     def has_ficha(v: object) -> bool:
         return any(re.sub(r"\D", "", tk) == f for tk in _extract_tokens(v))
-    out = df[df["ficha_detectada"].map(has_ficha)].copy()
+
+    json_match = df["fichas_detectadas_json"].map(
+        lambda raw: _detection_score_for_ficha(raw, f, "") > 0
+    )
+    relation_match = (
+        df["id"].astype(str).isin(relation_ids)
+        | df["enlace"].fillna("").astype(str).isin(relation_links)
+    )
+    out = df[
+        df["ficha_detectada"].map(has_ficha)
+        | json_match
+        | relation_match
+    ].copy()
     if out.empty:
         txt = df["titulo"].fillna("").astype(str) + " " + df["descripcion"].fillna("").astype(str)
         out = df[txt.str.contains(f, case=False, regex=False, na=False)].copy()
-    return out.drop_duplicates(subset=["id"])
+    out = out.drop_duplicates(subset=["id", "enlace"], keep="first")
+    out = _filter_acts_by_payload(out, filters, f)
+    # Mantiene el nombre utilizado por el resto del worker, corrigiendo su origen real.
+    out["fecha_publicacion_db"] = out.get("publicacion", "")
+    out.attrs["analytics_relation_ids"] = len(relation_ids)
+    out.attrs["analytics_relation_links"] = len(relation_links)
+    return out
 
 
 def _replace_rows(sheet: str, headers: list[str], ficha: str, new_rows: list[list[str]]) -> None:
@@ -746,6 +1038,292 @@ def _dump_debug_html(ficha: str, acto_id: str, label: str, html: str) -> str:
     except Exception:
         return ""
 
+
+def _build_study_ficha_profile(ficha: str, nombre: str) -> FichaProfile:
+    """Construye el perfil sin convertir una falla de catálogo en falla del estudio."""
+
+    catalog_name = ""
+    try:
+        catalog_name = _clean(get_catalog().names.get(str(ficha), ""))
+    except Exception:
+        catalog_name = ""
+    resolved_name = catalog_name or _clean(nombre) or f"Ficha {ficha}"
+    extra_names = [
+        value
+        for value in (_clean(nombre), catalog_name)
+        if value and _norm(value) != _norm(resolved_name)
+    ]
+    return build_ficha_profile(ficha, resolved_name, extra_names)
+
+
+def _line_audit_row(
+    *,
+    request_id: str,
+    run_id: str,
+    ficha: str,
+    nombre: str,
+    acto_id: str,
+    acto_nombre: str,
+    acto_url: str,
+    entidad: str,
+    method: str,
+    evidence: str,
+    created_at: str,
+) -> dict[str, Any]:
+    return {
+        "request_id": request_id,
+        "run_id_remote": run_id,
+        "line_detail_id": str(uuid.uuid4()),
+        "ficha": ficha,
+        "nombre_ficha": nombre,
+        "acto_id": acto_id,
+        "acto_nombre": acto_nombre,
+        "acto_url": acto_url,
+        "entidad": entidad,
+        "renglon_id": "",
+        "renglon_numero": "",
+        "renglon_texto": "",
+        "match_method": method,
+        "match_score": 0.0,
+        "match_evidence": evidence,
+        "match_requires_review": 1,
+        "cantidad": 0.0,
+        "unidad_medida": "",
+        "precio_referencia_unitario": 0.0,
+        "precio_referencia_total": 0.0,
+        "proveedor": "",
+        "precio_participacion_unitario": 0.0,
+        "precio_participacion_total": 0.0,
+        "binding_method": "sin_precio_renglon_confirmado",
+        "binding_score": 0.0,
+        "fuente_renglon": "auditoria",
+        "enlace_evidencia": acto_url,
+        "created_at": created_at,
+    }
+
+
+def _line_detail_rows_for_act(
+    *,
+    profile: FichaProfile,
+    request_id: str,
+    run_id: str,
+    ficha: str,
+    nombre: str,
+    acto_id: str,
+    acto_nombre: str,
+    acto_url: str,
+    entidad: str,
+    act_html: str,
+    offer_html: str,
+    default_provider: str,
+    evidence_url: str,
+    created_at: str,
+) -> list[dict[str, Any]]:
+    """Genera la capa paralela ficha-renglón-oferta sin usar totales del acto."""
+
+    if not _clean(act_html):
+        return [
+            _line_audit_row(
+                request_id=request_id,
+                run_id=run_id,
+                ficha=ficha,
+                nombre=nombre,
+                acto_id=acto_id,
+                acto_nombre=acto_nombre,
+                acto_url=acto_url,
+                entidad=entidad,
+                method="sin_html_acto",
+                evidence="No se obtuvo HTML para identificar renglones.",
+                created_at=created_at,
+            )
+        ]
+
+    line_items = extract_line_items_from_html(act_html)
+    matches = match_ficha_to_lines(profile, line_items, minimum_score=0.62)
+    if not matches:
+        return [
+            _line_audit_row(
+                request_id=request_id,
+                run_id=run_id,
+                ficha=ficha,
+                nombre=nombre,
+                acto_id=acto_id,
+                acto_nombre=acto_nombre,
+                acto_url=acto_url,
+                entidad=entidad,
+                method="sin_correspondencia_renglon",
+                evidence=(
+                    f"Se analizaron {len(line_items)} renglones, pero ninguno pudo "
+                    "atribuirse con seguridad a la ficha."
+                ),
+                created_at=created_at,
+            )
+        ]
+
+    offers = extract_offer_lines_from_html(offer_html or act_html)
+    bound = bind_offers_to_matches(matches, offers)
+    rows: list[dict[str, Any]] = []
+    for result in bound:
+        line = result.match.line
+        offer = result.offer
+        reference_total = float(line.reference_total or 0.0)
+        if reference_total <= 0 and line.reference_unit_price > 0 and line.quantity > 0:
+            reference_total = line.reference_unit_price * line.quantity
+        participation_total = float(offer.total or 0.0) if offer else 0.0
+        if (
+            offer
+            and participation_total <= 0
+            and offer.unit_price > 0
+            and offer.quantity > 0
+        ):
+            participation_total = offer.unit_price * offer.quantity
+        rows.append(
+            {
+                "request_id": request_id,
+                "run_id_remote": run_id,
+                "line_detail_id": str(uuid.uuid4()),
+                "ficha": ficha,
+                "nombre_ficha": profile.name or nombre,
+                "acto_id": acto_id,
+                "acto_nombre": acto_nombre,
+                "acto_url": acto_url,
+                "entidad": entidad,
+                "renglon_id": line.line_id,
+                "renglon_numero": line.line_number,
+                "renglon_texto": line.description,
+                "match_method": result.match.method,
+                "match_score": round(float(result.match.score), 4),
+                "match_evidence": result.match.evidence,
+                "match_requires_review": 1 if result.match.requires_review else 0,
+                "cantidad": round(float(line.quantity or (offer.quantity if offer else 0.0)), 6),
+                "unidad_medida": line.unit or (offer.unit if offer else ""),
+                "precio_referencia_unitario": round(float(line.reference_unit_price or 0.0), 6),
+                "precio_referencia_total": round(reference_total, 6),
+                "proveedor": (
+                    (_clean(offer.provider) or _clean(default_provider))
+                    if offer
+                    else _clean(default_provider)
+                ),
+                "precio_participacion_unitario": (
+                    round(float(offer.unit_price), 6) if offer else 0.0
+                ),
+                "precio_participacion_total": round(participation_total, 6),
+                "binding_method": result.binding_method,
+                "binding_score": round(float(result.binding_score), 4),
+                "fuente_renglon": "html_acto_y_cuadro_propuestas",
+                "enlace_evidencia": evidence_url or acto_url,
+                "created_at": created_at,
+            }
+        )
+    return rows
+
+
+def _persist_line_amount_rows(
+    database_paths: list[Path],
+    ficha: str,
+    rows: list[dict[str, Any]],
+) -> int:
+    """Persiste la evidencia ficha-renglón para el siguiente build analítico.
+
+    Es una salida adicional y tolerante a fallos: Sheets conserva el detalle
+    visible del estudio, mientras esta tabla permite que los montos confirmados
+    por renglón alimenten la inteligencia maestra sin usar el total del acto.
+    """
+
+    targets: list[Path] = []
+    for raw_path in database_paths:
+        path = Path(raw_path)
+        if path.exists() and path.resolve() not in {item.resolve() for item in targets}:
+            targets.append(path)
+    stored = 0
+    for path in targets:
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                with closing(sqlite3.connect(path, timeout=30)) as connection:
+                    connection.execute("PRAGMA busy_timeout=30000")
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS intel_ficha_line_amounts (
+                            ficha TEXT NOT NULL,
+                            acto_url TEXT NOT NULL,
+                            acto_id TEXT,
+                            line_key TEXT NOT NULL,
+                            renglon_id TEXT,
+                            renglon_numero TEXT,
+                            reference_total REAL NOT NULL DEFAULT 0,
+                            participation_total REAL NOT NULL DEFAULT 0,
+                            provider TEXT,
+                            match_score REAL NOT NULL DEFAULT 0,
+                            requires_review INTEGER NOT NULL DEFAULT 1,
+                            binding_method TEXT,
+                            updated_at TEXT,
+                            PRIMARY KEY (ficha, acto_url, line_key, provider)
+                        )
+                        """
+                    )
+                    connection.execute(
+                        "DELETE FROM intel_ficha_line_amounts WHERE ficha = ?",
+                        (ficha,),
+                    )
+                    values: list[tuple[Any, ...]] = []
+                    for row in rows:
+                        acto_url = _clean(row.get("acto_url"))
+                        if not acto_url:
+                            continue
+                        line_key = (
+                            _clean(row.get("renglon_id"))
+                            or _clean(row.get("renglon_numero"))
+                            or _clean(row.get("line_detail_id"))
+                        )
+                        if not line_key:
+                            continue
+                        values.append(
+                            (
+                                ficha,
+                                acto_url,
+                                _clean(row.get("acto_id")),
+                                line_key,
+                                _clean(row.get("renglon_id")),
+                                _clean(row.get("renglon_numero")),
+                                _num(row.get("precio_referencia_total")),
+                                _num(row.get("precio_participacion_total")),
+                                _clean(row.get("proveedor")),
+                                _num(row.get("match_score")),
+                                int(round(_num(row.get("match_requires_review")))),
+                                _clean(row.get("binding_method")),
+                                _clean(row.get("created_at")) or datetime.now().isoformat(timespec="seconds"),
+                            )
+                        )
+                    if values:
+                        connection.executemany(
+                            """
+                            INSERT OR REPLACE INTO intel_ficha_line_amounts (
+                                ficha, acto_url, acto_id, line_key, renglon_id,
+                                renglon_numero, reference_total, participation_total,
+                                provider, match_score, requires_review, binding_method,
+                                updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            values,
+                        )
+                    connection.commit()
+                    stored += len(values)
+                last_error = None
+                break
+            except sqlite3.OperationalError as exc:
+                last_error = exc
+                if attempt < 3:
+                    time.sleep(float(attempt))
+        if last_error is not None:
+            print(
+                f"[intel_estudio_ficha] WARN: no se pudo persistir detalle de renglones "
+                f"en {path}: {last_error}",
+                flush=True,
+            )
+    return stored
+
+
 def main() -> int:
     t0 = time.perf_counter()
     _log(f"inicio | spreadsheet={SPREADSHEET_ID}", t0)
@@ -773,13 +1351,43 @@ def main() -> int:
     if db_path is None:
         raise RuntimeError("No se encontro panamacompra.db local")
 
-    _log(f"request={request_id or 'sin-id'} | ficha={ficha} | db={db_path}", t0)
-    acts = _acts_for_ficha(db_path, ficha)
+    analytics_candidates = [
+        (
+            Path(_clean(payload.get("analytics_db_path", "")))
+            if _clean(payload.get("analytics_db_path", ""))
+            else None
+        ),
+        Path(r"C:\Users\rodri\scrapers_repo\data\db\inteligencia_proveedores.db"),
+    ]
+    analytics_db_path = next(
+        (path for path in analytics_candidates if path and path.exists()),
+        None,
+    )
+    study_scope, filters = _study_filters_from_payload(payload)
+    _log(
+        f"request={request_id or 'sin-id'} | ficha={ficha} | db={db_path} "
+        f"| analytics_db={analytics_db_path or 'no disponible'} "
+        f"| alcance={study_scope}",
+        t0,
+    )
+    acts = _acts_for_ficha(
+        db_path,
+        ficha,
+        filters,
+        analytics_db=analytics_db_path,
+    )
     max_acts = _debug_max_acts()
     if max_acts > 0:
         acts = acts.head(max_acts).copy()
         _log(f"DEBUG activo: limitando a {max_acts} actos", t0)
-    _log(f"actos detectados: {len(acts)}", t0)
+    _log(
+        "actos detectados en el alcance solicitado: "
+        f"{len(acts)} | referencias_analiticas="
+        f"{acts.attrs.get('analytics_relation_ids', 0)} ids/"
+        f"{acts.attrs.get('analytics_relation_links', 0)} enlaces "
+        f"| filtros={json.dumps(filters, ensure_ascii=False)}",
+        t0,
+    )
 
     run_id = str(uuid.uuid4())
     now = datetime.now().isoformat(timespec="seconds")
@@ -805,14 +1413,22 @@ def main() -> int:
         else:
             _replace_rows(RUNS_SHEET, RUNS_HEADERS, ficha, [_vals(RUNS_HEADERS, run_row)])
             _replace_rows(DETAIL_SHEET, DETAIL_HEADERS, ficha, [])
+            _replace_rows(LINE_DETAIL_SHEET, LINE_DETAIL_HEADERS, ficha, [])
         _log("run vacio publicado", t0)
         print(json.dumps({"ok": True, "request_id": request_id, "run_id_remote": run_id, "ficha": ficha}), flush=True)
         return 0
 
     cmap = _catalog_map()
     _log(f"catalogo claves: {len(cmap)}", t0)
+    ficha_profile = _build_study_ficha_profile(ficha, nombre)
+    _log(
+        f"perfil ficha: {ficha_profile.code} | {ficha_profile.name} "
+        f"| medidas_mm={sorted(ficha_profile.dimensions_mm)}",
+        t0,
+    )
 
     rows: list[dict[str, Any]] = []
+    line_rows: list[dict[str, Any]] = []
     t1 = 0
     t2 = 0
     started = datetime.now().isoformat(timespec="seconds")
@@ -837,6 +1453,24 @@ def main() -> int:
             driver, mode = _build_driver()
             _log(f"acto id={acto_id} selenium={mode}", t0)
             if driver is None:
+                line_rows.extend(
+                    _line_detail_rows_for_act(
+                        profile=ficha_profile,
+                        request_id=request_id,
+                        run_id=run_id,
+                        ficha=ficha,
+                        nombre=nombre,
+                        acto_id=acto_id,
+                        acto_nombre=acto_nombre,
+                        acto_url=acto_url,
+                        entidad=entidad,
+                        act_html="",
+                        offer_html="",
+                        default_provider=proveedor_ganador,
+                        evidence_url=acto_url,
+                        created_at=datetime.now().isoformat(timespec="seconds"),
+                    )
+                )
                 rows.append(
                     {
                         "request_id": request_id,
@@ -881,6 +1515,24 @@ def main() -> int:
             html = _driver_html(driver, acto_url)
             if not html:
                 _log(f"acto id={acto_id} sin html util (url={acto_url})", t0)
+                line_rows.extend(
+                    _line_detail_rows_for_act(
+                        profile=ficha_profile,
+                        request_id=request_id,
+                        run_id=run_id,
+                        ficha=ficha,
+                        nombre=nombre,
+                        acto_id=acto_id,
+                        acto_nombre=acto_nombre,
+                        acto_url=acto_url,
+                        entidad=entidad,
+                        act_html="",
+                        offer_html="",
+                        default_provider=proveedor_ganador,
+                        evidence_url=acto_url,
+                        created_at=datetime.now().isoformat(timespec="seconds"),
+                    )
+                )
                 rows.append(
                     {
                         "request_id": request_id,
@@ -951,6 +1603,7 @@ def main() -> int:
             t2 += 0 if has_info else 1
 
             info = _unit_data(html, ficha)
+            offer_html = html
             proveedor = _provider_from_tables(html) if has_info else ""
             fuente_precio = "acto_info_proponente" if has_info and float(info.get("unit", 0)) > 0 else ""
             evidencia = acto_url
@@ -960,6 +1613,10 @@ def main() -> int:
                 cuadro = _href(html, "/cuadro-de-propuestas/", exclude="/ver-propuesta/")
                 if cuadro:
                     cm = _cuadro_min_from_driver(driver, cuadro, ficha)
+                    try:
+                        offer_html = str(getattr(driver, "page_source", "") or "") or html
+                    except Exception:
+                        offer_html = html
                     if _clean(cm.get("proveedor", "")):
                         proveedor = _clean(cm.get("proveedor", ""))
                     if float(cm.get("unit", 0)) > 0:
@@ -1166,6 +1823,24 @@ def main() -> int:
                     "requiere_revision": rev,
                 }
             )
+            line_rows.extend(
+                _line_detail_rows_for_act(
+                    profile=ficha_profile,
+                    request_id=request_id,
+                    run_id=run_id,
+                    ficha=ficha,
+                    nombre=nombre,
+                    acto_id=acto_id,
+                    acto_nombre=acto_nombre,
+                    acto_url=acto_url,
+                    entidad=entidad,
+                    act_html=html,
+                    offer_html=offer_html,
+                    default_provider=proveedor,
+                    evidence_url=evidencia,
+                    created_at=datetime.now().isoformat(timespec="seconds"),
+                )
+            )
             saved = rows[-1]
             _log(
                 "stored acto id={aid} unit={unit} ref={ref} fecha_oc={foc} estado_rev={est}".format(
@@ -1204,13 +1879,48 @@ def main() -> int:
         "error": "",
     }
 
+    persisted_rows = _persist_line_amount_rows(
+        [
+            db_path,
+            REPO_ROOT / "data" / "db" / "panamacompra.db",
+        ],
+        ficha,
+        line_rows,
+    )
+    _log(f"evidencia de montos por renglón persistida: {persisted_rows}", t0)
+
     if _should_debug_no_sheets():
         _log("DEBUG_NO_SHEETS=1 -> no se escriben resultados a Sheets", t0)
     else:
         _replace_rows(RUNS_SHEET, RUNS_HEADERS, ficha, [_vals(RUNS_HEADERS, run_row)])
         _replace_rows(DETAIL_SHEET, DETAIL_HEADERS, ficha, [_vals(DETAIL_HEADERS, x) for x in rows])
-        _log(f"publicado en Sheets | detalle={len(rows)} | tipo1={t1} | tipo2={t2}", t0)
-    print(json.dumps({"ok": True, "request_id": request_id, "run_id_remote": run_id, "ficha": ficha, "total_items": len(rows), "tipo1": t1, "tipo2": t2}, ensure_ascii=False), flush=True)
+        _replace_rows(
+            LINE_DETAIL_SHEET,
+            LINE_DETAIL_HEADERS,
+            ficha,
+            [_vals(LINE_DETAIL_HEADERS, row) for row in line_rows],
+        )
+        _log(
+            f"publicado en Sheets | detalle={len(rows)} | renglones={len(line_rows)} "
+            f"| tipo1={t1} | tipo2={t2}",
+            t0,
+        )
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "request_id": request_id,
+                "run_id_remote": run_id,
+                "ficha": ficha,
+                "total_items": len(rows),
+                "total_renglones": len(line_rows),
+                "tipo1": t1,
+                "tipo2": t2,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
     return 0
 
 

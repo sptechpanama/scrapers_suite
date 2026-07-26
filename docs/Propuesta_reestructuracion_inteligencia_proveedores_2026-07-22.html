@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Propuesta de reestructuración — Inteligencia de proveedores</title>
+  <style>
+    @page { size: Letter; margin: 15mm 14mm 17mm; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: #17263a;
+      background: #fff;
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 9.7pt;
+      line-height: 1.43;
+    }
+    .cover {
+      min-height: 235mm;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: 18mm 12mm;
+      color: #fff;
+      background: linear-gradient(145deg, #07172d 0%, #0b3654 56%, #07847f 100%);
+      border-radius: 8px;
+      page-break-after: always;
+    }
+    .eyebrow { color: #75ecda; font-size: 9.5pt; letter-spacing: 1.8px; text-transform: uppercase; }
+    h1 { margin: 9mm 0 5mm; font-size: 29pt; line-height: 1.08; letter-spacing: -0.6px; }
+    .cover h2 { margin: 0; color: #ddfaf5; font-size: 15pt; font-weight: 400; border: 0; padding: 0; }
+    .cover .meta { margin-top: 20mm; color: #dbeaf2; font-size: 10pt; }
+    .badge { display: inline-block; align-self: flex-start; margin-top: 7mm; padding: 2.5mm 4mm; color: #073342; background: #75ecda; border-radius: 999px; font-weight: 700; }
+    h2 { margin: 8mm 0 3mm; color: #0a5870; font-size: 17.5pt; line-height: 1.2; border-bottom: 2px solid #19b6a9; padding-bottom: 2mm; }
+    h3 { margin: 5mm 0 2mm; color: #12445e; font-size: 12.3pt; }
+    h4 { margin: 4mm 0 1.5mm; color: #16566f; font-size: 10.4pt; }
+    p { margin: 0 0 3mm; }
+    ul, ol { margin: 1.5mm 0 4mm 5mm; padding-left: 4mm; }
+    li { margin-bottom: 1.3mm; }
+    code { font-family: Consolas, "Courier New", monospace; color: #07536a; }
+    pre { white-space: pre-wrap; word-break: break-word; padding: 4mm; color: #eaf9f8; background: #0c2035; border-left: 4px solid #20c4b6; border-radius: 5px; font: 8.5pt/1.45 Consolas, "Courier New", monospace; }
+    table { width: 100%; border-collapse: collapse; margin: 3mm 0 5mm; }
+    thead { display: table-header-group; }
+    tr { page-break-inside: avoid; }
+    th { color: #fff; background: #0b5c73; text-align: left; }
+    th, td { padding: 2.1mm 2.3mm; border: 1px solid #c9d8df; vertical-align: top; }
+    tr:nth-child(even) td { background: #f1f7f8; }
+    .callout { margin: 4mm 0; padding: 4mm 4.5mm; background: #e9f8f5; border-left: 5px solid #17b6a6; border-radius: 4px; page-break-inside: avoid; }
+    .warning { background: #fff4dd; border-left-color: #ed9c24; }
+    .metric-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 4mm; margin: 4mm 0 6mm; }
+    .metric { padding: 4mm; background: #f0f8fa; border: 1px solid #c8dfe4; border-radius: 6px; page-break-inside: avoid; }
+    .metric strong { display: block; color: #087f82; font-size: 16pt; line-height: 1.1; }
+    .flow { margin: 4mm 0 6mm; padding: 4mm; text-align: center; color: #fff; background: #0b3150; border-radius: 6px; font-weight: 700; }
+    .flow span { color: #72ead6; padding: 0 1.5mm; }
+    .page-break { page-break-before: always; }
+    .keep { page-break-inside: avoid; }
+    .small { color: #607382; font-size: 8.6pt; }
+    .wireframe { margin: 4mm 0 6mm; padding: 4mm; color: #dceaf0; background: #0a1d32; border: 1px solid #244660; border-radius: 7px; font-family: Consolas, "Courier New", monospace; font-size: 8.6pt; line-height: 1.55; white-space: pre-wrap; page-break-inside: avoid; }
+    .yes { color: #087d66; font-weight: 700; }
+    .no { color: #a24a57; font-weight: 700; }
+    .footer-note { margin-top: 8mm; padding-top: 3mm; color: #607382; border-top: 1px solid #ccd9df; font-size: 8.4pt; }
+  </style>
+</head>
+<body>
+  <section class="cover">
+    <div class="eyebrow">GEAPP · Inteligencia comercial</div>
+    <h1>Propuesta de reestructuración de Inteligencia de proveedores</h1>
+    <h2>Una sola herramienta para descubrir fichas atractivas, medir competencia y decidir cuándo vale la pena buscar proveedor</h2>
+    <div class="badge">Diseño funcional · Arquitectura analítica · Plan de implementación</div>
+    <div class="meta">
+      <p><strong>Fecha:</strong> 22 de julio de 2026</p>
+      <p><strong>Alcance:</strong> páginas actuales de inteligencia CT, Supabase, filtros temporales, ranking de fichas, análisis de proveedores y estudio profundo mediante orquestador.</p>
+      <p><strong>Objetivo:</strong> aumentar velocidad, claridad, flexibilidad y confiabilidad sin perder la potencia analítica existente.</p>
+    </div>
+  </section>
+
+  <h2>1. Resumen ejecutivo</h2>
+  <p>La recomendación es sustituir las dos páginas actuales de inteligencia por una experiencia unificada llamada <strong>Inteligencia de oportunidades y proveedores</strong>. La nueva sección debe permitir seleccionar un período, filtrar el universo completo, ordenar cualquier métrica de forma correcta y comparar fichas desde varios ángulos: demanda, valor económico, nivel de competencia, disponibilidad comercial, complejidad y calidad de datos.</p>
+  <p>El sistema no debe depender de un único “top”. Una ficha puede mover mucho dinero y, aun así, ser poco atractiva si está dominada por un proveedor, tiene demasiados participantes, requiere registro sanitario o presenta evidencia incompleta. La decisión debe construirse con métricas separadas, explicables y ajustables.</p>
+
+  <div class="metric-grid">
+    <div class="metric"><strong>1 página</strong>en lugar de dos interfaces casi duplicadas.</div>
+    <div class="metric"><strong>Rango real</strong>por año, últimos meses o fechas personalizadas.</div>
+    <div class="metric"><strong>100 % SQL</strong>filtrado y agregado en la base, no después de descargar toda la tabla.</div>
+    <div class="metric"><strong>6 dimensiones</strong>para evaluar cada oportunidad comercial.</div>
+    <div class="metric"><strong>Ranking explicable</strong>con componentes visibles y ajustables.</div>
+    <div class="metric"><strong>Estudio profundo</strong>conservado y conectado al orquestador.</div>
+  </div>
+
+  <div class="callout"><strong>Resultado esperado:</strong> pasar de una pantalla compleja que presenta información a una herramienta de decisión capaz de responder: “¿qué ficha conviene atacar, por qué, en qué período, con qué nivel de competencia y qué proveedor necesito conseguir?”.</div>
+
+  <h2>2. Diagnóstico del sistema actual</h2>
+  <h3>2.1 Dos páginas que mantienen casi la misma lógica</h3>
+  <p>Las páginas <code>inteligencia_ct_proveedores.py</code> e <code>inteligencia_ct_proveedores_flexible.py</code> tienen una estructura prácticamente idéntica. La variante flexible activa otro perfil de detección, pero ambas conservan por separado una aplicación extensa y difícil de mantener.</p>
+  <table>
+    <thead><tr><th>Situación actual</th><th>Consecuencia</th><th>Propuesta</th></tr></thead>
+    <tbody>
+      <tr><td>Dos archivos de gran tamaño con lógica repetida.</td><td>Cada corrección debe revisarse dos veces y puede divergir.</td><td>Una sola página con selector de perfil.</td></tr>
+      <tr><td>El perfil estricto/flexible define una página distinta.</td><td>El usuario cambia de sección para comparar resultados.</td><td>Perfil de detección como filtro superior.</td></tr>
+      <tr><td>Muchos controles distribuidos en pestañas.</td><td>Cuesta entender qué filtros afectan cada resultado.</td><td>Contexto global persistente en toda la página.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>2.2 La aplicación descarga demasiado antes de analizar</h3>
+  <p>Actualmente la carga principal ejecuta un <code>SELECT *</code> sobre la tabla completa de actos y después realiza gran parte de la transformación en pandas. Esto tiene tres efectos: aumenta el tiempo inicial, consume memoria de Streamlit y obliga a recalcular agrupaciones similares cada vez que cambia la sesión.</p>
+  <p>La base de datos debe examinar el universo completo, pero no necesita enviarlo completo al navegador. Supabase/PostgreSQL puede filtrar, agrupar y ordenar sobre todas las filas, devolviendo únicamente las métricas o la página solicitada.</p>
+
+  <h3>2.3 El rango temporal todavía no es un filtro funcional</h3>
+  <p>El sistema informa “Histórico completo (sin filtro temporal)”. Por lo tanto, hoy no es posible responder de manera limpia si una ficha fue fuerte en 2026, si está creciendo en los últimos seis meses o si su atractivo depende de años antiguos.</p>
+
+  <h3>2.4 Las métricas económicas necesitan separación semántica</h3>
+  <p>El monto histórico actual intenta usar el precio del proponente ganador y, cuando no puede identificarlo, recurre al precio de referencia. Es una salida práctica, pero mezcla dos conceptos diferentes:</p>
+  <ul>
+    <li><strong>Monto adjudicado confirmado:</strong> valor realmente asociado al ganador.</li>
+    <li><strong>Monto de referencia:</strong> presupuesto o valor estimado del acto.</li>
+  </ul>
+  <p>Ambos son útiles, pero deben mostrarse por separado y acompañarse de un porcentaje de cobertura. Así no se interpreta como dinero ganado un valor que solo era referencia.</p>
+
+  <h3>2.5 La puntuación actual es útil, pero demasiado compacta</h3>
+  <p>Hoy se ponderan actos, monto, ganadores, proponentes y riesgo. El problema no es que exista una puntuación, sino que una sola cifra puede ocultar por qué una ficha quedó arriba. Además, algunos filtros visibles son aún controles de primera fase y no ejecutan realmente el filtrado.</p>
+
+  <h2 class="page-break">3. Visión propuesta</h2>
+  <div class="flow">Filtros globales <span>→</span> universo de fichas <span>→</span> ranking multidimensional <span>→</span> detalle y evidencia <span>→</span> estudio profundo</div>
+
+  <h3>3.1 Una sola página, tres niveles de análisis</h3>
+  <ol>
+    <li><strong>Explorar:</strong> encontrar fichas atractivas mediante filtros, ordenamiento y ranking.</li>
+    <li><strong>Entender:</strong> abrir una ficha y revisar tendencia, actos, entidades, ganadores y concentración.</li>
+    <li><strong>Profundizar:</strong> enviar una ficha al orquestador para obtener datos adicionales, proveedores y contactos.</li>
+  </ol>
+
+  <div class="wireframe">INTELIGENCIA DE OPORTUNIDADES Y PROVEEDORES
+
+[Período: 2026 ▼] [Fecha: adjudicación ▼] [Detección: moderada ▼]
+[CT: todos ▼] [RS: todos ▼] [Entidad ▼] [Estado ▼] [Buscar ficha...]
+
+Resumen: 5,679 fichas · 18,420 actos · $XX.X M · 74 % con adjudicación confirmada
+
+[Oportunidades] [Tendencias] [Competencia] [Proveedores] [Estudios profundos]
+
+┌ Ficha ┬ Nombre ┬ Actos ┬ Monto ref. ┬ Adjudicado ┬ Participantes ┬ Score ┐
+│ 43358 │ Kit... │  16   │ $...       │ $...       │ 2.4           │ 82.6  │
+└───────┴────────┴───────┴────────────┴────────────┴───────────────┴───────┘
+
+Al seleccionar una fila:
+[Tendencia mensual] [Entidades] [Top ganadores] [Actos] [Enviar a estudio profundo]</div>
+
+  <h3>3.2 El contexto debe acompañar todos los módulos</h3>
+  <p>El período, tipo de fecha y perfil de detección seleccionados deben mantenerse al cambiar entre oportunidades, competencia y proveedores. Así cada tabla responde al mismo universo y los resultados son comparables.</p>
+
+  <h2>4. Filtros globales recomendados</h2>
+  <table>
+    <thead><tr><th>Filtro</th><th>Opciones</th><th>Para qué sirve</th></tr></thead>
+    <tbody>
+      <tr><td>Período</td><td>2026, 2025, últimos 6/12/24 meses, histórico, personalizado.</td><td>Comparar actualidad contra comportamiento histórico.</td></tr>
+      <tr><td>Dimensión de fecha</td><td>Publicación, celebración, adjudicación o actualización.</td><td>Evitar mezclar “publicado en 2026” con “adjudicado en 2026”.</td></tr>
+      <tr><td>Perfil de detección</td><td>Estricto, moderado, flexible, muy flexible.</td><td>Controlar cobertura y riesgo de falsos positivos.</td></tr>
+      <tr><td>Estado del acto</td><td>Adjudicado, desierto, vigente, todos.</td><td>Analizar mercado ganado o demanda disponible.</td></tr>
+      <tr><td>CT / RS</td><td>Sí, no, todos.</td><td>Alinear oportunidades con la capacidad regulatoria de la empresa.</td></tr>
+      <tr><td>Entidad / clase</td><td>Selección múltiple.</td><td>Identificar nichos institucionales o clínicos.</td></tr>
+      <tr><td>Valor económico</td><td>Mínimo/máximo de referencia o adjudicado.</td><td>Excluir oportunidades demasiado pequeñas o fuera de capacidad.</td></tr>
+      <tr><td>Demanda</td><td>Mínimo de actos, entidades o meses activos.</td><td>Separar recurrencia real de eventos aislados.</td></tr>
+      <tr><td>Competencia</td><td>Participantes, concentración, actos con un solo proponente.</td><td>Buscar mercados defendibles o poco atendidos.</td></tr>
+      <tr><td>Disponibilidad</td><td>Favoritos, catálogo Foyomed, proveedor conocido/contactable.</td><td>Priorizar fichas comercialmente accionables.</td></tr>
+      <tr><td>Búsqueda</td><td>Número, nombre, alias y grupos separados por coma.</td><td>Localizar familias de productos con lenguaje natural controlado.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warning"><strong>Regla esencial:</strong> todos los filtros deben ejecutarse en SQL sobre la totalidad de la base. La interfaz recibe solamente las filas agregadas o paginadas que necesita mostrar.</div>
+
+  <h2 class="page-break">5. Tabla maestra de oportunidades</h2>
+  <p>La tabla principal debe ser el centro del análisis. Todas las columnas numéricas y de fecha deben tener tipos reales para que el orden sea global y correcto, no lexicográfico ni limitado a las filas visibles.</p>
+  <table>
+    <thead><tr><th>Grupo</th><th>Columnas propuestas</th></tr></thead>
+    <tbody>
+      <tr><td>Identificación</td><td>Ficha, nombre genérico completo, clase, CT, RS, enlace MINSA.</td></tr>
+      <tr><td>Actividad</td><td>Último acto, actos totales, actos con ficha única, porcentaje de ficha única, entidades distintas, meses activos.</td></tr>
+      <tr><td>Economía</td><td>Monto de referencia, monto adjudicado confirmado, cobertura adjudicada, ticket promedio, mediana, máximo y tendencia.</td></tr>
+      <tr><td>Competencia</td><td>Proponentes distintos, promedio/mediana de participantes, actos con un proponente, cuota Top 1, cuota Top 3 e índice HHI.</td></tr>
+      <tr><td>Accionabilidad</td><td>Proveedor conocido, proveedor con contacto, presencia en catálogo, favorito y estudio vigente.</td></tr>
+      <tr><td>Decisión</td><td>Score total, demanda, valor, competencia, viabilidad, complejidad, confianza y recomendación.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>5.1 Ordenamiento confiable</h3>
+  <p>Cuando el usuario ordene “Monto total” de mayor a menor, la consulta debe ordenar el universo filtrado completo en PostgreSQL y luego devolver la primera página. Lo mismo aplica a actos, proveedores, porcentajes y fechas. La tabla visual no debe decidir el orden utilizando solo las filas ya cargadas.</p>
+
+  <h3>5.2 Paginación y exportación</h3>
+  <ul>
+    <li>Paginación del lado del servidor: 50, 100 o 250 filas por página.</li>
+    <li>Conteo total separado para mostrar el tamaño real del resultado.</li>
+    <li>Exportación de todas las filas filtradas mediante consulta dedicada, no solo la página visible.</li>
+    <li>Columnas configurables y vistas guardadas por usuario.</li>
+  </ul>
+
+  <h2>6. Evaluación multidimensional</h2>
+  <p>La nueva herramienta debe conservar un score general, pero dividirlo en componentes visibles. Cada dimensión se expresa de 0 a 100 y su peso puede ajustarse según la estrategia.</p>
+  <table>
+    <thead><tr><th>Dimensión</th><th>Variables sugeridas</th><th>Interpretación</th></tr></thead>
+    <tbody>
+      <tr><td>Demanda</td><td>Actos, frecuencia mensual, entidades, meses activos, recencia y crecimiento.</td><td>¿Existe una necesidad recurrente y vigente?</td></tr>
+      <tr><td>Potencial económico</td><td>Monto de referencia, adjudicado, ticket mediano y máximos.</td><td>¿El mercado mueve suficiente dinero?</td></tr>
+      <tr><td>Competencia</td><td>Participantes, actos de un proponente, concentración Top 1/Top 3, HHI.</td><td>¿Es un mercado abierto o dominado?</td></tr>
+      <tr><td>Viabilidad comercial</td><td>Proveedor identificado, contacto, catálogo, historial de precio y margen potencial.</td><td>¿Se puede convertir el hallazgo en una oferta real?</td></tr>
+      <tr><td>Complejidad</td><td>CT, RS, documentación, dispersión de especificaciones y plazos.</td><td>¿Cuánto esfuerzo y riesgo implica participar?</td></tr>
+      <tr><td>Confianza de datos</td><td>Cobertura de fechas, precios, ganadores, detección y enlaces.</td><td>¿Qué tan confiable es la recomendación?</td></tr>
+    </tbody>
+  </table>
+
+  <h3>6.1 Fórmula inicial propuesta</h3>
+  <pre>Oportunidad =
+  0.28 × Demanda
++ 0.27 × Potencial económico
++ 0.18 × Competencia favorable
++ 0.17 × Viabilidad comercial
++ 0.10 × Complejidad favorable
+
+La confianza de datos se muestra aparte y puede limitar la recomendación.</pre>
+  <p>Los pesos son un punto de partida, no una verdad fija. Se deben calibrar comparando el ranking con fichas conocidas y resultados comerciales reales.</p>
+
+  <h3>6.2 Etiquetas de decisión</h3>
+  <table>
+    <thead><tr><th>Etiqueta</th><th>Uso recomendado</th></tr></thead>
+    <tbody>
+      <tr><td class="yes">Atacar ahora</td><td>Demanda y valor altos, competencia manejable y proveedor disponible.</td></tr>
+      <tr><td class="yes">Vale la pena buscar proveedor</td><td>Mercado atractivo, pero falta fuente comercial o contacto.</td></tr>
+      <tr><td>Requiere validación</td><td>Oportunidad aparente con cobertura o clasificación insuficiente.</td></tr>
+      <tr><td>Observación</td><td>Mercado pequeño, reciente o concentrado que conviene monitorear.</td></tr>
+      <tr><td class="no">Baja prioridad</td><td>Poca demanda, valor reducido, competencia extrema o requisitos fuera de alcance.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>6.3 Explicación automática del resultado</h3>
+  <p>Cada fila debe incluir una explicación breve generada a partir de reglas, no necesariamente por IA:</p>
+  <pre>Ficha 43358 · Score 82.6
++ 16 actos en 2026 y actividad en 7 meses
++ ticket mediano superior al percentil 70
++ competencia moderada y concentración Top 1 controlada
+- proveedor potencial aún sin contacto confirmado
+Confianza: alta (92 % de actos con fecha y monto utilizables)</pre>
+
+  <h2>7. Ejemplo de uso: ficha 43358</h2>
+  <p>La ficha 43358 sirve como caso de control porque el detector corregido reconoce nombres completos, compactos, truncados y códigos contextuales. En la base sincronizada se verificaron <strong>16 registros de 2026</strong> y 46 registros históricos.</p>
+  <h3>Consulta comercial propuesta</h3>
+  <ol>
+    <li>Seleccionar <strong>Período = 2026</strong> y <strong>Dimensión = publicación</strong>.</li>
+    <li>Buscar <strong>43358</strong>.</li>
+    <li>Revisar actos, monto de referencia y adjudicado por separado.</li>
+    <li>Examinar entidades compradoras, meses activos y tendencia.</li>
+    <li>Comparar cantidad de proponentes, cuota del ganador y actos de ficha única.</li>
+    <li>Comprobar si existe proveedor conocido, contacto y presencia en catálogo.</li>
+    <li>Si la oportunidad supera el umbral, enviarla al estudio profundo con el mismo rango temporal.</li>
+  </ol>
+  <div class="callout"><strong>Ventaja:</strong> el usuario no recibe solamente “43358 está en el top”. Recibe evidencia suficiente para decidir si debe cotizar, buscar proveedor, negociar exclusividad o simplemente monitorear.</div>
+
+  <h2>8. Arquitectura de datos recomendada</h2>
+  <p>Para obtener velocidad sin perder cobertura, conviene separar el dato operativo del dato analítico.</p>
+  <div class="flow">actos_publicos <span>→</span> actos_fichas + acto_proponentes <span>→</span> métricas mensuales <span>→</span> consultas paginadas</div>
+
+  <h3>8.1 Tablas analíticas</h3>
+  <table>
+    <thead><tr><th>Tabla</th><th>Contenido</th><th>Beneficio</th></tr></thead>
+    <tbody>
+      <tr><td><code>actos_fichas</code></td><td>Una fila por acto y ficha, con método, score de detección, unicidad y evidencia.</td><td>Elimina la necesidad de volver a explotar textos en cada sesión.</td></tr>
+      <tr><td><code>acto_proponentes</code></td><td>Una fila por acto y proponente, precio, posición y condición de ganador.</td><td>Evita columnas Proponente 1…14 y facilita rankings correctos.</td></tr>
+      <tr><td><code>metricas_ficha_mes</code></td><td>Agregados por ficha y mes: actos, montos, entidades, participantes y concentración.</td><td>Hace casi instantáneos los análisis por período y tendencia.</td></tr>
+      <tr><td><code>estudios_ficha</code></td><td>Solicitudes, alcance, estado, resultados y versión del estudio profundo.</td><td>Unifica seguimiento local, Sheets y orquestador.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>8.2 Índices prioritarios</h3>
+  <ul>
+    <li>Fecha + ficha.</li>
+    <li>Ficha + estado.</li>
+    <li>Ficha + entidad.</li>
+    <li>Ficha + proponente/ganador.</li>
+    <li>Fecha + estado + entidad.</li>
+  </ul>
+
+  <h3>8.3 Consultas y caché</h3>
+  <ul>
+    <li>La base ejecuta <code>WHERE</code>, <code>GROUP BY</code>, <code>ORDER BY</code> y paginación.</li>
+    <li>Streamlit conserva únicamente parámetros y resultados pequeños.</li>
+    <li>Las métricas mensuales se actualizan después de sincronizar la base.</li>
+    <li>El caché se identifica por rango, filtros y versión de datos.</li>
+  </ul>
+
+  <h2>9. Integración con el estudio profundo</h2>
+  <p>La capacidad existente de enviar una ficha al orquestador debe mantenerse. La mejora consiste en transmitir el contexto completo de la investigación.</p>
+  <pre>{
+  "ficha": "43358",
+  "nombre": "KIT DE CIRCUITO DE PACIENTE PARA MAQUINA DE ANESTESIA",
+  "fecha_desde": "2026-01-01",
+  "fecha_hasta": "2026-12-31",
+  "tipo_fecha": "publicacion",
+  "perfil_deteccion": "moderado",
+  "estado": ["Adjudicado"],
+  "entidades": [],
+  "usuario": "rsanchez",
+  "scope_id": "sha256-de-parametros"
+}</pre>
+  <p>El trabajador debe usar la misma fuente normalizada de Supabase. El sistema actual consulta principalmente una SQLite local y aplica búsquedas adicionales por texto; esa ruta debe conservarse como respaldo, pero no como universo principal cuando PostgreSQL está disponible.</p>
+
+  <h3>Flujo recomendado</h3>
+  <ol>
+    <li>El usuario selecciona una ficha y pulsa <strong>Enviar a estudio profundo</strong>.</li>
+    <li>La app guarda alcance, filtros, versión de datos y usuario.</li>
+    <li>El orquestador recibe la solicitud sin bloquear Streamlit.</li>
+    <li>Selenium amplía datos que no están disponibles directamente.</li>
+    <li>Los resultados quedan vinculados a la ficha y al período analizado.</li>
+    <li>La página muestra estado, fecha, duración, cobertura y hallazgos.</li>
+  </ol>
+
+  <h2>10. Rendimiento y experiencia de usuario</h2>
+  <table>
+    <thead><tr><th>Cambio</th><th>Situación actual</th><th>Resultado esperado</th></tr></thead>
+    <tbody>
+      <tr><td>Filtrado SQL</td><td>Descarga completa y transformación en pandas.</td><td>Menor transferencia y menor uso de memoria.</td></tr>
+      <tr><td>Modelo normalizado</td><td>Fichas y proponentes se reconstruyen repetidamente.</td><td>Consultas simples, auditables e indexables.</td></tr>
+      <tr><td>Agregados mensuales</td><td>Tendencias calculadas durante la sesión.</td><td>Carga rápida para años y rangos extensos.</td></tr>
+      <tr><td>Paginación servidor</td><td>Top limitado o detalle de hasta 500 filas.</td><td>Acceso al universo completo sin saturar la interfaz.</td></tr>
+      <tr><td>Una página</td><td>Dos versiones casi iguales.</td><td>Mantenimiento menor y experiencia coherente.</td></tr>
+      <tr><td>Filtros persistentes</td><td>Contexto disperso por pestaña.</td><td>Comparaciones consistentes entre módulos.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Objetivos de rendimiento sugeridos</h3>
+  <ul>
+    <li>Resumen inicial filtrado: menos de 3 segundos con caché frío.</li>
+    <li>Cambio de orden o página: menos de 1.5 segundos.</li>
+    <li>Detalle de ficha: menos de 2 segundos, sin ejecutar Selenium.</li>
+    <li>El estudio profundo permanece asíncrono y muestra progreso.</li>
+  </ul>
+  <p class="small">Estos son objetivos de diseño que deberán medirse en el entorno real; no constituyen una garantía antes de implementar e instrumentar las consultas.</p>
+
+  <h2>11. Validación y controles de calidad</h2>
+  <p>La herramienta debe ser potente, pero también verificable. Cada actualización analítica necesita pruebas automáticas y casos de control conocidos.</p>
+  <table>
+    <thead><tr><th>Prueba</th><th>Qué valida</th></tr></thead>
+    <tbody>
+      <tr><td>Ficha 43358 por año</td><td>La detección y el filtro temporal conservan los 16 registros conocidos de 2026.</td></tr>
+      <tr><td>Totales contra SQL directo</td><td>Actos, montos y entidades coinciden con consultas independientes.</td></tr>
+      <tr><td>Orden global</td><td>El primer resultado es realmente el máximo del universo filtrado.</td></tr>
+      <tr><td>Monto adjudicado vs. referencia</td><td>No se mezclan conceptos ni se oculta la cobertura.</td></tr>
+      <tr><td>Deduplicación acto–ficha</td><td>Una ficha repetida en varios ítems cuenta una sola vez por acto.</td></tr>
+      <tr><td>Perfiles de detección</td><td>Estricto es subconjunto de moderado/flexible y conserva evidencia.</td></tr>
+      <tr><td>Competencia</td><td>Ganadores, participantes, cuotas y HHI se calculan sobre actos comparables.</td></tr>
+      <tr><td>Orquestador</td><td>La solicitud hereda fechas, filtros y ficha correctos.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Controles visibles de confianza</h3>
+  <ul>
+    <li>Porcentaje de actos con fecha válida.</li>
+    <li>Porcentaje con monto de referencia.</li>
+    <li>Porcentaje con adjudicado confirmado.</li>
+    <li>Porcentaje con ganador y proponentes identificados.</li>
+    <li>Distribución de métodos y scores de detección.</li>
+  </ul>
+
+  <h2>12. Plan de implementación</h2>
+  <h3>Fase 1 · Base unificada y filtros reales</h3>
+  <ul>
+    <li>Crear una sola página y conservar temporalmente las anteriores.</li>
+    <li>Implementar período, dimensión de fecha y perfil de detección.</li>
+    <li>Mover filtros, orden y paginación a SQL.</li>
+    <li>Separar monto de referencia y adjudicado.</li>
+  </ul>
+
+  <h3>Fase 2 · Modelo analítico</h3>
+  <ul>
+    <li>Crear <code>actos_fichas</code>, <code>acto_proponentes</code> y sus índices.</li>
+    <li>Backfill histórico desde la base vigente.</li>
+    <li>Validar conteos con fichas de control, incluyendo 43358.</li>
+  </ul>
+
+  <h3>Fase 3 · Tabla maestra y ranking explicable</h3>
+  <ul>
+    <li>Incorporar todas las métricas propuestas.</li>
+    <li>Agregar componentes del score y etiquetas de decisión.</li>
+    <li>Permitir vistas guardadas y exportación completa.</li>
+  </ul>
+
+  <h3>Fase 4 · Proveedores y estudio profundo</h3>
+  <ul>
+    <li>Conectar el análisis de proveedores al mismo universo temporal.</li>
+    <li>Enviar contexto completo al orquestador.</li>
+    <li>Integrar estado, cobertura y resultados del estudio en la ficha.</li>
+  </ul>
+
+  <h3>Fase 5 · Calibración comercial</h3>
+  <ul>
+    <li>Comparar scores con oportunidades realmente cotizadas y ganadas.</li>
+    <li>Ajustar pesos por empresa, categoría o estrategia.</li>
+    <li>Retirar las páginas antiguas solo después de demostrar paridad y estabilidad.</li>
+  </ul>
+
+  <h2>13. Qué se conserva y qué cambia</h2>
+  <table>
+    <thead><tr><th>Elemento</th><th>Decisión</th></tr></thead>
+    <tbody>
+      <tr><td>Perfiles estricto/moderado/flexible</td><td><span class="yes">Se conservan</span>, convertidos en filtro.</td></tr>
+      <tr><td>Detección mejorada de fichas</td><td><span class="yes">Se conserva</span> como fuente de evidencia.</td></tr>
+      <tr><td>Favoritos, seguimiento y catálogo</td><td><span class="yes">Se conservan</span> y pasan a filtros accionables.</td></tr>
+      <tr><td>Estudio profundo con orquestador</td><td><span class="yes">Se conserva y fortalece</span>.</td></tr>
+      <tr><td>Dos páginas duplicadas</td><td><span class="no">Se reemplazan</span> después de validar la nueva.</td></tr>
+      <tr><td><code>SELECT *</code> para análisis rutinario</td><td><span class="no">Se elimina</span> de las rutas principales.</td></tr>
+      <tr><td>Filtros visuales sin ejecución</td><td><span class="no">Se sustituyen</span> por filtros SQL reales.</td></tr>
+      <tr><td>Un único monto ambiguo</td><td><span class="no">Se separa</span> en referencia y adjudicado.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>14. Resultado final esperado</h2>
+  <p>La nueva inteligencia no debe limitarse a mostrar quién compró o quién ganó. Debe ordenar el mercado en oportunidades comerciales defendibles y permitir responder, con evidencia:</p>
+  <ul>
+    <li>¿Qué fichas están creciendo en el período seleccionado?</li>
+    <li>¿Cuáles mueven más dinero adjudicado y cuáles solo tienen alto presupuesto?</li>
+    <li>¿Dónde hay demanda recurrente en varias entidades?</li>
+    <li>¿Qué mercados tienen poca competencia o alta concentración?</li>
+    <li>¿Para qué ficha vale la pena invertir tiempo en conseguir proveedor?</li>
+    <li>¿Qué información falta antes de tomar una decisión?</li>
+  </ul>
+  <div class="callout"><strong>Principio rector:</strong> la plataforma puede hacer la decisión mucho más objetiva, rápida y trazable. No puede garantizar que una ficha produzca una venta; sí puede impedir que se recomiende sin suficiente demanda, valor, viabilidad y confianza de datos.</div>
+
+  <h2>15. Recomendación inmediata</h2>
+  <p>El primer entregable debería ser un prototipo funcional de la página unificada con rango temporal real, tabla maestra paginada y seis métricas verificadas. Antes de ampliar el score, se valida contra la ficha 43358 y un conjunto de fichas con comportamientos distintos. Una vez que los conteos, montos y ordenamientos coincidan con SQL independiente, se integra el estudio profundo y se retiran gradualmente las dos páginas antiguas.</p>
+
+  <div class="footer-note">Documento de propuesta técnica y funcional. No modifica la aplicación ni la base de datos; sirve como guía para la implementación y validación de la próxima versión de Inteligencia de proveedores.</div>
+</body>
+</html>
