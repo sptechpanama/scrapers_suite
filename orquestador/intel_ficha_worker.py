@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import time
 import uuid
 import traceback
@@ -22,6 +23,19 @@ try:
 except Exception:  # pragma: no cover - fallback en entornos sin bs4
     BeautifulSoup = None  # type: ignore[assignment]
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from common.ficha_line_items import (  # noqa: E402
+    FichaProfile,
+    bind_offers_to_matches,
+    build_ficha_profile,
+    extract_line_items_from_html,
+    extract_offer_lines_from_html,
+    match_ficha_to_lines,
+)
+from common.ficha_utils import get_catalog  # noqa: E402
 from sheets_bridge import (
     SPREADSHEET_ID,
     _clear_data_rows,
@@ -35,6 +49,10 @@ PANAMACOMPRA_BASE_URL = "https://www.panamacompra.gob.pa/Inicio/"
 FICHA_TOKEN_RE = re.compile(r"\b\d{3,8}\*?\b")
 RUNS_SHEET = os.environ.get("INTEL_STUDY_RUNS_SHEET", "intel_study_runs_remote")
 DETAIL_SHEET = os.environ.get("INTEL_STUDY_DETAIL_SHEET", "intel_study_detail_remote")
+LINE_DETAIL_SHEET = os.environ.get(
+    "INTEL_STUDY_LINE_DETAIL_SHEET",
+    "intel_study_line_items_remote",
+)
 
 RUNS_HEADERS = [
     "request_id","run_id_remote","ficha","nombre_ficha","estado_run","fecha_inicio","fecha_fin",
@@ -47,6 +65,14 @@ DETAIL_HEADERS = [
     "fecha_adjudicacion","fecha_orden_compra","dias_acto_a_oc","dias_acto_a_oc_mas_entrega","tipo_flujo",
     "fuente_precio","fuente_fecha","enlace_evidencia","unidad_medida","tiempo_entrega_dias","observaciones",
     "estado_revision","nivel_certeza","requiere_revision",
+]
+LINE_DETAIL_HEADERS = [
+    "request_id","run_id_remote","line_detail_id","ficha","nombre_ficha","acto_id",
+    "acto_nombre","acto_url","entidad","renglon_id","renglon_numero","renglon_texto",
+    "match_method","match_score","match_evidence","match_requires_review","cantidad",
+    "unidad_medida","precio_referencia_unitario","precio_referencia_total","proveedor",
+    "precio_participacion_unitario","precio_participacion_total","binding_method",
+    "binding_score","fuente_renglon","enlace_evidencia","created_at",
 ]
 DEBUG_HTML_DIR = Path(r"C:\Users\rodri\scrapers_repo\orquestador\debug_html_intel")
 
@@ -1012,6 +1038,186 @@ def _dump_debug_html(ficha: str, acto_id: str, label: str, html: str) -> str:
     except Exception:
         return ""
 
+
+def _build_study_ficha_profile(ficha: str, nombre: str) -> FichaProfile:
+    """Construye el perfil sin convertir una falla de catálogo en falla del estudio."""
+
+    catalog_name = ""
+    try:
+        catalog_name = _clean(get_catalog().names.get(str(ficha), ""))
+    except Exception:
+        catalog_name = ""
+    resolved_name = catalog_name or _clean(nombre) or f"Ficha {ficha}"
+    extra_names = [
+        value
+        for value in (_clean(nombre), catalog_name)
+        if value and _norm(value) != _norm(resolved_name)
+    ]
+    return build_ficha_profile(ficha, resolved_name, extra_names)
+
+
+def _line_audit_row(
+    *,
+    request_id: str,
+    run_id: str,
+    ficha: str,
+    nombre: str,
+    acto_id: str,
+    acto_nombre: str,
+    acto_url: str,
+    entidad: str,
+    method: str,
+    evidence: str,
+    created_at: str,
+) -> dict[str, Any]:
+    return {
+        "request_id": request_id,
+        "run_id_remote": run_id,
+        "line_detail_id": str(uuid.uuid4()),
+        "ficha": ficha,
+        "nombre_ficha": nombre,
+        "acto_id": acto_id,
+        "acto_nombre": acto_nombre,
+        "acto_url": acto_url,
+        "entidad": entidad,
+        "renglon_id": "",
+        "renglon_numero": "",
+        "renglon_texto": "",
+        "match_method": method,
+        "match_score": 0.0,
+        "match_evidence": evidence,
+        "match_requires_review": 1,
+        "cantidad": 0.0,
+        "unidad_medida": "",
+        "precio_referencia_unitario": 0.0,
+        "precio_referencia_total": 0.0,
+        "proveedor": "",
+        "precio_participacion_unitario": 0.0,
+        "precio_participacion_total": 0.0,
+        "binding_method": "sin_precio_renglon_confirmado",
+        "binding_score": 0.0,
+        "fuente_renglon": "auditoria",
+        "enlace_evidencia": acto_url,
+        "created_at": created_at,
+    }
+
+
+def _line_detail_rows_for_act(
+    *,
+    profile: FichaProfile,
+    request_id: str,
+    run_id: str,
+    ficha: str,
+    nombre: str,
+    acto_id: str,
+    acto_nombre: str,
+    acto_url: str,
+    entidad: str,
+    act_html: str,
+    offer_html: str,
+    default_provider: str,
+    evidence_url: str,
+    created_at: str,
+) -> list[dict[str, Any]]:
+    """Genera la capa paralela ficha-renglón-oferta sin usar totales del acto."""
+
+    if not _clean(act_html):
+        return [
+            _line_audit_row(
+                request_id=request_id,
+                run_id=run_id,
+                ficha=ficha,
+                nombre=nombre,
+                acto_id=acto_id,
+                acto_nombre=acto_nombre,
+                acto_url=acto_url,
+                entidad=entidad,
+                method="sin_html_acto",
+                evidence="No se obtuvo HTML para identificar renglones.",
+                created_at=created_at,
+            )
+        ]
+
+    line_items = extract_line_items_from_html(act_html)
+    matches = match_ficha_to_lines(profile, line_items, minimum_score=0.62)
+    if not matches:
+        return [
+            _line_audit_row(
+                request_id=request_id,
+                run_id=run_id,
+                ficha=ficha,
+                nombre=nombre,
+                acto_id=acto_id,
+                acto_nombre=acto_nombre,
+                acto_url=acto_url,
+                entidad=entidad,
+                method="sin_correspondencia_renglon",
+                evidence=(
+                    f"Se analizaron {len(line_items)} renglones, pero ninguno pudo "
+                    "atribuirse con seguridad a la ficha."
+                ),
+                created_at=created_at,
+            )
+        ]
+
+    offers = extract_offer_lines_from_html(offer_html or act_html)
+    bound = bind_offers_to_matches(matches, offers)
+    rows: list[dict[str, Any]] = []
+    for result in bound:
+        line = result.match.line
+        offer = result.offer
+        reference_total = float(line.reference_total or 0.0)
+        if reference_total <= 0 and line.reference_unit_price > 0 and line.quantity > 0:
+            reference_total = line.reference_unit_price * line.quantity
+        participation_total = float(offer.total or 0.0) if offer else 0.0
+        if (
+            offer
+            and participation_total <= 0
+            and offer.unit_price > 0
+            and offer.quantity > 0
+        ):
+            participation_total = offer.unit_price * offer.quantity
+        rows.append(
+            {
+                "request_id": request_id,
+                "run_id_remote": run_id,
+                "line_detail_id": str(uuid.uuid4()),
+                "ficha": ficha,
+                "nombre_ficha": profile.name or nombre,
+                "acto_id": acto_id,
+                "acto_nombre": acto_nombre,
+                "acto_url": acto_url,
+                "entidad": entidad,
+                "renglon_id": line.line_id,
+                "renglon_numero": line.line_number,
+                "renglon_texto": line.description,
+                "match_method": result.match.method,
+                "match_score": round(float(result.match.score), 4),
+                "match_evidence": result.match.evidence,
+                "match_requires_review": 1 if result.match.requires_review else 0,
+                "cantidad": round(float(line.quantity or (offer.quantity if offer else 0.0)), 6),
+                "unidad_medida": line.unit or (offer.unit if offer else ""),
+                "precio_referencia_unitario": round(float(line.reference_unit_price or 0.0), 6),
+                "precio_referencia_total": round(reference_total, 6),
+                "proveedor": (
+                    (_clean(offer.provider) or _clean(default_provider))
+                    if offer
+                    else _clean(default_provider)
+                ),
+                "precio_participacion_unitario": (
+                    round(float(offer.unit_price), 6) if offer else 0.0
+                ),
+                "precio_participacion_total": round(participation_total, 6),
+                "binding_method": result.binding_method,
+                "binding_score": round(float(result.binding_score), 4),
+                "fuente_renglon": "html_acto_y_cuadro_propuestas",
+                "enlace_evidencia": evidence_url or acto_url,
+                "created_at": created_at,
+            }
+        )
+    return rows
+
+
 def main() -> int:
     t0 = time.perf_counter()
     _log(f"inicio | spreadsheet={SPREADSHEET_ID}", t0)
@@ -1101,14 +1307,22 @@ def main() -> int:
         else:
             _replace_rows(RUNS_SHEET, RUNS_HEADERS, ficha, [_vals(RUNS_HEADERS, run_row)])
             _replace_rows(DETAIL_SHEET, DETAIL_HEADERS, ficha, [])
+            _replace_rows(LINE_DETAIL_SHEET, LINE_DETAIL_HEADERS, ficha, [])
         _log("run vacio publicado", t0)
         print(json.dumps({"ok": True, "request_id": request_id, "run_id_remote": run_id, "ficha": ficha}), flush=True)
         return 0
 
     cmap = _catalog_map()
     _log(f"catalogo claves: {len(cmap)}", t0)
+    ficha_profile = _build_study_ficha_profile(ficha, nombre)
+    _log(
+        f"perfil ficha: {ficha_profile.code} | {ficha_profile.name} "
+        f"| medidas_mm={sorted(ficha_profile.dimensions_mm)}",
+        t0,
+    )
 
     rows: list[dict[str, Any]] = []
+    line_rows: list[dict[str, Any]] = []
     t1 = 0
     t2 = 0
     started = datetime.now().isoformat(timespec="seconds")
@@ -1133,6 +1347,24 @@ def main() -> int:
             driver, mode = _build_driver()
             _log(f"acto id={acto_id} selenium={mode}", t0)
             if driver is None:
+                line_rows.extend(
+                    _line_detail_rows_for_act(
+                        profile=ficha_profile,
+                        request_id=request_id,
+                        run_id=run_id,
+                        ficha=ficha,
+                        nombre=nombre,
+                        acto_id=acto_id,
+                        acto_nombre=acto_nombre,
+                        acto_url=acto_url,
+                        entidad=entidad,
+                        act_html="",
+                        offer_html="",
+                        default_provider=proveedor_ganador,
+                        evidence_url=acto_url,
+                        created_at=datetime.now().isoformat(timespec="seconds"),
+                    )
+                )
                 rows.append(
                     {
                         "request_id": request_id,
@@ -1177,6 +1409,24 @@ def main() -> int:
             html = _driver_html(driver, acto_url)
             if not html:
                 _log(f"acto id={acto_id} sin html util (url={acto_url})", t0)
+                line_rows.extend(
+                    _line_detail_rows_for_act(
+                        profile=ficha_profile,
+                        request_id=request_id,
+                        run_id=run_id,
+                        ficha=ficha,
+                        nombre=nombre,
+                        acto_id=acto_id,
+                        acto_nombre=acto_nombre,
+                        acto_url=acto_url,
+                        entidad=entidad,
+                        act_html="",
+                        offer_html="",
+                        default_provider=proveedor_ganador,
+                        evidence_url=acto_url,
+                        created_at=datetime.now().isoformat(timespec="seconds"),
+                    )
+                )
                 rows.append(
                     {
                         "request_id": request_id,
@@ -1247,6 +1497,7 @@ def main() -> int:
             t2 += 0 if has_info else 1
 
             info = _unit_data(html, ficha)
+            offer_html = html
             proveedor = _provider_from_tables(html) if has_info else ""
             fuente_precio = "acto_info_proponente" if has_info and float(info.get("unit", 0)) > 0 else ""
             evidencia = acto_url
@@ -1256,6 +1507,10 @@ def main() -> int:
                 cuadro = _href(html, "/cuadro-de-propuestas/", exclude="/ver-propuesta/")
                 if cuadro:
                     cm = _cuadro_min_from_driver(driver, cuadro, ficha)
+                    try:
+                        offer_html = str(getattr(driver, "page_source", "") or "") or html
+                    except Exception:
+                        offer_html = html
                     if _clean(cm.get("proveedor", "")):
                         proveedor = _clean(cm.get("proveedor", ""))
                     if float(cm.get("unit", 0)) > 0:
@@ -1462,6 +1717,24 @@ def main() -> int:
                     "requiere_revision": rev,
                 }
             )
+            line_rows.extend(
+                _line_detail_rows_for_act(
+                    profile=ficha_profile,
+                    request_id=request_id,
+                    run_id=run_id,
+                    ficha=ficha,
+                    nombre=nombre,
+                    acto_id=acto_id,
+                    acto_nombre=acto_nombre,
+                    acto_url=acto_url,
+                    entidad=entidad,
+                    act_html=html,
+                    offer_html=offer_html,
+                    default_provider=proveedor,
+                    evidence_url=evidencia,
+                    created_at=datetime.now().isoformat(timespec="seconds"),
+                )
+            )
             saved = rows[-1]
             _log(
                 "stored acto id={aid} unit={unit} ref={ref} fecha_oc={foc} estado_rev={est}".format(
@@ -1505,8 +1778,33 @@ def main() -> int:
     else:
         _replace_rows(RUNS_SHEET, RUNS_HEADERS, ficha, [_vals(RUNS_HEADERS, run_row)])
         _replace_rows(DETAIL_SHEET, DETAIL_HEADERS, ficha, [_vals(DETAIL_HEADERS, x) for x in rows])
-        _log(f"publicado en Sheets | detalle={len(rows)} | tipo1={t1} | tipo2={t2}", t0)
-    print(json.dumps({"ok": True, "request_id": request_id, "run_id_remote": run_id, "ficha": ficha, "total_items": len(rows), "tipo1": t1, "tipo2": t2}, ensure_ascii=False), flush=True)
+        _replace_rows(
+            LINE_DETAIL_SHEET,
+            LINE_DETAIL_HEADERS,
+            ficha,
+            [_vals(LINE_DETAIL_HEADERS, row) for row in line_rows],
+        )
+        _log(
+            f"publicado en Sheets | detalle={len(rows)} | renglones={len(line_rows)} "
+            f"| tipo1={t1} | tipo2={t2}",
+            t0,
+        )
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "request_id": request_id,
+                "run_id_remote": run_id,
+                "ficha": ficha,
+                "total_items": len(rows),
+                "total_renglones": len(line_rows),
+                "tipo1": t1,
+                "tipo2": t2,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
     return 0
 
 
