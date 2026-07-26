@@ -34,10 +34,12 @@ DEFAULT_APP_ROOT = Path.home() / "GEAPP"
 DEFAULT_METADATA_XLSX = DEFAULT_APP_ROOT / "fichas_ctni_con_enlace.xlsx"
 DEFAULT_CATALOG_XLSX = DEFAULT_APP_ROOT / "oferentes_catalogos.xlsx"
 DEFAULT_ALIAS_JSON = REPO_ROOT / "data" / "fichas" / "ficha_aliases.json"
+DEFAULT_CLASSIFICATION_XLSX = REPO_ROOT / "data" / "fichas" / "todas_las_fichas.xlsx"
 
-ANALYTICS_SCHEMA_VERSION = "3.2.0"
+ANALYTICS_SCHEMA_VERSION = "3.3.0"
 SOURCE_CHUNK_SIZE = 5_000
 WRITE_CHUNK_SIZE = 5_000
+SQLITE_MAX_BOUND_PARAMETERS = 30_000
 FICHA_TOKEN_RE = re.compile(r"(?<!\d)(\d{3,8})\*?(?!\d)")
 DATE_TOKEN_RE = re.compile(r"(?<!\d)(\d{1,2}[\-/]\d{1,2}[\-/]\d{4}|\d{4}[\-/]\d{1,2}[\-/]\d{1,2})(?!\d)")
 
@@ -63,8 +65,18 @@ FACT_COLUMNS = [
     "celebration_end_date",
     "award_date",
     "update_date",
+    "source_line_count",
+    "attributed_line_count",
     "reference_amount",
+    "reference_amount_context",
+    "reference_amount_attributed",
+    "reference_amount_attribution_source",
+    "reference_amount_reliable",
     "award_amount",
+    "award_amount_context",
+    "award_amount_attributed",
+    "award_amount_attribution_source",
+    "award_amount_reliable",
     "award_amount_source",
     "winner",
     "winner_short",
@@ -114,6 +126,12 @@ CATALOG_COLUMNS = [
 def _log(label: str, message: str, started: float) -> None:
     elapsed = time.perf_counter() - started
     print(f"{datetime.now():%Y-%m-%d %H:%M:%S} | {label:<10} | +{elapsed:,.1f}s | {message}", flush=True)
+
+
+def _sqlite_multi_chunksize(column_count: int) -> int:
+    """Evita superar el lÃ­mite de variables enlazadas de SQLite."""
+
+    return max(1, min(1_000, SQLITE_MAX_BOUND_PARAMETERS // max(1, column_count)))
 
 
 def clean_text(value: object) -> str:
@@ -322,13 +340,205 @@ def resolve_award_amount(row: Mapping[str, Any], proponents: Sequence[Mapping[st
     return 0.0, "sin_monto_confirmado"
 
 
+def parse_item_details(raw_value: object) -> list[dict[str, Any]]:
+    """Normaliza ``items_json`` legado y enriquecido sin inventar importes."""
+
+    if isinstance(raw_value, list):
+        payload = raw_value
+    else:
+        try:
+            payload = json.loads(clean_text(raw_value) or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = []
+    if not isinstance(payload, list):
+        return []
+
+    details: list[dict[str, Any]] = []
+    for position, item in enumerate(payload, start=1):
+        if isinstance(item, Mapping):
+            description = clean_text(
+                item.get("descripcion")
+                or item.get("description")
+                or item.get("detalle")
+                or item.get("nombre")
+            )
+            line_number = clean_text(
+                item.get("numero_renglon")
+                or item.get("numRenglon")
+                or item.get("renglon")
+                or position
+            )
+            quantity = parse_number(
+                item.get("cantidad")
+                or item.get("quantity")
+                or item.get("cantidadSolicitada")
+            )
+            reference_unit = parse_number(
+                item.get("precio_referencia_unitario")
+                or item.get("precioReferenciaUnitario")
+                or item.get("precioUnitarioReferencia")
+            )
+            reference_total = parse_number(
+                item.get("precio_referencia_total")
+                or item.get("precioReferenciaTotal")
+                or item.get("montoReferencia")
+                or item.get("precioTotalReferencia")
+                or item.get("precioReferencia")
+            )
+            if reference_total <= 0 and reference_unit > 0 and quantity > 0:
+                reference_total = reference_unit * quantity
+        else:
+            description = clean_text(item)
+            line_number = str(position)
+            quantity = 0.0
+            reference_unit = 0.0
+            reference_total = 0.0
+        if not description:
+            continue
+        details.append(
+            {
+                "position": position,
+                "line_number": line_number,
+                "description": description,
+                "quantity": quantity,
+                "reference_unit": reference_unit,
+                "reference_total": reference_total,
+            }
+        )
+    return details
+
+
+def _all_detection_entries(row: Mapping[str, Any]) -> list[dict[str, Any]]:
+    raw = clean_text(row.get("fichas_detectadas_json"))
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if isinstance(payload, Mapping):
+        payload = payload.get("fichas") or payload.get("detecciones") or [payload]
+    return [dict(item) for item in payload if isinstance(item, Mapping)] if isinstance(payload, list) else []
+
+
+def _detected_item_positions(row: Mapping[str, Any], ficha: str) -> set[int]:
+    positions: set[int] = set()
+    for item in _all_detection_entries(row):
+        code = _normalize_ficha(item.get("code") or item.get("ficha") or item.get("numero"))
+        if code != ficha:
+            continue
+        field = clean_text(item.get("field") or item.get("campo"))
+        match = re.search(r"(?:item|renglon|linea)[ _-]*(\d+)", field, re.IGNORECASE)
+        if match:
+            positions.add(int(match.group(1)))
+    return positions
+
+
+def _amount_attribution(
+    row: Mapping[str, Any],
+    *,
+    ficha: str,
+    distinct_fichas: int,
+    reference_context: float,
+    award_context: float,
+    winner_names: Sequence[object] = (),
+    confirmed_line_amounts: Mapping[tuple[str, str], object] | None = None,
+) -> dict[str, Any]:
+    """Atribuye dinero a una ficha sin repartir arbitrariamente el total del acto.
+
+    Jerarquía:
+    1. suma confirmada por el estudio de renglones;
+    2. importes de renglones API donde el detector ubicó esa ficha;
+    3. total del acto únicamente si consta un solo renglón y una sola ficha.
+    Los actos mixtos o sin detalle conservan el monto global como contexto,
+    pero aportan cero al monto financiero atribuible.
+    """
+
+    link = clean_text(row.get("enlace"))
+    items = parse_item_details(row.get("items_json"))
+    source_line_count = len(items)
+    confirmed = (confirmed_line_amounts or {}).get((link, ficha))
+    confirmed_reference = 0.0
+    confirmed_lines = 0
+    confirmed_awards: Mapping[str, object] = {}
+    if isinstance(confirmed, Mapping):
+        confirmed_reference = parse_number(confirmed.get("reference_amount"))
+        confirmed_lines = parse_int(confirmed.get("line_count"))
+        raw_awards = confirmed.get("award_by_provider")
+        if isinstance(raw_awards, Mapping):
+            confirmed_awards = raw_awards
+    elif isinstance(confirmed, Sequence) and not isinstance(confirmed, (str, bytes)):
+        # Compatibilidad con la primera versiÃ³n local: (monto_referencia, renglones).
+        confirmed_reference = parse_number(confirmed[0]) if confirmed else 0.0
+        confirmed_lines = parse_int(confirmed[1]) if len(confirmed) > 1 else 0
+
+    if confirmed_reference > 0:
+        reference_attributed = confirmed_reference
+        attributed_line_count = max(1, confirmed_lines)
+        reference_source = "estudio_renglon_confirmado"
+    else:
+        positions = _detected_item_positions(row, ficha)
+        matched_items = [item for item in items if int(item["position"]) in positions]
+        amount_items = [item for item in matched_items if parse_number(item["reference_total"]) > 0]
+        if amount_items:
+            reference_attributed = sum(parse_number(item["reference_total"]) for item in amount_items)
+            attributed_line_count = len(amount_items)
+            reference_source = "api_renglon_detectado"
+        elif source_line_count == 1 and distinct_fichas == 1 and reference_context > 0:
+            reference_attributed = reference_context
+            attributed_line_count = 1
+            reference_source = "acto_un_renglon_ficha_unica"
+        else:
+            reference_attributed = 0.0
+            attributed_line_count = 0
+            reference_source = (
+                "sin_detalle_renglones"
+                if source_line_count == 0
+                else "acto_mixto_sin_monto_atribuible"
+            )
+
+    matched_awards = [
+        parse_number(amount)
+        for provider, amount in confirmed_awards.items()
+        if parse_number(amount) > 0 and provider_matches_winner(provider, winner_names)
+    ]
+    if matched_awards:
+        # Si el mismo ganador aparece con variantes de nombre, no se suman
+        # entre sÃ­: se conserva el total confirmado mÃ¡s completo.
+        award_attributed = max(matched_awards)
+        award_source = "estudio_renglon_ganador_confirmado"
+    elif source_line_count == 1 and distinct_fichas == 1 and award_context > 0:
+        award_attributed = award_context
+        award_source = "acto_un_renglon_ficha_unica"
+    else:
+        award_attributed = 0.0
+        award_source = (
+            "sin_detalle_renglones"
+            if source_line_count == 0
+            else "sin_adjudicacion_por_renglon_confirmada"
+        )
+
+    return {
+        "source_line_count": source_line_count,
+        "attributed_line_count": attributed_line_count,
+        "reference_amount_context": round(reference_context, 6),
+        "reference_amount_attributed": round(reference_attributed, 6),
+        "reference_amount_attribution_source": reference_source,
+        "reference_amount_reliable": int(reference_attributed > 0),
+        "award_amount_context": round(award_context, 6),
+        "award_amount_attributed": round(award_attributed, 6),
+        "award_amount_attribution_source": award_source,
+        "award_amount_reliable": int(award_attributed > 0),
+    }
+
+
 def source_rows(connection: sqlite3.Connection, chunk_size: int = SOURCE_CHUNK_SIZE) -> Iterator[pd.DataFrame]:
     columns = {row[1] for row in connection.execute("PRAGMA table_info(actos_publicos)").fetchall()}
     required = {
         "id", "enlace", "titulo", "entidad", "unidad_solic", "estado", "publicacion", "fecha",
         "fecha_adjudicacion", "fecha_actualizacion", "precio_referencia", "total_items_ofertados",
         "num_participantes", "razon_social", "nombre_comercial", "ficha_detectada",
-        "fichas_detectadas_json", "ficha_detector_version", "ficha_catalogo_version",
+        "fichas_detectadas_json", "ficha_detector_version", "ficha_catalogo_version", "items_json",
     }
     for index in range(1, 15):
         required.add(f"Proponente {index}")
@@ -340,7 +550,11 @@ def source_rows(connection: sqlite3.Connection, chunk_size: int = SOURCE_CHUNK_S
     yield from pd.read_sql_query(f"SELECT {quoted} FROM actos_publicos", connection, chunksize=chunk_size)
 
 
-def row_to_records(row: Mapping[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def row_to_records(
+    row: Mapping[str, Any],
+    *,
+    confirmed_line_amounts: Mapping[tuple[str, str], object] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     evidences = extract_ficha_evidence(row)
     if not evidences:
         return [], []
@@ -349,6 +563,7 @@ def row_to_records(row: Mapping[str, Any]) -> tuple[list[dict[str, Any]], list[d
     award_amount, award_source = resolve_award_amount(row, proponents)
     celebration_dates = parse_date_tokens(row.get("fecha"))
     distinct_count = len(evidences)
+    reference_context = parse_number(row.get("precio_referencia"))
     base = {
         "acto_key": acto_key,
         "source_id": clean_text(row.get("id")),
@@ -366,7 +581,9 @@ def row_to_records(row: Mapping[str, Any]) -> tuple[list[dict[str, Any]], list[d
         "celebration_end_date": celebration_dates[-1] if celebration_dates else "",
         "award_date": parse_date(row.get("fecha_adjudicacion")),
         "update_date": parse_date(row.get("fecha_actualizacion")),
-        "reference_amount": parse_number(row.get("precio_referencia")),
+        # Columnas legadas: se mantienen como totales globales del acto para
+        # compatibilidad y auditoría. Las métricas financieras usan *_attributed.
+        "reference_amount": reference_context,
         "award_amount": award_amount,
         "award_amount_source": award_source,
         "winner": clean_text(row.get("razon_social")),
@@ -387,6 +604,16 @@ def row_to_records(row: Mapping[str, Any]) -> tuple[list[dict[str, Any]], list[d
     facts: list[dict[str, Any]] = []
     for evidence in evidences:
         fact = dict(base)
+        attribution = _amount_attribution(
+            row,
+            ficha=evidence["ficha"],
+            distinct_fichas=distinct_count,
+            reference_context=reference_context,
+            award_context=award_amount,
+            winner_names=(row.get("razon_social"), row.get("nombre_comercial")),
+            confirmed_line_amounts=confirmed_line_amounts,
+        )
+        fact.update(attribution)
         fact.update(
             {
                 "ficha": evidence["ficha"],
@@ -460,7 +687,7 @@ def _load_aliases(path: Path) -> dict[str, list[str]]:
     return dict(result)
 
 
-def load_metadata(path: Path, aliases_path: Path = DEFAULT_ALIAS_JSON) -> pd.DataFrame:
+def _load_primary_metadata(path: Path, aliases_path: Path = DEFAULT_ALIAS_JSON) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame(columns=METADATA_COLUMNS)
     raw = pd.read_excel(path, dtype=object)
@@ -519,6 +746,123 @@ def load_metadata(path: Path, aliases_path: Path = DEFAULT_ALIAS_JSON) -> pd.Dat
         previous = records.get(code)
         if previous is None or sum(bool(v) for v in record.values()) > sum(bool(v) for v in previous.values()):
             records[code] = record
+    return pd.DataFrame(records.values(), columns=METADATA_COLUMNS)
+
+
+def _classification_flag(value: object, *, registro_sanitario: bool = False) -> str:
+    """Normaliza las clasificaciones usadas por los scrapers.
+
+    En ``todas_las_fichas.xlsx`` el registro sanitario puede venir como
+    ``SI RS LCRSP``, ``SI RS DNFD`` u otra variante. Todas significan que la
+    ficha requiere registro; únicamente ``NO`` significa que no lo requiere.
+    """
+    normalized = normalize_text(value)
+    if not normalized:
+        return ""
+    if registro_sanitario:
+        if normalized == "no" or normalized.startswith("no "):
+            return "No"
+        if normalized == "si" or normalized.startswith("si "):
+            return "Si"
+    return _yes_no(value)
+
+
+def load_classification_metadata(
+    path: Path,
+    aliases_path: Path = DEFAULT_ALIAS_JSON,
+) -> pd.DataFrame:
+    """Carga el inventario CT/RS utilizado por clv, clrir y rir1.
+
+    Este archivo histórico no tiene encabezados: ficha, criterio técnico y
+    registro sanitario. Sirve como cobertura complementaria cuando el catálogo
+    enriquecido de MINSA no contiene una ficha que sí fue detectada en actos.
+    """
+    if not path.exists():
+        return pd.DataFrame(columns=METADATA_COLUMNS)
+    raw = pd.read_excel(path, header=None, dtype=object)
+    if raw.empty or raw.shape[1] < 3:
+        return pd.DataFrame(columns=METADATA_COLUMNS)
+
+    aliases = _load_aliases(aliases_path)
+    records: dict[str, dict[str, Any]] = {}
+    for _, row in raw.iterrows():
+        code = _normalize_ficha(row.iloc[0])
+        if not code:
+            continue
+        alias_candidates = [item for item in aliases.get(code, []) if not item.endswith("...")]
+        name = max(alias_candidates, key=len) if alias_candidates else ""
+        record = {
+            "ficha": code,
+            "nombre_ficha": name,
+            "descripcion": "",
+            "area": "",
+            "tipo_producto": "",
+            "especialidad": "",
+            "tiene_ct": _classification_flag(row.iloc[1]),
+            "registro_sanitario": _classification_flag(row.iloc[2], registro_sanitario=True),
+            "enlace_minsa": "",
+            "metadata_source": path.name,
+            "search_text_norm": normalize_text(f"{code} {name}"),
+        }
+        previous = records.get(code)
+        if previous is None or sum(bool(v) for v in record.values()) > sum(bool(v) for v in previous.values()):
+            records[code] = record
+    return pd.DataFrame(records.values(), columns=METADATA_COLUMNS)
+
+
+def _metadata_search_text(record: Mapping[str, Any]) -> str:
+    return normalize_text(
+        " ".join(
+            clean_text(record.get(field))
+            for field in ("ficha", "nombre_ficha", "descripcion", "area", "tipo_producto", "especialidad")
+        )
+    )
+
+
+def load_metadata(
+    path: Path,
+    aliases_path: Path = DEFAULT_ALIAS_JSON,
+    classification_path: Path = DEFAULT_CLASSIFICATION_XLSX,
+) -> pd.DataFrame:
+    """Combina metadata enriquecida con la clasificación oficial de scrapers.
+
+    El catálogo enriquecido conserva nombres, descripciones y enlaces. La
+    clasificación CT/RS de los scrapers completa fichas ausentes y es la fuente
+    autoritativa para esos dos indicadores, evitando excluir fichas válidas por
+    falta de metadata (por ejemplo, 100523).
+    """
+    primary = _load_primary_metadata(path, aliases_path)
+    classification = load_classification_metadata(classification_path, aliases_path)
+    if primary.empty:
+        return classification
+    if classification.empty:
+        return primary
+
+    records = {clean_text(row["ficha"]): row.to_dict() for _, row in primary.iterrows()}
+    for _, fallback_row in classification.iterrows():
+        fallback = fallback_row.to_dict()
+        code = clean_text(fallback.get("ficha"))
+        if not code:
+            continue
+        current = records.get(code)
+        if current is None:
+            records[code] = fallback
+            continue
+
+        used_fallback = False
+        for field in ("tiene_ct", "registro_sanitario"):
+            value = clean_text(fallback.get(field))
+            if value and clean_text(current.get(field)) != value:
+                current[field] = value
+                used_fallback = True
+        if not clean_text(current.get("nombre_ficha")) and clean_text(fallback.get("nombre_ficha")):
+            current["nombre_ficha"] = fallback["nombre_ficha"]
+            used_fallback = True
+        if used_fallback:
+            sources = [clean_text(current.get("metadata_source")), clean_text(fallback.get("metadata_source"))]
+            current["metadata_source"] = " + ".join(dict.fromkeys(item for item in sources if item))
+            current["search_text_norm"] = _metadata_search_text(current)
+
     return pd.DataFrame(records.values(), columns=METADATA_COLUMNS)
 
 
@@ -601,8 +945,18 @@ def _create_local_schema(connection: sqlite3.Connection) -> None:
             celebration_end_date TEXT,
             award_date TEXT,
             update_date TEXT,
+            source_line_count INTEGER NOT NULL DEFAULT 0,
+            attributed_line_count INTEGER NOT NULL DEFAULT 0,
             reference_amount REAL NOT NULL DEFAULT 0,
+            reference_amount_context REAL NOT NULL DEFAULT 0,
+            reference_amount_attributed REAL NOT NULL DEFAULT 0,
+            reference_amount_attribution_source TEXT,
+            reference_amount_reliable INTEGER NOT NULL DEFAULT 0,
             award_amount REAL NOT NULL DEFAULT 0,
+            award_amount_context REAL NOT NULL DEFAULT 0,
+            award_amount_attributed REAL NOT NULL DEFAULT 0,
+            award_amount_attribution_source TEXT,
+            award_amount_reliable INTEGER NOT NULL DEFAULT 0,
             award_amount_source TEXT,
             winner TEXT,
             winner_short TEXT,
@@ -632,6 +986,10 @@ def _create_local_schema(connection: sqlite3.Connection) -> None:
             entidades INTEGER NOT NULL DEFAULT 0,
             monto_referencia REAL NOT NULL DEFAULT 0,
             monto_adjudicado REAL NOT NULL DEFAULT 0,
+            monto_referencia_contexto REAL NOT NULL DEFAULT 0,
+            monto_adjudicado_contexto REAL NOT NULL DEFAULT 0,
+            actos_monto_referencia INTEGER NOT NULL DEFAULT 0,
+            actos_monto_adjudicado INTEGER NOT NULL DEFAULT 0,
             actos_con_ganador INTEGER NOT NULL DEFAULT 0,
             participantes_promedio REAL NOT NULL DEFAULT 0,
             confianza_deteccion REAL NOT NULL DEFAULT 0,
@@ -699,6 +1057,76 @@ def _create_local_indexes(connection: sqlite3.Connection) -> None:
     )
 
 
+def load_confirmed_line_amounts(
+    source: sqlite3.Connection,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Carga montos referenciales confirmados por estudios de renglón.
+
+    La tabla es opcional: una base que todavía no haya ejecutado estudios
+    profundos sigue construyéndose con la regla conservadora de un solo renglón.
+    """
+
+    table_exists = source.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='intel_ficha_line_amounts'"
+    ).fetchone()
+    if not table_exists:
+        return {}
+    rows = source.execute(
+        """
+        SELECT ficha, acto_url,
+               COALESCE(NULLIF(renglon_id, ''), NULLIF(renglon_numero, ''), line_key) AS line_identity,
+               MAX(COALESCE(reference_total, 0)) AS reference_total,
+               COALESCE(provider, '') AS provider,
+               MAX(COALESCE(participation_total, 0)) AS participation_total
+        FROM intel_ficha_line_amounts
+        WHERE COALESCE(requires_review, 1) = 0
+          AND COALESCE(ficha, '') <> ''
+          AND COALESCE(acto_url, '') <> ''
+        GROUP BY ficha, acto_url,
+                 COALESCE(NULLIF(renglon_id, ''), NULLIF(renglon_numero, ''), line_key),
+                 COALESCE(provider, '')
+        """
+    ).fetchall()
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for ficha, acto_url, line_identity, reference_total, provider, participation_total in rows:
+        key = (clean_text(acto_url), _normalize_ficha(ficha))
+        line_key = clean_text(line_identity)
+        if not key[0] or not key[1] or not line_key:
+            continue
+        record = grouped.setdefault(
+            key,
+            {
+                "reference_by_line": {},
+                "award_lines_by_provider": defaultdict(dict),
+            },
+        )
+        record["reference_by_line"][line_key] = max(
+            parse_number(record["reference_by_line"].get(line_key)),
+            parse_number(reference_total),
+        )
+        provider_name = clean_text(provider)
+        if provider_name and parse_number(participation_total) > 0:
+            provider_lines = record["award_lines_by_provider"][provider_name]
+            provider_lines[line_key] = max(
+                parse_number(provider_lines.get(line_key)),
+                parse_number(participation_total),
+            )
+
+    output: dict[tuple[str, str], dict[str, Any]] = {}
+    for key, record in grouped.items():
+        reference_by_line = record["reference_by_line"]
+        award_lines_by_provider = record["award_lines_by_provider"]
+        output[key] = {
+            "reference_amount": sum(parse_number(value) for value in reference_by_line.values()),
+            "line_count": len(reference_by_line),
+            "award_by_provider": {
+                provider: sum(parse_number(value) for value in line_values.values())
+                for provider, line_values in award_lines_by_provider.items()
+            },
+        }
+    return output
+
+
 def build_local_analytics(
     source_db: Path,
     output_db: Path,
@@ -706,6 +1134,7 @@ def build_local_analytics(
     catalog_xlsx: Path,
     aliases_json: Path,
     *,
+    classification_xlsx: Path = DEFAULT_CLASSIFICATION_XLSX,
     limit: int = 0,
 ) -> dict[str, Any]:
     started = time.perf_counter()
@@ -722,6 +1151,13 @@ def build_local_analytics(
     _log("START", f"fuente={source_db} salida={output_db}", started)
 
     source_count = int(source.execute("SELECT COUNT(*) FROM actos_publicos").fetchone()[0])
+    confirmed_line_amounts = load_confirmed_line_amounts(source)
+    if confirmed_line_amounts:
+        _log(
+            "LINES",
+            f"{len(confirmed_line_amounts):,} relaciones ficha-acto con monto por renglón confirmado",
+            started,
+        )
     processed = 0
     fact_count = 0
     proponent_count = 0
@@ -734,17 +1170,32 @@ def build_local_analytics(
             facts: list[dict[str, Any]] = []
             proponents: list[dict[str, Any]] = []
             for row in chunk.to_dict(orient="records"):
-                row_facts, row_proponents = row_to_records(row)
+                row_facts, row_proponents = row_to_records(
+                    row,
+                    confirmed_line_amounts=confirmed_line_amounts,
+                )
                 facts.extend(row_facts)
                 proponents.extend(row_proponents)
             if facts:
                 pd.DataFrame(facts, columns=FACT_COLUMNS).to_sql(
-                    "intel_actos_fichas", target, if_exists="append", index=False, method="multi", chunksize=1_000
+                    "intel_actos_fichas",
+                    target,
+                    if_exists="append",
+                    index=False,
+                    method="multi",
+                    chunksize=_sqlite_multi_chunksize(len(FACT_COLUMNS)),
                 )
             if proponents:
                 pd.DataFrame(proponents, columns=PROPONENT_COLUMNS).drop_duplicates(
                     subset=["acto_key", "ordinal"], keep="last"
-                ).to_sql("intel_acto_proponentes", target, if_exists="append", index=False, method="multi", chunksize=1_000)
+                ).to_sql(
+                    "intel_acto_proponentes",
+                    target,
+                    if_exists="append",
+                    index=False,
+                    method="multi",
+                    chunksize=_sqlite_multi_chunksize(len(PROPONENT_COLUMNS)),
+                )
             processed += len(chunk)
             fact_count += len(facts)
             proponent_count += len(proponents)
@@ -758,20 +1209,32 @@ def build_local_analytics(
         target.executescript(
             """
             WITH dated AS (
-                SELECT ficha, acto_key, is_unique_ficha, entidad, reference_amount, award_amount,
+                SELECT ficha, acto_key, is_unique_ficha, entidad,
+                       reference_amount_attributed, award_amount_attributed,
+                       reference_amount_context, award_amount_context,
+                       reference_amount_reliable, award_amount_reliable,
                        winner, participant_count, detection_score, 'publicacion' date_basis,
                        substr(publication_date, 1, 7) period_month
                 FROM intel_actos_fichas WHERE publication_date IS NOT NULL AND length(publication_date) >= 7
                 UNION ALL
-                SELECT ficha, acto_key, is_unique_ficha, entidad, reference_amount, award_amount,
+                SELECT ficha, acto_key, is_unique_ficha, entidad,
+                       reference_amount_attributed, award_amount_attributed,
+                       reference_amount_context, award_amount_context,
+                       reference_amount_reliable, award_amount_reliable,
                        winner, participant_count, detection_score, 'celebracion', substr(celebration_date, 1, 7)
                 FROM intel_actos_fichas WHERE celebration_date IS NOT NULL AND length(celebration_date) >= 7
                 UNION ALL
-                SELECT ficha, acto_key, is_unique_ficha, entidad, reference_amount, award_amount,
+                SELECT ficha, acto_key, is_unique_ficha, entidad,
+                       reference_amount_attributed, award_amount_attributed,
+                       reference_amount_context, award_amount_context,
+                       reference_amount_reliable, award_amount_reliable,
                        winner, participant_count, detection_score, 'adjudicacion', substr(award_date, 1, 7)
                 FROM intel_actos_fichas WHERE award_date IS NOT NULL AND length(award_date) >= 7
                 UNION ALL
-                SELECT ficha, acto_key, is_unique_ficha, entidad, reference_amount, award_amount,
+                SELECT ficha, acto_key, is_unique_ficha, entidad,
+                       reference_amount_attributed, award_amount_attributed,
+                       reference_amount_context, award_amount_context,
+                       reference_amount_reliable, award_amount_reliable,
                        winner, participant_count, detection_score, 'actualizacion', substr(update_date, 1, 7)
                 FROM intel_actos_fichas WHERE update_date IS NOT NULL AND length(update_date) >= 7
             ), profiles(detection_profile, threshold) AS (
@@ -779,14 +1242,19 @@ def build_local_analytics(
             )
             INSERT INTO intel_metricas_ficha_mes (
                 date_basis, period_month, detection_profile, ficha, actos, actos_ficha_unica,
-                entidades, monto_referencia, monto_adjudicado, actos_con_ganador,
+                entidades, monto_referencia, monto_adjudicado,
+                monto_referencia_contexto, monto_adjudicado_contexto,
+                actos_monto_referencia, actos_monto_adjudicado, actos_con_ganador,
                 participantes_promedio, confianza_deteccion
             )
             SELECT d.date_basis, d.period_month, p.detection_profile, d.ficha,
                    COUNT(DISTINCT d.acto_key),
                    COUNT(DISTINCT CASE WHEN d.is_unique_ficha = 1 THEN d.acto_key END),
                    COUNT(DISTINCT NULLIF(trim(d.entidad), '')),
-                   SUM(d.reference_amount), SUM(d.award_amount),
+                   SUM(d.reference_amount_attributed), SUM(d.award_amount_attributed),
+                   SUM(d.reference_amount_context), SUM(d.award_amount_context),
+                   COUNT(DISTINCT CASE WHEN d.reference_amount_reliable = 1 THEN d.acto_key END),
+                   COUNT(DISTINCT CASE WHEN d.award_amount_reliable = 1 THEN d.acto_key END),
                    COUNT(DISTINCT CASE WHEN trim(COALESCE(d.winner, '')) <> '' THEN d.acto_key END),
                    AVG(d.participant_count), AVG(d.detection_score)
             FROM dated d
@@ -798,12 +1266,26 @@ def build_local_analytics(
         )
         monthly_count = int(target.execute("SELECT COUNT(*) FROM intel_metricas_ficha_mes").fetchone()[0])
 
-        metadata = load_metadata(metadata_xlsx, aliases_json)
+        metadata = load_metadata(metadata_xlsx, aliases_json, classification_xlsx)
         catalog = load_catalog(catalog_xlsx)
         if not metadata.empty:
-            metadata.to_sql("intel_ficha_metadata", target, if_exists="append", index=False, method="multi", chunksize=1_000)
+            metadata.to_sql(
+                "intel_ficha_metadata",
+                target,
+                if_exists="append",
+                index=False,
+                method="multi",
+                chunksize=_sqlite_multi_chunksize(len(METADATA_COLUMNS)),
+            )
         if not catalog.empty:
-            catalog.to_sql("intel_ficha_catalogo", target, if_exists="append", index=False, method="multi", chunksize=1_000)
+            catalog.to_sql(
+                "intel_ficha_catalogo",
+                target,
+                if_exists="append",
+                index=False,
+                method="multi",
+                chunksize=_sqlite_multi_chunksize(len(CATALOG_COLUMNS)),
+            )
 
         build_values = {
             "schema_version": ANALYTICS_SCHEMA_VERSION,
@@ -814,7 +1296,9 @@ def build_local_analytics(
             "proponent_rows": str(proponent_count),
             "monthly_rows": str(monthly_count),
             "metadata_rows": str(len(metadata)),
+            "classification_xlsx": str(classification_xlsx.resolve()) if classification_xlsx.exists() else "",
             "catalog_rows": str(len(catalog)),
+            "confirmed_line_amount_relations": str(len(confirmed_line_amounts)),
         }
         target.executemany(
             "INSERT OR REPLACE INTO intel_build_metadata(key, value) VALUES (?, ?)", build_values.items()
@@ -949,8 +1433,25 @@ def verify_analytics(local_db: Path) -> dict[str, Any]:
                 "SELECT COUNT(*) FROM intel_actos_fichas WHERE detection_score < 0 OR detection_score > 100"
             ).fetchone()[0]
         )
-        result = {**counts, "duplicates": duplicates, "invalid_unique": invalid_unique, "invalid_scores": invalid_scores}
-        if duplicates or invalid_unique or invalid_scores:
+        invalid_amounts = int(
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM intel_actos_fichas
+                WHERE reference_amount_attributed < 0
+                   OR award_amount_attributed < 0
+                   OR (reference_amount_reliable = 0 AND reference_amount_attributed <> 0)
+                   OR (award_amount_reliable = 0 AND award_amount_attributed <> 0)
+                """
+            ).fetchone()[0]
+        )
+        result = {
+            **counts,
+            "duplicates": duplicates,
+            "invalid_unique": invalid_unique,
+            "invalid_scores": invalid_scores,
+            "invalid_amounts": invalid_amounts,
+        }
+        if duplicates or invalid_unique or invalid_scores or invalid_amounts:
             raise RuntimeError(f"Validacion analitica fallida: {result}")
         return result
     finally:
@@ -964,6 +1465,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--metadata-xlsx", type=Path, default=DEFAULT_METADATA_XLSX)
     parser.add_argument("--catalog-xlsx", type=Path, default=DEFAULT_CATALOG_XLSX)
     parser.add_argument("--aliases-json", type=Path, default=DEFAULT_ALIAS_JSON)
+    parser.add_argument("--classification-xlsx", type=Path, default=DEFAULT_CLASSIFICATION_XLSX)
     parser.add_argument("--postgres-url", default="")
     parser.add_argument("--publish-postgres", action="store_true")
     parser.add_argument("--require-postgres", action="store_true")
@@ -982,6 +1484,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.metadata_xlsx,
                 args.catalog_xlsx,
                 args.aliases_json,
+                classification_xlsx=args.classification_xlsx,
                 limit=max(0, args.limit),
             )
         verification = verify_analytics(args.output_db)

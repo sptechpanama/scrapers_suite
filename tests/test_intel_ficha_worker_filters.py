@@ -17,6 +17,7 @@ sys.path.insert(0, str(REPO_ROOT / "orquestador"))
 from intel_ficha_worker import (  # noqa: E402
     _acts_for_ficha,
     _filter_acts_by_payload,
+    _persist_line_amount_rows,
     _study_filters_from_payload,
 )
 
@@ -192,6 +193,43 @@ class WorkerFilterTests(unittest.TestCase):
                 analytics_db=analytics_database,
             )
             self.assertEqual(result["id"].tolist(), [99])
+
+    def test_persists_reliable_line_amount_evidence_for_analytics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "source.db"
+            sqlite3.connect(database).close()
+            stored = _persist_line_amount_rows(
+                [database],
+                "43358",
+                [
+                    {
+                        "acto_url": "https://example.test/acto/1",
+                        "acto_id": "1",
+                        "renglon_id": "abc",
+                        "renglon_numero": "2",
+                        "precio_referencia_total": 1250,
+                        "precio_participacion_total": 1100,
+                        "proveedor": "BTS PANAMA",
+                        "match_score": 97,
+                        "match_requires_review": 0,
+                        "binding_method": "id_exacto",
+                        "created_at": "2026-07-25T12:00:00",
+                    }
+                ],
+            )
+            self.assertEqual(stored, 1)
+            with closing(sqlite3.connect(database)) as connection:
+                row = connection.execute(
+                    """
+                    SELECT ficha, acto_url, reference_total, participation_total,
+                           provider, requires_review
+                    FROM intel_ficha_line_amounts
+                    """
+                ).fetchone()
+            self.assertEqual(
+                row,
+                ("43358", "https://example.test/acto/1", 1250.0, 1100.0, "BTS PANAMA", 0),
+            )
 
 
 if __name__ == "__main__":

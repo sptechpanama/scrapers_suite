@@ -336,6 +336,45 @@ def _numeric_ficha(value: Any) -> str:
     return match.group(1) if match else ""
 
 
+def _detect_fichas_with_line_evidence(
+    fields: dict[str, Any],
+) -> tuple[list[FichaMatch], list[FichaMatch]]:
+    """Detecta fichas y conserva cada renglÃ³n donde aparecieron.
+
+    ``detectar_fichas_detalladas`` devuelve la mejor coincidencia por ficha.
+    Para la clasificaciÃ³n general eso es correcto, pero la atribuciÃ³n monetaria
+    necesita saber si la misma ficha aparece en item_1, item_2, etc. Esta capa
+    mantiene ambas vistas sin cambiar la columna legada ``ficha_detectada``.
+    """
+
+    best: dict[str, FichaMatch] = {}
+    detailed: list[FichaMatch] = []
+    seen: set[tuple[str, str, str, str, int]] = set()
+    for field, value in fields.items():
+        if value is None or not str(value).strip():
+            continue
+        for match in detectar_fichas_detalladas({str(field): value}):
+            identity = (
+                match.code,
+                match.method,
+                match.field,
+                match.evidence,
+                int(match.score),
+            )
+            if identity not in seen:
+                seen.add(identity)
+                detailed.append(match)
+            current = best.get(match.code)
+            if current is None or match.score > current.score:
+                best[match.code] = match
+    ordered_best = sorted(best.values(), key=lambda item: (-item.score, int(item.code)))
+    ordered_detail = sorted(
+        detailed,
+        key=lambda item: (int(item.code), item.field, -item.score, item.method),
+    )
+    return ordered_best, ordered_detail
+
+
 class FichaMatcher:
     def __init__(self) -> None:
         catalog = get_catalog()
@@ -396,11 +435,11 @@ class FichaMatcher:
         return self.classify({"texto": text})["ficha_detectada"]
 
     def classify(self, fields: dict[str, Any]) -> dict[str, str]:
-        matches = detectar_fichas_detalladas(fields)
+        matches, detailed_matches = _detect_fichas_with_line_evidence(fields)
         tokens = legacy_tokens(matches)
         return {
             "ficha_detectada": ", ".join(tokens) if tokens else "No Detectada",
-            "fichas_detectadas_json": detection_json(matches),
+            "fichas_detectadas_json": detection_json(detailed_matches),
             "ficha_detector_version": DETECTOR_VERSION,
             "ficha_catalogo_version": self.catalog_version,
             "ficha_detectada_at": datetime.now(PANAMA_TZ).strftime("%Y-%m-%d %H:%M:%S"),
@@ -640,6 +679,86 @@ def _item_description(item: dict[str, Any]) -> str:
     return _item_description(nested) if isinstance(nested, dict) else ""
 
 
+def _first_money(item: dict[str, Any], keys: Iterable[str]) -> float | None:
+    """Devuelve el primer importe numérico presente, incluido cero explícito."""
+
+    for key in keys:
+        if key not in item or item.get(key) in (None, ""):
+            continue
+        value = money_number(item.get(key))
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _item_detail_record(item: dict[str, Any]) -> dict[str, Any]:
+    """Conserva el detalle mínimo necesario para atribuir montos por renglón.
+
+    Las corridas antiguas almacenaban únicamente una lista de descripciones.
+    El formato enriquecido sigue siendo compatible con ``_item_fields_from_json``
+    y añade cantidad, número de renglón e importes referenciales auditables.
+    """
+
+    nested = item.get("item") if isinstance(item.get("item"), dict) else {}
+    source = {**nested, **item}
+    quantity = _first_money(
+        source,
+        ("cantidad", "cantidadSolicitada", "cantidadRequerida", "quantity"),
+    )
+    reference_total = _first_money(
+        source,
+        (
+            "precioReferenciaTotal",
+            "montoReferencia",
+            "montoTotalReferencia",
+            "precioTotalReferencia",
+            "subtotalReferencia",
+        ),
+    )
+    reference_unit = _first_money(
+        source,
+        (
+            "precioReferenciaUnitario",
+            "precioUnitarioReferencia",
+            "referenceUnitPrice",
+        ),
+    )
+    legacy_reference = _first_money(source, ("precioReferencia",))
+
+    # La API histórica expone ``precioReferencia`` como importe del renglón.
+    # Se conserva esa semántica, ya utilizada para formar el total del acto.
+    if reference_total is None:
+        reference_total = legacy_reference
+    if reference_total is None and reference_unit is not None and quantity and quantity > 0:
+        reference_total = reference_unit * quantity
+    if reference_unit is None and reference_total is not None:
+        reference_unit = (
+            reference_total / quantity
+            if quantity and quantity > 0
+            else reference_total
+        )
+
+    return {
+        "descripcion": _item_description(source),
+        "numero_renglon": str(
+            source.get("numRenglon")
+            or source.get("numeroRenglon")
+            or source.get("renglon")
+            or source.get("itemNumber")
+            or ""
+        ).strip(),
+        "cantidad": float(quantity or 0.0),
+        "unidad": str(
+            source.get("unidad")
+            or source.get("unidadMedida")
+            or source.get("nombreUnidad")
+            or ""
+        ).strip(),
+        "precio_referencia_unitario": float(reference_unit or 0.0),
+        "precio_referencia_total": float(reference_total or 0.0),
+    }
+
+
 def parse_detail(
     record: dict[str, Any], state_name: str, run_stamp: str, matcher: FichaMatcher
 ) -> dict[str, Any]:
@@ -666,7 +785,12 @@ def parse_detail(
 
     title = _label(labels, "Título") or str(record.get("titulo") or "").strip()
     description = _label(labels, "Descripción") or str(record.get("observaciones") or "").strip()
-    item_descriptions = [description for item in items if (description := _item_description(item))]
+    item_details = [
+        detail
+        for item in items
+        if (detail := _item_detail_record(item)).get("descripcion")
+    ]
+    item_descriptions = [str(detail["descripcion"]) for detail in item_details]
     item_fields = {
         f"item_{index}": value for index, value in enumerate(item_descriptions, 1) if value
     }
@@ -726,7 +850,7 @@ def parse_detail(
         "termino_entrega": _label(labels, "Término de entrega"),
         "estado": state_name,
         "descripcion": description,
-        "items_json": json.dumps(item_descriptions, ensure_ascii=False, separators=(",", ":")),
+        "items_json": json.dumps(item_details, ensure_ascii=False, separators=(",", ":")),
         "source_flow_id": str(flow),
         "source_tipo_proceso": str(tipo),
         "source_record_json": json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str),
@@ -894,15 +1018,30 @@ def reclassify_existing(
                     "descripcion": str(description or ""),
                     **_item_fields_from_json(items_json),
                 }
-                matches = detectar_fichas_detalladas(fields)
-                matches = _merge_legacy_matches(matches, old_detection, matcher.valid)
-                tokens = legacy_tokens(matches)
+                matches, detailed_matches = _detect_fichas_with_line_evidence(fields)
+                merged_matches = _merge_legacy_matches(matches, old_detection, matcher.valid)
+                detailed_identities = {
+                    (match.code, match.method, match.field, match.evidence, int(match.score))
+                    for match in detailed_matches
+                }
+                for match in merged_matches:
+                    identity = (
+                        match.code,
+                        match.method,
+                        match.field,
+                        match.evidence,
+                        int(match.score),
+                    )
+                    if identity not in detailed_identities:
+                        detailed_matches.append(match)
+                        detailed_identities.add(identity)
+                tokens = legacy_tokens(merged_matches)
                 new_detection = ", ".join(tokens) if tokens else "No Detectada"
                 changed += int(new_detection != str(old_detection or ""))
                 updates.append(
                     (
                         new_detection,
-                        detection_json(matches),
+                        detection_json(detailed_matches),
                         DETECTOR_VERSION,
                         matcher.catalog_version,
                         run_stamp,
@@ -1073,12 +1212,52 @@ def verify_sqlite(path: Path) -> tuple[int, str]:
         conn.close()
 
 
-def checkpoint_sqlite() -> None:
-    """Consolida el WAL antes de copiar o subir el archivo principal."""
-    with connect_db() as conn:
-        result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-    if result and int(result[0]) != 0:
-        raise RuntimeError(f"No se pudo consolidar el WAL de SQLite: {result}")
+def checkpoint_sqlite(max_attempts: int = 3) -> bool:
+    """Intenta consolidar el WAL; devuelve False ante un lector persistente."""
+    last_result: tuple[Any, ...] | None = None
+    for attempt in range(1, max(1, max_attempts) + 1):
+        conn = sqlite3.connect(DB_PATH, timeout=5, isolation_level=None)
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        finally:
+            conn.close()
+        last_result = tuple(result) if result else None
+        if not result or int(result[0]) == 0:
+            if attempt > 1:
+                log("WAL", f"Checkpoint completado en el intento {attempt}")
+            return True
+        if attempt < max_attempts:
+            delay = min(2.0 * attempt, 10.0)
+            log(
+                "RETRY",
+                f"WAL ocupado {result}; intento {attempt}/{max_attempts}, espera {delay:.1f}s",
+            )
+            time.sleep(delay)
+    log(
+        "WARN",
+        f"WAL ocupado tras {max_attempts} intentos ({last_result}); "
+        "se publicará una instantánea SQLite consistente.",
+    )
+    return False
+
+
+def create_publish_snapshot() -> Path:
+    """Crea una copia autocontenida incluyendo cualquier contenido del WAL."""
+    snapshot_dir = DB_PATH.parent / "publish_snapshots"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = snapshot_dir / f"panamacompra_publish_{os.getpid()}.db"
+    source = sqlite3.connect(DB_PATH, timeout=60)
+    target = sqlite3.connect(snapshot_path, timeout=60)
+    try:
+        source.backup(target, pages=4096, sleep=0.05)
+        target.commit()
+    finally:
+        target.close()
+        source.close()
+    verify_sqlite(snapshot_path)
+    log("SNAPSHOT", f"Instantánea consistente creada: {snapshot_path}")
+    return snapshot_path
 
 
 def atomic_copy(source: Path, target: Path) -> None:
@@ -1099,7 +1278,7 @@ def atomic_copy(source: Path, target: Path) -> None:
     raise RuntimeError(f"No se pudo reemplazar {target}: {last_error}")
 
 
-def publish_local(config: dict[str, Any]) -> None:
+def publish_local(config: dict[str, Any], source: Path = DB_PATH) -> None:
     configured = config.get("publish_targets") or []
     targets = [Path(os.path.expandvars(os.path.expanduser(str(value)))) for value in configured]
     if not targets:
@@ -1107,14 +1286,14 @@ def publish_local(config: dict[str, Any]) -> None:
             Path.home() / "GEAPP" / "panamacompra.db",
             Path.home() / "OneDrive" / "cl" / "panamacompra.db",
         ]
-    source_resolved = DB_PATH.resolve()
+    live_db_resolved = DB_PATH.resolve()
     for target in targets:
-        if target.resolve() == source_resolved:
+        if target.resolve() == live_db_resolved:
             continue
-        atomic_copy(DB_PATH, target)
+        atomic_copy(source, target)
 
 
-def publish_drive(config: dict[str, Any]) -> bool:
+def publish_drive(config: dict[str, Any], source: Path = DB_PATH) -> bool:
     file_id = os.environ.get("DRIVE_PANAMACOMPRA_FILE_ID") or config.get("drive_file_id")
     if not file_id:
         log("DRIVE", "Sin DRIVE_PANAMACOMPRA_FILE_ID; publicación omitida")
@@ -1131,7 +1310,7 @@ def publish_drive(config: dict[str, Any]) -> bool:
             str(CREDENTIALS_FILE), scopes=["https://www.googleapis.com/auth/drive"]
         )
         service = build("drive", "v3", credentials=credentials, cache_discovery=False)
-        media = MediaFileUpload(str(DB_PATH), mimetype="application/x-sqlite3", resumable=True)
+        media = MediaFileUpload(str(source), mimetype="application/x-sqlite3", resumable=True)
         # El archivo vive en una unidad compartida. Sin supportsAllDrives=True la
         # API responde 404 aunque la cuenta de servicio tenga permiso de edición.
         request = service.files().update(
@@ -1150,6 +1329,16 @@ def publish_drive(config: dict[str, Any]) -> bool:
         return False
 
 
+def postgres_reconciliation_required(
+    local_count: int,
+    remote_count: int,
+    *,
+    requested_full: bool = False,
+) -> bool:
+    """Indica si Supabase necesita recibir y reconciliar la tabla completa."""
+    return bool(requested_full or int(local_count) != int(remote_count))
+
+
 def sync_postgres(run_stamp: str, *, full: bool = False) -> bool:
     dsn = os.environ.get("SUPABASE_DB_URL") or os.environ.get("DATABASE_URL")
     if not dsn:
@@ -1164,6 +1353,9 @@ def sync_postgres(run_stamp: str, *, full: bool = False) -> bool:
 
     with connect_db() as sqlite_conn:
         sqlite_conn.row_factory = sqlite3.Row
+        local_count = int(
+            sqlite_conn.execute("SELECT COUNT(*) FROM actos_publicos").fetchone()[0]
+        )
         if full:
             rows = sqlite_conn.execute("SELECT * FROM actos_publicos").fetchall()
         else:
@@ -1171,9 +1363,6 @@ def sync_postgres(run_stamp: str, *, full: bool = False) -> bool:
                 "SELECT * FROM actos_publicos WHERE fecha_actualizacion=?", (run_stamp,)
             ).fetchall()
         columns = [item[1] for item in sqlite_conn.execute("PRAGMA table_info(actos_publicos)") if item[1] != "id"]
-    if not rows:
-        log("POSTGRES", "No hay filas para sincronizar")
-        return True
 
     connection = psycopg2.connect(dsn, connect_timeout=20)
     try:
@@ -1197,6 +1386,38 @@ def sync_postgres(run_stamp: str, *, full: bool = False) -> bool:
             cursor.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ux_actos_publicos_enlace ON actos_publicos(enlace)"
             )
+            cursor.execute("SELECT COUNT(*) FROM actos_publicos")
+            remote_count_before = int(cursor.fetchone()[0])
+            reconcile_full = postgres_reconciliation_required(
+                local_count,
+                remote_count_before,
+                requested_full=full,
+            )
+            if reconcile_full and not full:
+                log(
+                    "RECONCILE",
+                    "Diferencia SQLite/Supabase detectada "
+                    f"({local_count:,} vs {remote_count_before:,}); "
+                    "se sincronizará y depurará la tabla completa.",
+                )
+                with connect_db() as sqlite_conn:
+                    sqlite_conn.row_factory = sqlite3.Row
+                    rows = sqlite_conn.execute(
+                        "SELECT * FROM actos_publicos"
+                    ).fetchall()
+
+            if not rows and not reconcile_full:
+                connection.commit()
+                metadata_set("last_postgres_local_rows", local_count)
+                metadata_set("last_postgres_remote_rows", remote_count_before)
+                metadata_set("last_postgres_sync_scope", "sin cambios; conteos alineados")
+                log(
+                    "POSTGRES",
+                    "No hay filas nuevas y Supabase ya coincide con SQLite "
+                    f"({local_count:,} filas)",
+                )
+                return True
+
             updates = ",".join(
                 f"{qident(column)}=EXCLUDED.{qident(column)}" for column in columns if column != "enlace"
             )
@@ -1207,8 +1428,56 @@ def sync_postgres(run_stamp: str, *, full: bool = False) -> bool:
             values = [tuple(row[column] for column in columns) for row in rows]
             for offset in range(0, len(values), 1000):
                 execute_values(cursor, statement, values[offset : offset + 1000], page_size=1000)
+
+            if reconcile_full:
+                enlace_index = columns.index("enlace")
+                cursor.execute(
+                    "CREATE TEMP TABLE sync_actos_enlaces "
+                    "(enlace TEXT PRIMARY KEY) ON COMMIT DROP"
+                )
+                link_values = [
+                    (str(value[enlace_index]),)
+                    for value in values
+                    if value[enlace_index] is not None
+                    and str(value[enlace_index]).strip()
+                ]
+                link_statement = (
+                    "INSERT INTO sync_actos_enlaces (enlace) VALUES %s "
+                    "ON CONFLICT (enlace) DO NOTHING"
+                )
+                for offset in range(0, len(link_values), 2000):
+                    execute_values(
+                        cursor,
+                        link_statement,
+                        link_values[offset : offset + 2000],
+                        page_size=2000,
+                    )
+                cursor.execute(
+                    "DELETE FROM actos_publicos AS remote "
+                    "WHERE NOT EXISTS ("
+                    "SELECT 1 FROM sync_actos_enlaces AS source "
+                    "WHERE source.enlace = remote.enlace"
+                    ")"
+                )
+                removed = max(0, int(cursor.rowcount or 0))
+                if removed:
+                    log(
+                        "RECONCILE",
+                        f"Se eliminaron {removed:,} filas remotas ausentes en SQLite.",
+                    )
+
+            cursor.execute("SELECT COUNT(*) FROM actos_publicos")
+            remote_count_after = int(cursor.fetchone()[0])
+            if remote_count_after != local_count:
+                raise RuntimeError(
+                    "Supabase no quedó alineado con SQLite: "
+                    f"local={local_count:,}, remoto={remote_count_after:,}"
+                )
         connection.commit()
-        scope = "base completa" if full else "corrida actual"
+        scope = "base completa reconciliada" if reconcile_full else "corrida actual"
+        metadata_set("last_postgres_local_rows", local_count)
+        metadata_set("last_postgres_remote_rows", remote_count_after)
+        metadata_set("last_postgres_sync_scope", scope)
         log("POSTGRES", f"{len(rows):,} filas sincronizadas con Supabase/PostgreSQL ({scope})")
         return True
     except Exception:
@@ -1314,6 +1583,12 @@ def main(argv: list[str] | None = None) -> int:
     metadata_set("last_run_started_at", run_stamp)
     metadata_set("last_run_status", "running")
     metadata_set("last_run_script", str(Path(__file__).resolve()))
+    metadata_set("last_local_update_status", "running")
+    metadata_set("last_local_update_started_at", run_stamp)
+    metadata_set("last_local_update_error", "")
+    if args.require_postgres and not args.skip_postgres:
+        metadata_set("last_postgres_sync_status", "pending")
+        metadata_set("last_postgres_sync_error", "")
 
     start, end_inclusive = determine_range(args)
     end_exclusive = end_inclusive + timedelta(days=1)
@@ -1382,7 +1657,6 @@ def main(argv: list[str] | None = None) -> int:
                 only_unresolved=args.reclassify_only_unresolved,
             )
 
-        checkpoint_sqlite()
         count, source_max = verify_sqlite(DB_PATH)
         if source_max:
             metadata_set("last_data_update_at", source_max)
@@ -1397,6 +1671,11 @@ def main(argv: list[str] | None = None) -> int:
         metadata_set("last_reclassified_rows", reclassified)
         metadata_set("last_reclassification_changes", reclassification_changes)
         metadata_set("last_total_rows", count)
+        metadata_set("last_local_update_status", "success")
+        metadata_set(
+            "last_local_update_completed_at",
+            datetime.now(PANAMA_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+        )
         with connect_db() as conn:
             pending_failures = int(
                 conn.execute("SELECT COUNT(*) FROM db_failed_processes").fetchone()[0]
@@ -1405,31 +1684,53 @@ def main(argv: list[str] | None = None) -> int:
         log("VERIFY", f"SQLite íntegra: {count:,} filas; fecha fuente máxima={source_max}")
 
         if not args.skip_publish:
-            publish_local(config)
-            if not args.skip_drive:
-                drive_ok = publish_drive(config)
-                metadata_set("last_drive_publish_status", "success" if drive_ok else "warning")
-            if not args.skip_postgres:
-                try:
-                    postgres_ok = sync_postgres(
-                        run_stamp,
-                        full=args.postgres_full or reclassified > 0,
-                    )
+            publish_source = DB_PATH
+            snapshot_path: Path | None = None
+            if not checkpoint_sqlite():
+                snapshot_path = create_publish_snapshot()
+                publish_source = snapshot_path
+            try:
+                publish_local(config, publish_source)
+                if not args.skip_drive:
+                    drive_ok = publish_drive(config, publish_source)
                     metadata_set(
-                        "last_postgres_sync_status", "success" if postgres_ok else "skipped"
+                        "last_drive_publish_status",
+                        "success" if drive_ok else "warning",
                     )
-                    if args.require_postgres and not postgres_ok:
-                        raise RuntimeError(
-                            "Supabase/PostgreSQL era obligatorio, pero la sincronizacion fue omitida"
+                if not args.skip_postgres:
+                    try:
+                        metadata_set("last_postgres_sync_status", "running")
+                        metadata_set(
+                            "last_postgres_sync_started_at",
+                            datetime.now(PANAMA_TZ).strftime("%Y-%m-%d %H:%M:%S"),
                         )
-                except Exception as exc:  # espejo opcional; SQLite/Drive siguen válidos
-                    metadata_set("last_postgres_sync_status", "error")
-                    metadata_set("last_postgres_sync_error", str(exc)[:2000])
-                    log("WARN", f"No se pudo sincronizar PostgreSQL: {exc}")
-                    if args.require_postgres:
-                        raise RuntimeError(
-                            f"SQLite/Drive quedaron actualizados, pero Supabase fallo: {exc}"
-                        ) from exc
+                        postgres_ok = sync_postgres(
+                            run_stamp,
+                            full=args.postgres_full or reclassified > 0,
+                        )
+                        metadata_set(
+                            "last_postgres_sync_status",
+                            "success" if postgres_ok else "skipped",
+                        )
+                        metadata_set(
+                            "last_postgres_sync_completed_at",
+                            datetime.now(PANAMA_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+                        )
+                        if args.require_postgres and not postgres_ok:
+                            raise RuntimeError(
+                                "Supabase/PostgreSQL era obligatorio, pero la sincronizacion fue omitida"
+                            )
+                    except Exception as exc:  # espejo opcional; SQLite/Drive siguen válidos
+                        metadata_set("last_postgres_sync_status", "error")
+                        metadata_set("last_postgres_sync_error", str(exc)[:2000])
+                        log("WARN", f"No se pudo sincronizar PostgreSQL: {exc}")
+                        if args.require_postgres:
+                            raise RuntimeError(
+                                f"SQLite/Drive quedaron actualizados, pero Supabase fallo: {exc}"
+                            ) from exc
+            finally:
+                if snapshot_path is not None:
+                    snapshot_path.unlink(missing_ok=True)
         duration = datetime.now(PANAMA_TZ) - run_started
         log(
             "DONE",
@@ -1439,6 +1740,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
     except Exception as exc:
+        if metadata_get("last_local_update_status") != "success":
+            metadata_set("last_local_update_status", "error")
+            metadata_set("last_local_update_error", str(exc)[:2000])
+            metadata_set(
+                "last_local_update_completed_at",
+                datetime.now(PANAMA_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+            )
         metadata_set("last_run_completed_at", datetime.now(PANAMA_TZ).strftime("%Y-%m-%d %H:%M:%S"))
         metadata_set("last_run_status", "error")
         metadata_set("last_run_error", str(exc)[:4000])

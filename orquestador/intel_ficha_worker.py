@@ -1218,6 +1218,112 @@ def _line_detail_rows_for_act(
     return rows
 
 
+def _persist_line_amount_rows(
+    database_paths: list[Path],
+    ficha: str,
+    rows: list[dict[str, Any]],
+) -> int:
+    """Persiste la evidencia ficha-renglón para el siguiente build analítico.
+
+    Es una salida adicional y tolerante a fallos: Sheets conserva el detalle
+    visible del estudio, mientras esta tabla permite que los montos confirmados
+    por renglón alimenten la inteligencia maestra sin usar el total del acto.
+    """
+
+    targets: list[Path] = []
+    for raw_path in database_paths:
+        path = Path(raw_path)
+        if path.exists() and path.resolve() not in {item.resolve() for item in targets}:
+            targets.append(path)
+    stored = 0
+    for path in targets:
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                with closing(sqlite3.connect(path, timeout=30)) as connection:
+                    connection.execute("PRAGMA busy_timeout=30000")
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS intel_ficha_line_amounts (
+                            ficha TEXT NOT NULL,
+                            acto_url TEXT NOT NULL,
+                            acto_id TEXT,
+                            line_key TEXT NOT NULL,
+                            renglon_id TEXT,
+                            renglon_numero TEXT,
+                            reference_total REAL NOT NULL DEFAULT 0,
+                            participation_total REAL NOT NULL DEFAULT 0,
+                            provider TEXT,
+                            match_score REAL NOT NULL DEFAULT 0,
+                            requires_review INTEGER NOT NULL DEFAULT 1,
+                            binding_method TEXT,
+                            updated_at TEXT,
+                            PRIMARY KEY (ficha, acto_url, line_key, provider)
+                        )
+                        """
+                    )
+                    connection.execute(
+                        "DELETE FROM intel_ficha_line_amounts WHERE ficha = ?",
+                        (ficha,),
+                    )
+                    values: list[tuple[Any, ...]] = []
+                    for row in rows:
+                        acto_url = _clean(row.get("acto_url"))
+                        if not acto_url:
+                            continue
+                        line_key = (
+                            _clean(row.get("renglon_id"))
+                            or _clean(row.get("renglon_numero"))
+                            or _clean(row.get("line_detail_id"))
+                        )
+                        if not line_key:
+                            continue
+                        values.append(
+                            (
+                                ficha,
+                                acto_url,
+                                _clean(row.get("acto_id")),
+                                line_key,
+                                _clean(row.get("renglon_id")),
+                                _clean(row.get("renglon_numero")),
+                                _num(row.get("precio_referencia_total")),
+                                _num(row.get("precio_participacion_total")),
+                                _clean(row.get("proveedor")),
+                                _num(row.get("match_score")),
+                                int(round(_num(row.get("match_requires_review")))),
+                                _clean(row.get("binding_method")),
+                                _clean(row.get("created_at")) or datetime.now().isoformat(timespec="seconds"),
+                            )
+                        )
+                    if values:
+                        connection.executemany(
+                            """
+                            INSERT OR REPLACE INTO intel_ficha_line_amounts (
+                                ficha, acto_url, acto_id, line_key, renglon_id,
+                                renglon_numero, reference_total, participation_total,
+                                provider, match_score, requires_review, binding_method,
+                                updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            values,
+                        )
+                    connection.commit()
+                    stored += len(values)
+                last_error = None
+                break
+            except sqlite3.OperationalError as exc:
+                last_error = exc
+                if attempt < 3:
+                    time.sleep(float(attempt))
+        if last_error is not None:
+            print(
+                f"[intel_estudio_ficha] WARN: no se pudo persistir detalle de renglones "
+                f"en {path}: {last_error}",
+                flush=True,
+            )
+    return stored
+
+
 def main() -> int:
     t0 = time.perf_counter()
     _log(f"inicio | spreadsheet={SPREADSHEET_ID}", t0)
@@ -1772,6 +1878,16 @@ def main() -> int:
         "updated_at": finished,
         "error": "",
     }
+
+    persisted_rows = _persist_line_amount_rows(
+        [
+            db_path,
+            REPO_ROOT / "data" / "db" / "panamacompra.db",
+        ],
+        ficha,
+        line_rows,
+    )
+    _log(f"evidencia de montos por renglón persistida: {persisted_rows}", t0)
 
     if _should_debug_no_sheets():
         _log("DEBUG_NO_SHEETS=1 -> no se escriben resultados a Sheets", t0)
