@@ -304,6 +304,8 @@ class BuilderUnitTests(unittest.TestCase):
                 [
                     {"Numero Ficha": 43358, "Clase de Riesgo": "A"},
                     {"Numero Ficha": 100523, "Clase de Riesgo": "B"},
+                    {"Numero Ficha": 22241, "Clase de Riesgo": "D"},
+                    {"Numero Ficha": 99999, "Clase de Riesgo": "No Aplica"},
                 ]
             ).to_excel(risk_class_xlsx, index=False)
             aliases_json.write_text(json.dumps({"100523": ["FICHA DE PRUEBA"]}), encoding="utf-8")
@@ -320,6 +322,8 @@ class BuilderUnitTests(unittest.TestCase):
             self.assertEqual(result.loc["100523", "nombre_ficha"], "FICHA DE PRUEBA")
             self.assertEqual(result.loc["100523", "clase_riesgo"], "B")
             self.assertEqual(result.loc["22241", "registro_sanitario"], "Si")
+            self.assertEqual(result.loc["22241", "clase_riesgo"], "D")
+            self.assertEqual(result.loc["99999", "clase_riesgo"], "NO APLICA")
             self.assertIn(classification_xlsx.name, result.loc["100523", "metadata_source"])
 
 

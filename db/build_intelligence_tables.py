@@ -37,7 +37,7 @@ DEFAULT_ALIAS_JSON = REPO_ROOT / "data" / "fichas" / "ficha_aliases.json"
 DEFAULT_CLASSIFICATION_XLSX = REPO_ROOT / "data" / "fichas" / "todas_las_fichas.xlsx"
 DEFAULT_RISK_CLASS_XLSX = REPO_ROOT / "minsa_scraper" / "outputs" / "fichas_ctni.xlsx"
 
-ANALYTICS_SCHEMA_VERSION = "3.4.0"
+ANALYTICS_SCHEMA_VERSION = "3.4.1"
 SOURCE_CHUNK_SIZE = 5_000
 WRITE_CHUNK_SIZE = 5_000
 SQLITE_MAX_BOUND_PARAMETERS = 30_000
@@ -691,7 +691,11 @@ def _load_aliases(path: Path) -> dict[str, list[str]]:
 
 def _normalize_risk_class(value: object) -> str:
     normalized = clean_text(value).upper()
-    return normalized if normalized in {"A", "B", "C"} else ""
+    if normalized in {"A", "B", "C", "D", "N"}:
+        return normalized
+    if normalized in {"NO AP", "NO APLICA", "NO APLICA."}:
+        return "NO APLICA"
+    return ""
 
 
 def _load_risk_classes(path: Path) -> dict[str, str]:
