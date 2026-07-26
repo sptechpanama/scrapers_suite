@@ -35,8 +35,9 @@ DEFAULT_METADATA_XLSX = DEFAULT_APP_ROOT / "fichas_ctni_con_enlace.xlsx"
 DEFAULT_CATALOG_XLSX = DEFAULT_APP_ROOT / "oferentes_catalogos.xlsx"
 DEFAULT_ALIAS_JSON = REPO_ROOT / "data" / "fichas" / "ficha_aliases.json"
 DEFAULT_CLASSIFICATION_XLSX = REPO_ROOT / "data" / "fichas" / "todas_las_fichas.xlsx"
+DEFAULT_RISK_CLASS_XLSX = REPO_ROOT / "minsa_scraper" / "outputs" / "fichas_ctni.xlsx"
 
-ANALYTICS_SCHEMA_VERSION = "3.3.0"
+ANALYTICS_SCHEMA_VERSION = "3.4.0"
 SOURCE_CHUNK_SIZE = 5_000
 WRITE_CHUNK_SIZE = 5_000
 SQLITE_MAX_BOUND_PARAMETERS = 30_000
@@ -101,6 +102,7 @@ METADATA_COLUMNS = [
     "area",
     "tipo_producto",
     "especialidad",
+    "clase_riesgo",
     "tiene_ct",
     "registro_sanitario",
     "enlace_minsa",
@@ -687,7 +689,35 @@ def _load_aliases(path: Path) -> dict[str, list[str]]:
     return dict(result)
 
 
-def _load_primary_metadata(path: Path, aliases_path: Path = DEFAULT_ALIAS_JSON) -> pd.DataFrame:
+def _normalize_risk_class(value: object) -> str:
+    normalized = clean_text(value).upper()
+    return normalized if normalized in {"A", "B", "C"} else ""
+
+
+def _load_risk_classes(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    raw = pd.read_excel(path, dtype=object)
+    if raw.empty:
+        return {}
+    ficha_column = _find_column(raw, ["Número Ficha", "Numero Ficha", "ficha", "numero_ficha"])
+    class_column = _find_column(raw, ["Clase de Riesgo", "Clase Riesgo", "clase_riesgo"])
+    if not ficha_column or not class_column:
+        return {}
+    result: dict[str, str] = {}
+    for _, row in raw.iterrows():
+        code = _normalize_ficha(row.get(ficha_column))
+        risk_class = _normalize_risk_class(row.get(class_column))
+        if code and risk_class:
+            result[code] = risk_class
+    return result
+
+
+def _load_primary_metadata(
+    path: Path,
+    aliases_path: Path = DEFAULT_ALIAS_JSON,
+    risk_class_path: Path = DEFAULT_RISK_CLASS_XLSX,
+) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame(columns=METADATA_COLUMNS)
     raw = pd.read_excel(path, dtype=object)
@@ -700,6 +730,7 @@ def _load_primary_metadata(path: Path, aliases_path: Path = DEFAULT_ALIAS_JSON) 
         "area": _find_column(raw, ["Área", "Area"]),
         "tipo": _find_column(raw, ["Tipo Producto", "Tipo de Producto"]),
         "especialidad": _find_column(raw, ["Especialidad"]),
+        "clase": _find_column(raw, ["Clase de Riesgo", "Clase Riesgo", "clase_riesgo"]),
         "ct": _find_column(raw, ["Criterio", "Tiene criterio tecnico", "Tiene CT"]),
         "rs": _find_column(raw, ["Registro Sanitario", "Tiene registro sanitario"]),
         "url": _find_column(raw, ["enlace_ficha_tecnica", "Enlace ficha MINSA", "Enlace"]),
@@ -707,6 +738,7 @@ def _load_primary_metadata(path: Path, aliases_path: Path = DEFAULT_ALIAS_JSON) 
     if not columns["ficha"]:
         return pd.DataFrame(columns=METADATA_COLUMNS)
     aliases = _load_aliases(aliases_path)
+    risk_classes = _load_risk_classes(risk_class_path)
     records: dict[str, dict[str, Any]] = {}
     for _, row in raw.iterrows():
         code = _normalize_ficha(row.get(columns["ficha"]))
@@ -726,6 +758,11 @@ def _load_primary_metadata(path: Path, aliases_path: Path = DEFAULT_ALIAS_JSON) 
             "area": clean_text(row.get(columns["area"])) if columns["area"] else "",
             "tipo_producto": clean_text(row.get(columns["tipo"])) if columns["tipo"] else "",
             "especialidad": clean_text(row.get(columns["especialidad"])) if columns["especialidad"] else "",
+            "clase_riesgo": (
+                _normalize_risk_class(row.get(columns["clase"])) or risk_classes.get(code, "")
+                if columns["clase"]
+                else risk_classes.get(code, "")
+            ),
             "tiene_ct": _yes_no(row.get(columns["ct"])) if columns["ct"] else "",
             "registro_sanitario": _yes_no(row.get(columns["rs"])) if columns["rs"] else "",
             "enlace_minsa": clean_text(row.get(columns["url"])) if columns["url"] else "",
@@ -798,6 +835,7 @@ def load_classification_metadata(
             "area": "",
             "tipo_producto": "",
             "especialidad": "",
+            "clase_riesgo": "",
             "tiene_ct": _classification_flag(row.iloc[1]),
             "registro_sanitario": _classification_flag(row.iloc[2], registro_sanitario=True),
             "enlace_minsa": "",
@@ -814,7 +852,15 @@ def _metadata_search_text(record: Mapping[str, Any]) -> str:
     return normalize_text(
         " ".join(
             clean_text(record.get(field))
-            for field in ("ficha", "nombre_ficha", "descripcion", "area", "tipo_producto", "especialidad")
+            for field in (
+                "ficha",
+                "nombre_ficha",
+                "descripcion",
+                "area",
+                "tipo_producto",
+                "especialidad",
+                "clase_riesgo",
+            )
         )
     )
 
@@ -823,6 +869,7 @@ def load_metadata(
     path: Path,
     aliases_path: Path = DEFAULT_ALIAS_JSON,
     classification_path: Path = DEFAULT_CLASSIFICATION_XLSX,
+    risk_class_path: Path = DEFAULT_RISK_CLASS_XLSX,
 ) -> pd.DataFrame:
     """Combina metadata enriquecida con la clasificación oficial de scrapers.
 
@@ -831,13 +878,8 @@ def load_metadata(
     autoritativa para esos dos indicadores, evitando excluir fichas válidas por
     falta de metadata (por ejemplo, 100523).
     """
-    primary = _load_primary_metadata(path, aliases_path)
+    primary = _load_primary_metadata(path, aliases_path, risk_class_path)
     classification = load_classification_metadata(classification_path, aliases_path)
-    if primary.empty:
-        return classification
-    if classification.empty:
-        return primary
-
     records = {clean_text(row["ficha"]): row.to_dict() for _, row in primary.iterrows()}
     for _, fallback_row in classification.iterrows():
         fallback = fallback_row.to_dict()
@@ -862,6 +904,20 @@ def load_metadata(
             sources = [clean_text(current.get("metadata_source")), clean_text(fallback.get("metadata_source"))]
             current["metadata_source"] = " + ".join(dict.fromkeys(item for item in sources if item))
             current["search_text_norm"] = _metadata_search_text(current)
+
+    risk_classes = _load_risk_classes(risk_class_path)
+    for code, risk_class in risk_classes.items():
+        current = records.get(code)
+        if current is None:
+            current = {column: "" for column in METADATA_COLUMNS}
+            current["ficha"] = code
+            current["metadata_source"] = risk_class_path.name
+            records[code] = current
+        if not clean_text(current.get("clase_riesgo")):
+            current["clase_riesgo"] = risk_class
+            sources = [clean_text(current.get("metadata_source")), risk_class_path.name]
+            current["metadata_source"] = " + ".join(dict.fromkeys(item for item in sources if item))
+        current["search_text_norm"] = _metadata_search_text(current)
 
     return pd.DataFrame(records.values(), columns=METADATA_COLUMNS)
 
@@ -1003,6 +1059,7 @@ def _create_local_schema(connection: sqlite3.Connection) -> None:
             area TEXT,
             tipo_producto TEXT,
             especialidad TEXT,
+            clase_riesgo TEXT,
             tiene_ct TEXT,
             registro_sanitario TEXT,
             enlace_minsa TEXT,
@@ -1135,6 +1192,7 @@ def build_local_analytics(
     aliases_json: Path,
     *,
     classification_xlsx: Path = DEFAULT_CLASSIFICATION_XLSX,
+    risk_class_xlsx: Path = DEFAULT_RISK_CLASS_XLSX,
     limit: int = 0,
 ) -> dict[str, Any]:
     started = time.perf_counter()
@@ -1266,7 +1324,12 @@ def build_local_analytics(
         )
         monthly_count = int(target.execute("SELECT COUNT(*) FROM intel_metricas_ficha_mes").fetchone()[0])
 
-        metadata = load_metadata(metadata_xlsx, aliases_json, classification_xlsx)
+        metadata = load_metadata(
+            metadata_xlsx,
+            aliases_json,
+            classification_xlsx,
+            risk_class_xlsx,
+        )
         catalog = load_catalog(catalog_xlsx)
         if not metadata.empty:
             metadata.to_sql(
@@ -1466,6 +1529,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--catalog-xlsx", type=Path, default=DEFAULT_CATALOG_XLSX)
     parser.add_argument("--aliases-json", type=Path, default=DEFAULT_ALIAS_JSON)
     parser.add_argument("--classification-xlsx", type=Path, default=DEFAULT_CLASSIFICATION_XLSX)
+    parser.add_argument("--risk-class-xlsx", type=Path, default=DEFAULT_RISK_CLASS_XLSX)
     parser.add_argument("--postgres-url", default="")
     parser.add_argument("--publish-postgres", action="store_true")
     parser.add_argument("--require-postgres", action="store_true")
@@ -1485,6 +1549,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.catalog_xlsx,
                 args.aliases_json,
                 classification_xlsx=args.classification_xlsx,
+                risk_class_xlsx=args.risk_class_xlsx,
                 limit=max(0, args.limit),
             )
         verification = verify_analytics(args.output_db)

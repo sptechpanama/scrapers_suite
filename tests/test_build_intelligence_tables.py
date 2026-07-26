@@ -288,6 +288,7 @@ class BuilderUnitTests(unittest.TestCase):
             root = Path(temp_dir)
             metadata_xlsx = root / "metadata.xlsx"
             classification_xlsx = root / "todas_las_fichas.xlsx"
+            risk_class_xlsx = root / "risk_classes.xlsx"
             aliases_json = root / "aliases.json"
             pd.DataFrame(
                 [{"Numero Ficha": 43358, "Nombre Generico": "CIRCUITO", "Criterio": "SI", "Registro Sanitario": "NO"}]
@@ -299,13 +300,25 @@ class BuilderUnitTests(unittest.TestCase):
                     [22241, "NO", "SI RS LCRSP"],
                 ]
             ).to_excel(classification_xlsx, index=False, header=False)
+            pd.DataFrame(
+                [
+                    {"Numero Ficha": 43358, "Clase de Riesgo": "A"},
+                    {"Numero Ficha": 100523, "Clase de Riesgo": "B"},
+                ]
+            ).to_excel(risk_class_xlsx, index=False)
             aliases_json.write_text(json.dumps({"100523": ["FICHA DE PRUEBA"]}), encoding="utf-8")
 
-            result = builder.load_metadata(metadata_xlsx, aliases_json, classification_xlsx).set_index("ficha")
+            result = builder.load_metadata(
+                metadata_xlsx,
+                aliases_json,
+                classification_xlsx,
+                risk_class_xlsx,
+            ).set_index("ficha")
             self.assertIn("100523", result.index)
             self.assertEqual(result.loc["100523", "tiene_ct"], "Si")
             self.assertEqual(result.loc["100523", "registro_sanitario"], "No")
             self.assertEqual(result.loc["100523", "nombre_ficha"], "FICHA DE PRUEBA")
+            self.assertEqual(result.loc["100523", "clase_riesgo"], "B")
             self.assertEqual(result.loc["22241", "registro_sanitario"], "Si")
             self.assertIn(classification_xlsx.name, result.loc["100523", "metadata_source"])
 
@@ -320,6 +333,7 @@ class BuilderIntegrationTests(unittest.TestCase):
             catalog_xlsx = root / "catalog.xlsx"
             aliases_json = root / "aliases.json"
             classification_xlsx = root / "classification.xlsx"
+            risk_class_xlsx = root / "risk_classes.xlsx"
 
             connection = sqlite3.connect(source_db)
             columns = [
@@ -375,6 +389,7 @@ class BuilderIntegrationTests(unittest.TestCase):
                 catalog_xlsx,
                 aliases_json,
                 classification_xlsx=classification_xlsx,
+                risk_class_xlsx=risk_class_xlsx,
             )
             verified = builder.verify_analytics(output_db)
             self.assertEqual(result["fact_rows"], 1)
