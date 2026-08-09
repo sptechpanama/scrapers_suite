@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import sqlite3
@@ -38,9 +39,11 @@ from common.ficha_line_items import (  # noqa: E402
 from common.ficha_utils import get_catalog  # noqa: E402
 from sheets_bridge import (
     SPREADSHEET_ID,
+    _call_with_backoff,
     _clear_data_rows,
     _column_letter,
     _ensure_headers,
+    _get_service,
     _get_values,
     _update_values,
 )
@@ -57,6 +60,7 @@ LINE_DETAIL_SHEET = os.environ.get(
 RUNS_HEADERS = [
     "request_id","run_id_remote","ficha","nombre_ficha","estado_run","fecha_inicio","fecha_fin",
     "db_source","total_items","total_consultas","consultas_resueltas","notas","updated_at","error",
+    "scope_id",
 ]
 DETAIL_HEADERS = [
     "request_id","run_id_remote","detail_id","ficha","nombre_ficha","acto_id","acto_nombre","acto_url",
@@ -310,15 +314,42 @@ def _build_driver() -> tuple[object | None, str]:
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("--window-size=1920,1080")
-        # Requerimiento: siempre visible (no headless).
+        headless = _clean(os.getenv("INTEL_STUDY_HEADLESS", "")).lower() in {
+            "1", "true", "yes", "si",
+        }
+        if headless:
+            opts.add_argument("--headless=new")
         driver = webdriver.Chrome(options=opts)
         driver.set_page_load_timeout(60)
-        return driver, "ok_visible"
+        return driver, "ok_headless" if headless else "ok_visible"
     except Exception as exc:
         return None, f"driver_init_error:{exc}"
 
 
 def _driver_html(driver: object, url: str, timeout: int = 40) -> str:
+    cache_dir_raw = _clean(os.getenv("INTEL_STUDY_HTML_CACHE_DIR", ""))
+    cache_path: Path | None = None
+    if cache_dir_raw and url:
+        cache_dir = Path(cache_dir_raw)
+        cache_path = cache_dir / f"{hashlib.sha256(url.encode('utf-8')).hexdigest()}.html"
+        try:
+            if cache_path.exists() and time.time() - cache_path.stat().st_mtime <= 7 * 86400:
+                cached = cache_path.read_text(encoding="utf-8", errors="ignore")
+                expected = _process_code_from_url(url).lower()
+                if len(cached) >= 15000 and (not expected or expected in cached.lower()):
+                    return cached
+        except OSError:
+            cache_path = None
+
+    def _cache(html: str) -> str:
+        if cache_path is not None and len(html or "") >= 15000:
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(html, encoding="utf-8", errors="ignore")
+            except OSError:
+                pass
+        return html
+
     try:
         from selenium.common.exceptions import TimeoutException  # type: ignore
         from selenium.webdriver.common.by import By  # type: ignore
@@ -394,7 +425,7 @@ def _driver_html(driver: object, url: str, timeout: int = 40) -> str:
             has_token = any(t in body_text for t in tokens)
             has_tables = "<table" in html_now.lower()
             if has_token or (has_tables and len(html_now) >= 45000):
-                return html_now
+                return _cache(html_now)
 
             if html_now == last_html:
                 stable_hits += 1
@@ -403,10 +434,10 @@ def _driver_html(driver: object, url: str, timeout: int = 40) -> str:
             last_html = html_now
 
             if stable_hits >= 4 and len(html_now) >= 15000:
-                return html_now
+                return _cache(html_now)
             time.sleep(0.8)
 
-        return str(getattr(driver, "page_source", "") or "")
+        return _cache(str(getattr(driver, "page_source", "") or ""))
     except Exception:
         return ""
 
@@ -1007,6 +1038,36 @@ def _replace_rows(sheet: str, headers: list[str], ficha: str, new_rows: list[lis
         _update_values(f"{sheet}!A2", merged)
 
 
+def _append_rows(sheet: str, headers: list[str], rows: list[list[str]]) -> None:
+    if not rows:
+        return
+    _ensure_headers(sheet, headers)
+    service = _get_service()
+    _call_with_backoff(
+        lambda: service.spreadsheets()
+        .values()
+        .append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{sheet}!A1",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": rows},
+        )
+        .execute(),
+        f"append {sheet}",
+    )
+
+
+def _publish_rows(sheet: str, headers: list[str], ficha: str, rows: list[list[str]]) -> None:
+    append_mode = _clean(os.getenv("INTEL_STUDY_APPEND_RESULTS", "")).lower() in {
+        "1", "true", "yes", "si",
+    }
+    if append_mode:
+        _append_rows(sheet, headers, rows)
+    else:
+        _replace_rows(sheet, headers, ficha, rows)
+
+
 def _vals(headers: list[str], data: dict[str, Any]) -> list[str]:
     return [str(data.get(h, "") if data.get(h, "") is not None else "") for h in headers]
 
@@ -1338,6 +1399,7 @@ def main() -> int:
     ficha = re.sub(r"\D", "", str(payload.get("ficha", "")))
     nombre = _clean(payload.get("nombre_ficha", ""))
     notes = _clean(payload.get("notes", ""))
+    scope_id = _clean(payload.get("scope_id", ""))
     if not ficha:
         raise RuntimeError("Payload sin ficha valida")
 
@@ -1407,13 +1469,14 @@ def main() -> int:
             "notas": notes,
             "updated_at": now,
             "error": "Sin actos para la ficha",
+            "scope_id": scope_id,
         }
         if _should_debug_no_sheets():
             _log("DEBUG_NO_SHEETS=1 -> run vacio no se escribe a Sheets", t0)
         else:
-            _replace_rows(RUNS_SHEET, RUNS_HEADERS, ficha, [_vals(RUNS_HEADERS, run_row)])
-            _replace_rows(DETAIL_SHEET, DETAIL_HEADERS, ficha, [])
-            _replace_rows(LINE_DETAIL_SHEET, LINE_DETAIL_HEADERS, ficha, [])
+            _publish_rows(RUNS_SHEET, RUNS_HEADERS, ficha, [_vals(RUNS_HEADERS, run_row)])
+            _publish_rows(DETAIL_SHEET, DETAIL_HEADERS, ficha, [])
+            _publish_rows(LINE_DETAIL_SHEET, LINE_DETAIL_HEADERS, ficha, [])
         _log("run vacio publicado", t0)
         print(json.dumps({"ok": True, "request_id": request_id, "run_id_remote": run_id, "ficha": ficha}), flush=True)
         return 0
@@ -1877,6 +1940,7 @@ def main() -> int:
         "notas": notes,
         "updated_at": finished,
         "error": "",
+        "scope_id": scope_id,
     }
 
     persisted_rows = _persist_line_amount_rows(
@@ -1892,9 +1956,9 @@ def main() -> int:
     if _should_debug_no_sheets():
         _log("DEBUG_NO_SHEETS=1 -> no se escriben resultados a Sheets", t0)
     else:
-        _replace_rows(RUNS_SHEET, RUNS_HEADERS, ficha, [_vals(RUNS_HEADERS, run_row)])
-        _replace_rows(DETAIL_SHEET, DETAIL_HEADERS, ficha, [_vals(DETAIL_HEADERS, x) for x in rows])
-        _replace_rows(
+        _publish_rows(RUNS_SHEET, RUNS_HEADERS, ficha, [_vals(RUNS_HEADERS, run_row)])
+        _publish_rows(DETAIL_SHEET, DETAIL_HEADERS, ficha, [_vals(DETAIL_HEADERS, x) for x in rows])
+        _publish_rows(
             LINE_DETAIL_SHEET,
             LINE_DETAIL_HEADERS,
             ficha,
