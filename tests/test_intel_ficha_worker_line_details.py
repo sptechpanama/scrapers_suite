@@ -52,6 +52,8 @@ def _run(act_html: str = ACT_HTML, offer_html: str = OFFER_HTML):
         default_provider="Proveedor",
         evidence_url="https://example.test/evidencia",
         created_at="2026-07-25T12:00:00",
+        precio_total_acto=100050.0,
+        enlace_ficha_minsa="https://ctni.minsa.gob.pa/Utilities/LoadFicha/?idficha=43358",
     )
 
 
@@ -62,6 +64,8 @@ def test_worker_parallel_layer_uses_only_matching_line_amounts() -> None:
     assert rows[0]["precio_referencia_total"] == 50.0
     assert rows[0]["precio_participacion_total"] == 45.0
     assert rows[0]["precio_referencia_total"] != 100050.0
+    assert rows[0]["precio_total_acto"] == 100050.0
+    assert rows[0]["enlace_ficha_minsa"].endswith("idficha=43358")
 
 
 def test_worker_marks_missing_correspondence_for_review() -> None:

@@ -68,7 +68,7 @@ DETAIL_HEADERS = [
     "cantidad","precio_unitario_participacion","precio_unitario_referencia","fecha_publicacion","fecha_celebracion",
     "fecha_adjudicacion","fecha_orden_compra","dias_acto_a_oc","dias_acto_a_oc_mas_entrega","tipo_flujo",
     "fuente_precio","fuente_fecha","enlace_evidencia","unidad_medida","tiempo_entrega_dias","observaciones",
-    "estado_revision","nivel_certeza","requiere_revision",
+    "estado_revision","nivel_certeza","requiere_revision","precio_total_acto","enlace_ficha_minsa",
 ]
 LINE_DETAIL_HEADERS = [
     "request_id","run_id_remote","line_detail_id","ficha","nombre_ficha","acto_id",
@@ -76,7 +76,7 @@ LINE_DETAIL_HEADERS = [
     "match_method","match_score","match_evidence","match_requires_review","cantidad",
     "unidad_medida","precio_referencia_unitario","precio_referencia_total","proveedor",
     "precio_participacion_unitario","precio_participacion_total","binding_method",
-    "binding_score","fuente_renglon","enlace_evidencia","created_at",
+    "binding_score","fuente_renglon","enlace_evidencia","created_at","precio_total_acto","enlace_ficha_minsa",
 ]
 DEBUG_HTML_DIR = Path(r"C:\Users\rodri\scrapers_repo\orquestador\debug_html_intel")
 
@@ -889,6 +889,42 @@ def _analytics_refs_for_ficha(
     return source_ids, links
 
 
+def _analytics_metadata_for_ficha(
+    analytics_db: Path | None,
+    ficha: str,
+) -> dict[str, str]:
+    """Recupera nombre y URL MINSA de la misma capa analitica usada por la app."""
+
+    empty = {"nombre_ficha": "", "enlace_minsa": ""}
+    if analytics_db is None or not analytics_db.exists():
+        return empty
+    try:
+        with closing(sqlite3.connect(analytics_db)) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='intel_ficha_metadata'"
+            ).fetchone()
+            if not exists:
+                return empty
+            row = conn.execute(
+                """
+                SELECT COALESCE(nombre_ficha, ''), COALESCE(enlace_minsa, '')
+                FROM intel_ficha_metadata
+                WHERE ficha = ?
+                LIMIT 1
+                """,
+                (str(ficha),),
+            ).fetchone()
+    except (OSError, sqlite3.Error):
+        return empty
+    if not row:
+        return empty
+    return {
+        "nombre_ficha": _clean(row[0]),
+        "enlace_minsa": _clean(row[1]),
+    }
+
+
 def _study_filters_from_payload(payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     """Determina si el estudio usa historial completo o el análisis visible."""
     raw_scope = _norm(payload.get("study_scope", "historico_completo"))
@@ -1130,6 +1166,8 @@ def _line_audit_row(
     method: str,
     evidence: str,
     created_at: str,
+    precio_total_acto: float = 0.0,
+    enlace_ficha_minsa: str = "",
 ) -> dict[str, Any]:
     return {
         "request_id": request_id,
@@ -1160,6 +1198,8 @@ def _line_audit_row(
         "fuente_renglon": "auditoria",
         "enlace_evidencia": acto_url,
         "created_at": created_at,
+        "precio_total_acto": round(float(precio_total_acto or 0.0), 6),
+        "enlace_ficha_minsa": _clean(enlace_ficha_minsa),
     }
 
 
@@ -1179,6 +1219,8 @@ def _line_detail_rows_for_act(
     default_provider: str,
     evidence_url: str,
     created_at: str,
+    precio_total_acto: float = 0.0,
+    enlace_ficha_minsa: str = "",
 ) -> list[dict[str, Any]]:
     """Genera la capa paralela ficha-renglón-oferta sin usar totales del acto."""
 
@@ -1196,6 +1238,8 @@ def _line_detail_rows_for_act(
                 method="sin_html_acto",
                 evidence="No se obtuvo HTML para identificar renglones.",
                 created_at=created_at,
+                precio_total_acto=precio_total_acto,
+                enlace_ficha_minsa=enlace_ficha_minsa,
             )
         ]
 
@@ -1218,6 +1262,8 @@ def _line_detail_rows_for_act(
                     "atribuirse con seguridad a la ficha."
                 ),
                 created_at=created_at,
+                precio_total_acto=precio_total_acto,
+                enlace_ficha_minsa=enlace_ficha_minsa,
             )
         ]
 
@@ -1274,6 +1320,8 @@ def _line_detail_rows_for_act(
                 "fuente_renglon": "html_acto_y_cuadro_propuestas",
                 "enlace_evidencia": evidence_url or acto_url,
                 "created_at": created_at,
+                "precio_total_acto": round(float(precio_total_acto or 0.0), 6),
+                "enlace_ficha_minsa": _clean(enlace_ficha_minsa),
             }
         )
     return rows
@@ -1425,6 +1473,13 @@ def main() -> int:
         (path for path in analytics_candidates if path and path.exists()),
         None,
     )
+    ficha_metadata = _analytics_metadata_for_ficha(analytics_db_path, ficha)
+    if not nombre:
+        nombre = ficha_metadata["nombre_ficha"] or f"Ficha {ficha}"
+    ficha_minsa_url = (
+        _clean(payload.get("enlace_minsa", ""))
+        or ficha_metadata["enlace_minsa"]
+    )
     study_scope, filters = _study_filters_from_payload(payload)
     _log(
         f"request={request_id or 'sin-id'} | ficha={ficha} | db={db_path} "
@@ -1532,6 +1587,8 @@ def main() -> int:
                         default_provider=proveedor_ganador,
                         evidence_url=acto_url,
                         created_at=datetime.now().isoformat(timespec="seconds"),
+                        precio_total_acto=precio_ref_db,
+                        enlace_ficha_minsa=ficha_minsa_url,
                     )
                 )
                 rows.append(
@@ -1571,6 +1628,8 @@ def main() -> int:
                         "estado_revision": "pendiente",
                         "nivel_certeza": 0.2,
                         "requiere_revision": 1,
+                        "precio_total_acto": round(precio_ref_db, 6),
+                        "enlace_ficha_minsa": ficha_minsa_url,
                     }
                 )
                 continue
@@ -1594,6 +1653,8 @@ def main() -> int:
                         default_provider=proveedor_ganador,
                         evidence_url=acto_url,
                         created_at=datetime.now().isoformat(timespec="seconds"),
+                        precio_total_acto=precio_ref_db,
+                        enlace_ficha_minsa=ficha_minsa_url,
                     )
                 )
                 rows.append(
@@ -1633,6 +1694,8 @@ def main() -> int:
                         "estado_revision": "pendiente",
                         "nivel_certeza": 0.2,
                         "requiere_revision": 1,
+                        "precio_total_acto": round(precio_ref_db, 6),
+                        "enlace_ficha_minsa": ficha_minsa_url,
                     }
                 )
                 try:
@@ -1884,6 +1947,8 @@ def main() -> int:
                     "estado_revision": estado_revision if es_desierto else ("pendiente" if rev else "autocompletado"),
                     "nivel_certeza": nivel_certeza if es_desierto else (0.45 if rev else 0.95),
                     "requiere_revision": rev,
+                    "precio_total_acto": round(precio_ref_db, 6),
+                    "enlace_ficha_minsa": ficha_minsa_url,
                 }
             )
             line_rows.extend(
@@ -1902,6 +1967,8 @@ def main() -> int:
                     default_provider=proveedor,
                     evidence_url=evidencia,
                     created_at=datetime.now().isoformat(timespec="seconds"),
+                    precio_total_acto=precio_ref_db,
+                    enlace_ficha_minsa=ficha_minsa_url,
                 )
             )
             saved = rows[-1]
