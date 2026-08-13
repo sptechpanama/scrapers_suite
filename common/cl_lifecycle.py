@@ -168,7 +168,7 @@ def parse_money(value: object) -> float:
     if not text:
         return 0.0
     match = re.search(
-        r"-?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?|-?\d+(?:[.,]\d+)?",
+        r"(?<!\d)-?(?:\d{1,3}(?:[.,]\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?)(?!\d)",
         text,
     )
     if not match:

@@ -11,6 +11,7 @@ import re
 import smtplib
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import unicodedata
@@ -49,6 +50,13 @@ from sheets_bridge import (
 )
 
 BASE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = BASE_DIR.parent
+COMMON_DIR = REPO_ROOT / "common"
+if str(COMMON_DIR) not in sys.path:
+    sys.path.insert(0, str(COMMON_DIR))
+
+from ficha_utils import detectar_fichas_detalladas  # noqa: E402
+
 CONFIG_PATH = BASE_DIR / "config.json"
 STATE_PATH = BASE_DIR / "state.json"
 DEFAULT_ORQUESTADOR_CREDENTIALS = BASE_DIR / "pure-beach-474203-p1-fdc9557f33d0.json"
@@ -770,6 +778,12 @@ def _scan_ct_rir_candidates() -> list[dict[str, object]]:
             continue
         headers = values[0]
         mapping = _column_index_map(headers)
+        semantic_keys = [
+            key
+            for key in mapping
+            if key in {"titulo", "descripcion", "ficha_detectada"}
+            or key.startswith("item")
+        ]
         for row in values[1:]:
             if _truthy_cell(_row_value(row, mapping, "descartar")):
                 continue
@@ -783,17 +797,50 @@ def _scan_ct_rir_candidates() -> list[dict[str, object]]:
             if not titulo and not enlace:
                 continue
 
+            label_codes = set(_extract_ficha_codes_from_label(ficha_label))
+            semantic_codes: set[str] = set()
+            if not label_codes.intersection(fichas) and semantic_keys:
+                semantic_fields = {
+                    key: _row_value(row, mapping, key)
+                    for key in semantic_keys
+                }
+                try:
+                    semantic_codes = {
+                        match.code
+                        for match in detectar_fichas_detalladas(semantic_fields)
+                    }
+                except (FileNotFoundError, OSError, ValueError) as exc:
+                    logging.warning(
+                        "CT_RIR: no se pudo reclasificar fila de %s: %s",
+                        sheet_name,
+                        exc,
+                    )
+
+            matched_codes = sorted(
+                fichas.intersection(label_codes.union(semantic_codes)),
+                key=int,
+            )
             relevant = False
             if sheet_name in PANAMACOMPRA_CT_RIR_DIRECT_SHEETS:
                 relevant = True
             else:
-                relevant = any(code in fichas for code in _extract_ficha_codes_from_label(ficha_label))
+                relevant = bool(matched_codes)
             if not relevant:
                 continue
 
+            effective_label = ficha_label
+            if matched_codes and not label_codes.intersection(fichas):
+                effective_label = ", ".join(f"* {code}" for code in matched_codes)
+                logging.info(
+                    "CT_RIR: recuperada clasificacion semantica %s en %s (%s)",
+                    effective_label,
+                    sheet_name,
+                    enlace or titulo,
+                )
+
             entry = {
                 "hoja_origen": sheet_name,
-                "ficha_detectada": ficha_label or "No Detectada",
+                "ficha_detectada": effective_label or "No Detectada",
                 "titulo": titulo,
                 "entidad": entidad,
                 "fecha": fecha,

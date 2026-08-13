@@ -41,6 +41,35 @@ class FichaDetectorTests(unittest.TestCase):
         self.assertIn("* 43358", detectar_fichas_tokens(complete))
         self.assertIn("* 43358", detectar_fichas_tokens(compact))
 
+    def test_caso_real_cl_048336_detecta_plural_pacientes(self) -> None:
+        fields = {
+            "titulo": (
+                "KIT DE CIRCUITO DE PACIENTES PARA MAQUINA DE ANESTESIA, "
+                "SE UTILIZA PARA ADMINISTRAR GASES ANESTESICOS"
+            ),
+            "descripcion": (
+                "KIT DE CIRCUITO DE PACIENTES PARA MAQUINA DE ANESTESIA "
+                "CON MANGUERAS Y ACCESORIOS"
+            ),
+            "item_1": (
+                "KIT DE CIRCUITO DE PACIENTES PARA MAQUINA DE ANESTESIA "
+                "PARA ADMINISTRAR GASES ANESTESICOS"
+            ),
+        }
+        matches = detectar_fichas_detalladas(fields)
+        matched = next(match for match in matches if match.code == "43358")
+        self.assertIn(matched.method, {"nombre_exacto", "nombre_compacto"})
+        self.assertIn(matched.field, fields)
+
+    def test_plural_flexible_sigue_exigiendo_nombre_especifico(self) -> None:
+        for text in (
+            "Compra de kits para pacientes de anestesia",
+            "Circuitos y pacientes para equipos medicos",
+            "Gases anestesicos para pacientes adultos",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn("* 43358", detectar_fichas_tokens(text))
+
     def test_frase_demasiado_amplia_no_clasifica(self) -> None:
         self.assertNotIn(
             "* 43358",

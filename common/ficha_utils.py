@@ -21,7 +21,7 @@ import pandas as pd
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DETECTOR_VERSION = "3.1.0"
+DETECTOR_VERSION = "3.2.0"
 FICHAS_DEFAULT_PATH = Path(r"C:\Users\rodri\fichas\fichas-y-nombre.xlsx")
 ALIASES_DEFAULT_PATH = REPO_ROOT / "data" / "fichas" / "ficha_aliases.json"
 
@@ -62,6 +62,32 @@ def _has_ellipsis(value: object) -> bool:
 
 def _significant(tokens: Sequence[str]) -> tuple[str, ...]:
     return tuple(token for token in tokens if token not in _STOPWORDS)
+
+
+def _token_variants(token: str) -> frozenset[str]:
+    """Devuelve variantes singular/plural conservadoras de un token.
+
+    Solo se usan dentro de nombres largos y especificos de ficha. Esto cubre
+    diferencias editoriales como ``PACIENTE``/``PACIENTES`` sin convertir una
+    palabra generica aislada en evidencia suficiente.
+    """
+    value = str(token or "").strip()
+    variants = {value} if value else set()
+    if len(value) >= 5 and value.endswith("s"):
+        variants.add(value[:-1])
+    if len(value) >= 6 and value.endswith("es"):
+        variants.add(value[:-2])
+    if len(value) >= 6 and value.endswith("ces"):
+        variants.add(value[:-3] + "z")
+    return frozenset(item for item in variants if len(item) >= 3)
+
+
+def _tokens_equivalent(left: str, right: str, *, allow_inflection: bool) -> bool:
+    if left == right:
+        return True
+    if not allow_inflection:
+        return False
+    return bool(_token_variants(left).intersection(_token_variants(right)))
 
 
 def _catalog_candidates(explicit_path: Path | str | None = None) -> tuple[Path, ...]:
@@ -200,18 +226,31 @@ def _contains_sequence(
     text_tokens: Sequence[str],
     *,
     truncated: bool,
+    allow_inflection: bool = False,
 ) -> tuple[str, ...] | None:
     if not alias or len(text_tokens) < len(alias):
         return None
     width = len(alias)
-    first = alias[0]
     for start, token in enumerate(text_tokens):
-        if token != first or start + width > len(text_tokens):
+        if (
+            not _tokens_equivalent(token, alias[0], allow_inflection=allow_inflection)
+            or start + width > len(text_tokens)
+        ):
             continue
         window = tuple(text_tokens[start : start + width])
-        if width > 1 and window[:-1] != tuple(alias[:-1]):
+        if width > 1 and not all(
+            _tokens_equivalent(current, expected, allow_inflection=allow_inflection)
+            for current, expected in zip(window[:-1], alias[:-1])
+        ):
             continue
-        if (window[-1].startswith(alias[-1]) if truncated else window[-1] == alias[-1]):
+        tail_matches = (
+            window[-1].startswith(alias[-1])
+            if truncated
+            else _tokens_equivalent(
+                window[-1], alias[-1], allow_inflection=allow_inflection
+            )
+        )
+        if tail_matches:
             return window
     return None
 
@@ -227,13 +266,30 @@ def _alias_matches(
     if not alias or not text_tokens:
         return None
 
+    allow_inflection = (
+        len(entry.significant_tokens) >= 4
+        and sum(map(len, entry.significant_tokens)) >= 18
+    )
+
     # Coincidencia contigua. En nombres truncados, el ultimo token es prefijo.
-    required = set(alias[:-1] if entry.truncated else alias)
+    required_tokens = tuple(alias[:-1] if entry.truncated else alias)
+    required = set(required_tokens)
+    required_present = required.issubset(token_set)
+    if allow_inflection and not required_present:
+        required_present = all(
+            any(_tokens_equivalent(expected, actual, allow_inflection=True) for actual in token_set)
+            for expected in required_tokens
+        )
     truncated_tail_present = (
         not entry.truncated or any(token.startswith(alias[-1]) for token in token_set)
     )
-    if required.issubset(token_set) and truncated_tail_present:
-        window = _contains_sequence(alias, text_tokens, truncated=entry.truncated)
+    if required_present and truncated_tail_present:
+        window = _contains_sequence(
+            alias,
+            text_tokens,
+            truncated=entry.truncated,
+            allow_inflection=allow_inflection,
+        )
         if window:
             return "nombre_truncado" if entry.truncated else "nombre_exacto", " ".join(window)
 
@@ -242,12 +298,26 @@ def _alias_matches(
     compact_alias = entry.significant_tokens
     if len(compact_alias) < 4 or sum(map(len, compact_alias)) < 18:
         return None
-    compact_required = set(compact_alias[:-1] if entry.truncated else compact_alias)
+    compact_required_tokens = tuple(
+        compact_alias[:-1] if entry.truncated else compact_alias
+    )
+    compact_required = set(compact_required_tokens)
+    compact_required_present = compact_required.issubset(compact_token_set)
+    if not compact_required_present:
+        compact_required_present = all(
+            any(_tokens_equivalent(expected, actual, allow_inflection=True) for actual in compact_token_set)
+            for expected in compact_required_tokens
+        )
     compact_tail_present = (
         not entry.truncated or any(token.startswith(compact_alias[-1]) for token in compact_token_set)
     )
-    if compact_required.issubset(compact_token_set) and compact_tail_present:
-        window = _contains_sequence(compact_alias, compact_text, truncated=entry.truncated)
+    if compact_required_present and compact_tail_present:
+        window = _contains_sequence(
+            compact_alias,
+            compact_text,
+            truncated=entry.truncated,
+            allow_inflection=True,
+        )
         if window:
             return "nombre_compacto", " ".join(window)
     return None
@@ -400,8 +470,9 @@ def detectar_fichas_detalladas(
 
         candidate_entries: dict[tuple[str, str], AliasEntry] = {}
         for token in token_set:
-            for entry in catalog.aliases_by_anchor.get(token, ()):
-                candidate_entries[(entry.code, entry.raw)] = entry
+            for anchor in _token_variants(token):
+                for entry in catalog.aliases_by_anchor.get(anchor, ()):
+                    candidate_entries[(entry.code, entry.raw)] = entry
         for entry in candidate_entries.values():
             found = _alias_matches(
                 entry,

@@ -13,10 +13,17 @@ from common.cl_lifecycle import (
     is_closed,
     load_known_links,
     parse_cl_deadline,
+    parse_money,
     persist_local,
     record_from_mapping,
     should_inspect_cl,
 )
+
+
+def test_parse_money_does_not_truncate_four_digit_reference_amount():
+    assert parse_money("3750") == 3750.0
+    assert parse_money("B/. 3,750.00") == 3750.0
+    assert parse_money("B/. 3.750,00") == 3750.0
 
 
 class FakeElement:
