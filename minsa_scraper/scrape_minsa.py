@@ -494,6 +494,10 @@ class ScrapeResult:
     dataframe: pd.DataFrame
 
 
+class MinsaPortalUnavailable(RuntimeError):
+    """Indica que MINSA respondio, pero el portal requerido no esta operativo."""
+
+
 
 
 
@@ -1770,13 +1774,54 @@ def _table_signature(table: WebElement, sample_rows: int = 5) -> str:
     return "||".join(signature_parts)
 
 
+_PORTAL_UNAVAILABLE_MARKERS = (
+    "sitio en mantenimiento",
+    "sistema se encuentra en mantenimiento",
+    "service unavailable",
+    "temporarily unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "http error 503",
+    "error 503",
+)
+
+
+def _fold_probe_text(value: Any) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    return " ".join(
+        "".join(ch for ch in text if not unicodedata.combining(ch)).casefold().split()
+    )
+
+
+def _portal_unavailable_reason(driver: Chrome) -> str | None:
+    """Detecta paginas de mantenimiento/error antes de agotar los timeouts Selenium."""
+    fragments: list[str] = []
+    for attr in ("title", "current_url", "page_source"):
+        with contextlib.suppress(Exception):
+            fragments.append(str(getattr(driver, attr, "") or ""))
+    with contextlib.suppress(Exception):
+        fragments.append(driver.find_element(By.TAG_NAME, "body").text)
+
+    folded = _fold_probe_text(" ".join(fragments))
+    for marker in _PORTAL_UNAVAILABLE_MARKERS:
+        if marker in folded:
+            return marker
+    return None
+
+
 def _ensure_oferentes_table(driver: Chrome, wait: WebDriverWait, target_page: int) -> WebElement:
     """Garantiza que estemos en la tabla principal de oferentes (p?gina deseada)."""
     for attempt in range(3):
         try:
-            if "Oferentes.aspx" not in driver.current_url:
+            if attempt > 0 or "Oferentes.aspx" not in driver.current_url:
                 driver.get(OFERENTES_URL)
                 wait_prm_idle(driver, timeout=20)
+            unavailable_reason = _portal_unavailable_reason(driver)
+            if unavailable_reason:
+                raise MinsaPortalUnavailable(
+                    "El portal de oferentes de MINSA no esta disponible "
+                    f"({unavailable_reason}; url={driver.current_url})."
+                )
             table = wait.until(EC.presence_of_element_located((By.ID, "MainContent_gvOferentes")))
             if target_page > 1:
                 driver.execute_script(
@@ -1785,11 +1830,32 @@ def _ensure_oferentes_table(driver: Chrome, wait: WebDriverWait, target_page: in
                     f"Page${target_page}",
                 )
                 wait_prm_idle(driver, timeout=20)
+                unavailable_reason = _portal_unavailable_reason(driver)
+                if unavailable_reason:
+                    raise MinsaPortalUnavailable(
+                        "El portal de oferentes de MINSA dejo de estar disponible "
+                        f"({unavailable_reason}; pagina={target_page})."
+                    )
                 table = wait.until(EC.presence_of_element_located((By.ID, "MainContent_gvOferentes")))
             return table
-        except TimeoutException:
+        except MinsaPortalUnavailable:
+            raise
+        except TimeoutException as exc:
+            unavailable_reason = _portal_unavailable_reason(driver)
+            if unavailable_reason:
+                raise MinsaPortalUnavailable(
+                    "El portal de oferentes de MINSA no esta disponible "
+                    f"({unavailable_reason}; url={driver.current_url})."
+                ) from exc
+            print(
+                f"[OFERENTES][WARN] La tabla principal no aparecio "
+                f"(intento {attempt + 1}/3); se recargara el portal."
+            )
             continue
-    raise TimeoutException("No se pudo recuperar la tabla principal de oferentes.")
+    raise TimeoutException(
+        "No se pudo recuperar la tabla principal de oferentes despues de 3 recargas "
+        f"(url={driver.current_url!r}, titulo={driver.title!r})."
+    )
 
 
 def _scrape_catalog_via_print_button(
@@ -3854,6 +3920,59 @@ def run_with_driver(
 
 
 
+_OFERENTES_SNAPSHOT_NAMES = (
+    "oferentes_Cat\u00E1logos.xlsx",
+    "oferentes_Catalogos.xlsx",
+    "oferentes_catalogos.xlsx",
+)
+
+
+def _find_usable_oferentes_snapshot(output_dir: Path = DEFAULT_OUTPUT_DIR) -> Path | None:
+    """Devuelve un Excel anterior solo si existe, abre correctamente y contiene datos."""
+    for name in _OFERENTES_SNAPSHOT_NAMES:
+        candidate = output_dir / name
+        if not candidate.is_file() or candidate.stat().st_size < 1024:
+            continue
+        try:
+            preview = pd.read_excel(candidate, nrows=5)
+        except Exception as exc:
+            print(f"[OFERENTES][WARN] Snapshot previo invalido {candidate.name}: {exc}")
+            continue
+        if preview.empty or len(preview.columns) < 2:
+            print(f"[OFERENTES][WARN] Snapshot previo sin datos utiles: {candidate.name}")
+            continue
+        return candidate
+    return None
+
+
+def _preserve_oferentes_snapshot_or_raise(
+    failure: BaseException,
+    output_dir: Path = DEFAULT_OUTPUT_DIR,
+) -> Path:
+    """Conserva el ultimo catalogo valido ante una indisponibilidad externa de MINSA."""
+    snapshot = _find_usable_oferentes_snapshot(output_dir)
+    if snapshot is None:
+        raise failure
+
+    updated_at = time.strftime(
+        "%Y-%m-%d %H:%M:%S",
+        time.localtime(snapshot.stat().st_mtime),
+    )
+    print(
+        "[MINSA][DEGRADED] No se actualizo el catalogo de oferentes porque el portal "
+        f"externo no esta disponible: {failure}"
+    )
+    print(
+        "[MINSA][DEGRADED] Se conserva sin sobrescribir el ultimo archivo validado: "
+        f"{snapshot} (fecha local {updated_at})."
+    )
+    print(
+        "MINSA_COMPONENT_STATUS=warning component=oferentes "
+        f"snapshot={snapshot.name} updated_at={updated_at}"
+    )
+    return snapshot
+
+
 def main(argv: list[str] | None = None) -> int:
 
     global SKIPPED_OFERENTES, CATALOG_SCRAPE_MODE, PDF_EXTRACTION_ISSUES
@@ -3915,20 +4034,26 @@ def main(argv: list[str] | None = None) -> int:
         scraper_fn = (
             scrape_catalogo_public if args.oferentes_source == "catalog" else scrape_oferentes
         )
-        df_oferentes = run_with_driver(
-            scraper_fn,
-            headless=args.headless,
-            max_pages=args.max_pages,
-        )
-        export_results(
-            [ScrapeResult("oferentes_Cat\u00E1logos", df_oferentes)],
-            DEFAULT_OUTPUT_DIR,
-            drive_uploader=drive_uploader,
-            ignore_existing=not args.respect_existing_output,
-        )
-        print(f"[LOG] Oferentes: recuperadas {len(df_oferentes)} filas.")
-        ran_catalog = True
-        exported_any = True
+        try:
+            df_oferentes = run_with_driver(
+                scraper_fn,
+                headless=args.headless,
+                max_pages=args.max_pages,
+            )
+            export_results(
+                [ScrapeResult("oferentes_Cat\u00E1logos", df_oferentes)],
+                DEFAULT_OUTPUT_DIR,
+                drive_uploader=drive_uploader,
+                ignore_existing=not args.respect_existing_output,
+            )
+            print(f"[LOG] Oferentes: recuperadas {len(df_oferentes)} filas.")
+            ran_catalog = True
+            exported_any = True
+        except (MinsaPortalUnavailable, TimeoutException, WebDriverException) as exc:
+            _preserve_oferentes_snapshot_or_raise(exc)
+            # Fichas y criterios ya exportados siguen siendo validos. El catalogo anterior
+            # permanece intacto y la siguiente corrida volvera a intentar actualizarlo.
+            exported_any = True
 
     if ran_catalog:
         export_duplicate_report(DEFAULT_OUTPUT_DIR, drive_uploader=drive_uploader)
