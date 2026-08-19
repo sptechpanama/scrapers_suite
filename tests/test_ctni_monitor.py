@@ -7,6 +7,8 @@ import requests
 from ctni_monitor.monitor import (
     CtniRepository,
     CtniHttpClient,
+    _ficha_event_decider,
+    deduplicate_payloads,
     ficha_record_key,
     homologation_record_key,
     parse_homepage_homologations,
@@ -123,6 +125,66 @@ class FakeSheetStore:
         return len(rows)
 
 
+class TerminalRequestClient:
+    def __init__(self) -> None:
+        self.detail_calls = 0
+
+    def fetch_requests(self):
+        return [
+            {
+                "id": 99,
+                "numFormulario": "500",
+                "tipoFormulario": "Elaboración",
+                "numFicha": "43358",
+                "subComite": "Médico Quirúrgico",
+                "institucion": "CSS",
+                "unidadEjecutora": "Hospital",
+                "nombreGenerico": "Circuito de paciente",
+                "fecha": "01-01-2020",
+            }
+        ]
+
+    def fetch_request_detail(self, _official_id):
+        self.detail_calls += 1
+        return {
+            "fechaFinal": "02-01-2020",
+            "observacionFinal": "Trámite finalizado con resolución oficial",
+        }
+
+    def fetch_worked_fichas(self):
+        return []
+
+    def confirm_published_ficha(self, _ficha_number):
+        return False
+
+    def fetch_homepage(self):
+        return "<html><body>Sin avisos</body></html>"
+
+
+class AlternatingFichaPagesClient(TerminalRequestClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.ficha_calls = 0
+
+    def fetch_requests(self):
+        return []
+
+    def fetch_worked_fichas(self):
+        self.ficha_calls += 1
+        number = "100" if self.ficha_calls % 2 else "200"
+        return [
+            {
+                "id": number,
+                "numFicha": number,
+                "accion": "Actualizacion",
+                "numacta": "1",
+                "titulo": f"Ficha {number}",
+                "subcomite": "Laboratorio",
+                "fecha": "18-Agosto-2026",
+            }
+        ]
+
+
 class FailingSheetStore:
     def upsert_rows(self, *_args, **_kwargs):
         raise RuntimeError("Google temporalmente no disponible")
@@ -136,6 +198,60 @@ def test_official_keys_follow_requested_deduplication_rules():
     assert homologation_record_key({"enlace_adjunto": "https://ctni.minsa.gob.pa/a.docx"}).startswith(
         "homologacion:url:"
     )
+
+
+def test_duplicate_official_keys_are_collapsed_deterministically():
+    older = {
+        "record_key": "ficha:43358|actualizada|10|2026-08-18",
+        "id_oficial": "100",
+        "producto": "Circuito incompleto",
+    }
+    newer = {
+        "record_key": "ficha:43358|actualizada|10|2026-08-18",
+        "id_oficial": "200",
+        "producto": "Circuito de paciente completo",
+        "subcomite": "Médico Quirúrgico",
+    }
+
+    forward = deduplicate_payloads([older, newer])
+    reverse = deduplicate_payloads([newer, older])
+
+    assert forward == reverse == [newer]
+
+
+def test_ficha_watermark_suppresses_late_historical_discoveries():
+    historical = {"accion": "Elaborada", "id_oficial": "99"}
+    genuinely_new = {"accion": "Elaborada", "id_oficial": "101"}
+
+    assert _ficha_event_decider(None, historical, True, minimum_new_id=100) is None
+    assert _ficha_event_decider(None, genuinely_new, True, minimum_new_id=100) == (
+        "Ficha nueva publicada",
+        True,
+    )
+
+
+def test_non_notifiable_change_does_not_create_generic_event(tmp_path: Path):
+    repository = CtniRepository(tmp_path / "events.db")
+    try:
+        repository.apply_records(
+            source="fichas",
+            category="fichas",
+            records=[{"record_key": "ficha:1", "producto": "Nombre A"}],
+            event_decider=lambda *_args: None,
+        )
+        changed = repository.apply_records(
+            source="fichas",
+            category="fichas",
+            records=[{"record_key": "ficha:1", "producto": "Nombre B"}],
+            event_decider=lambda *_args: None,
+        )
+        event_count = repository.connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+
+        assert len(changed.changed_records) == 1
+        assert changed.events == []
+        assert event_count == 0
+    finally:
+        repository.close()
 
 
 def test_homepage_parser_extracts_schedule_and_status_changes():
@@ -176,6 +292,51 @@ def test_first_run_is_baseline_and_repeated_runs_are_idempotent(tmp_path: Path, 
     repeated = run_monitor(db_path=db_path, client=client, sheet_store=sheets)
     assert repeated.events == []
     assert repeated.summary()["events"] == []
+
+
+def test_terminal_request_keeps_its_detail_when_refresh_is_skipped(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CTNI_REQUEST_DETAIL_LOOKBACK_DAYS", "4000")
+    monkeypatch.setenv("CTNI_TERMINAL_REFRESH_DAYS", "1")
+    client = TerminalRequestClient()
+    sheets = FakeSheetStore()
+    db_path = tmp_path / "terminal.db"
+
+    first = run_monitor(db_path=db_path, client=client, sheet_store=sheets)
+    assert first.summary()["events"] == []
+    assert client.detail_calls == 1
+
+    second = run_monitor(db_path=db_path, client=client, sheet_store=sheets)
+    repository = CtniRepository(db_path)
+    try:
+        saved = repository.get_records("solicitudes")["solicitud:id:99"]
+        event_count = repository.connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    finally:
+        repository.close()
+
+    assert second.events == []
+    assert client.detail_calls == 1
+    assert saved["estado"] == "Finalizado"
+    assert saved["observacion_estado"] == "Trámite finalizado con resolución oficial"
+    assert saved["detalle_disponible"] is True
+    assert event_count == 0
+
+
+def test_monitor_unions_two_unstable_ficha_passes(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("CTNI_FICHA_PASSES", "2")
+    client = AlternatingFichaPagesClient()
+    db_path = tmp_path / "two-passes.db"
+
+    result = run_monitor(db_path=db_path, client=client, sync_sheets=False)
+    repository = CtniRepository(db_path)
+    try:
+        fichas = repository.get_records("fichas")
+    finally:
+        repository.close()
+
+    assert client.ficha_calls == 2
+    assert result.counts["fichas"] == 2
+    assert result.counts["fichas_filas_fuente"] == 2
+    assert len(fichas) == 2
 
 
 def test_failed_sheet_sync_is_rebuilt_from_sqlite_on_next_identical_run(tmp_path: Path, monkeypatch):

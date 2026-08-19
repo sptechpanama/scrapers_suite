@@ -20,6 +20,11 @@ Cada fuente crea su propia línea base en su primer éxito. Esa corrida no gener
 notificaciones antiguas. Un fallo HTTP o de Google Sheets no borra datos; el
 espejo pendiente se reconstruye desde SQLite en el siguiente éxito.
 
+`LoadFichasTrabajadas` no ofrece un orden estable para su paginación. El monitor
+realiza dos pasadas y une las filas por la clave oficial solicitada. Además,
+conserva una marca de agua del ID oficial para incorporar hallazgos históricos
+tardíos sin enviarlos por correo como publicaciones nuevas.
+
 ## Ejecución
 
 ```powershell
@@ -36,6 +41,7 @@ se inyecta como configuración obligatoria aunque todavía no exista una fila en
 - `CTNI_SPREADSHEET_ID`: libro de datos; por defecto usa el actual de Panamá Compra.
 - `CTNI_REQUEST_DETAIL_LIMIT`: detalles máximos por corrida (por defecto 15000).
 - `CTNI_REQUEST_DETAIL_WORKERS`: concurrencia de detalles (por defecto 6).
+- `CTNI_FICHA_PASSES`: pasadas del historial de fichas (por defecto 2; máximo 4).
 - `CTNI_SHEET_HISTORY_DAYS`: historial de fichas reflejado en Sheets (por defecto 1825).
 - `ORQUESTADOR_CTNI_EMAIL_FROM`, `ORQUESTADOR_CTNI_EMAIL_APP_PASSWORD` y
   `ORQUESTADOR_CTNI_EMAIL_TO`: solo si se desea sobreescribir la configuración

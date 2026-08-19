@@ -32,6 +32,7 @@ HOMOLOGATIONS_SHEET = "ctni_homologaciones"
 FICHAS_SHEET = "ctni_fichas"
 EVENTS_SHEET = "ctni_eventos"
 HEALTH_SHEET = "ctni_health"
+VOLATILE_SHEET_FIELDS = {"ultima_deteccion"}
 
 DEFAULT_SPREADSHEET_ID = "17hOfP-vMdJ4D7xym1cUp7vAcd8XJPErpY3V-9Ui2tCo"
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "ctni" / "ctni_monitor.db"
@@ -177,6 +178,30 @@ def payload_hash(payload: Mapping[str, Any]) -> str:
     canonical = {key: payload.get(key, "") for key in sorted(payload) if key not in excluded}
     raw = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def deduplicate_payloads(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Colapsa claves oficiales repetidas de forma estable, sin depender del orden del portal."""
+    selected: dict[str, tuple[tuple[int, int, str], dict[str, Any]]] = {}
+    for raw in records:
+        payload = dict(raw)
+        key = clean_text(payload.get("record_key"))
+        if not key:
+            continue
+        official_id = normalize_number(payload.get("id_oficial"))
+        numeric_id = int(official_id) if official_id.isdigit() else -1
+        completeness = sum(1 for value in payload.values() if clean_text(value))
+        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        rank = (numeric_id, completeness, canonical)
+        current = selected.get(key)
+        if current is None or rank > current[0]:
+            selected[key] = (rank, payload)
+    return [selected[key][1] for key in sorted(selected)]
+
+
+def official_id_number(value: Any) -> int:
+    normalized = normalize_number(value)
+    return int(normalized) if normalized.isdigit() else -1
 
 
 def parse_source_date(value: Any) -> date | None:
@@ -815,7 +840,9 @@ class CtniRepository:
 
             if not baseline:
                 decision = event_decider(previous, rendered, is_new)
-                event_type, notify = decision if decision else ("Registro actualizado", False)
+                if decision is None:
+                    continue
+                event_type, notify = decision
                 event_id = stable_hash(category, key, event_type, new_hash)
                 cursor = self.connection.execute(
                     """
@@ -945,8 +972,15 @@ def _ficha_event_decider(
     previous: Mapping[str, Any] | None,
     current: Mapping[str, Any],
     is_new: bool,
+    *,
+    minimum_new_id: int = -1,
 ) -> tuple[str, bool] | None:
     if is_new and current.get("accion") == "Elaborada":
+        # LoadFichasTrabajadas pagina sin un ORDER BY estable. Una clave historica
+        # puede aparecer por primera vez en una corrida posterior; solo los IDs
+        # posteriores a la marca de agua son publicaciones realmente nuevas.
+        if official_id_number(current.get("id_oficial")) <= minimum_new_id:
+            return None
         return "Ficha nueva publicada", True
     return None
 
@@ -1051,7 +1085,9 @@ class SheetStore:
                 last_error = exc
                 if attempt == 3:
                     break
-                wait = float(2**attempt)
+                message = normalized_text(exc)
+                quota_limited = "429" in message or "quota" in message or "rate_limit" in message
+                wait = float((15, 30, 60)[attempt] if quota_limited else 2**attempt)
                 logging.warning("Sheets %s falló: %s. Reintento en %.1fs", label, exc, wait)
                 time.sleep(wait)
         raise CtniError(f"No fue posible sincronizar {label}: {last_error}")
@@ -1142,15 +1178,18 @@ class SheetStore:
                     "TRUE" if value is True else "FALSE" if value is False else clean_text(value)
                     for value in rendered
                 ]
-                if old_rendered == new_rendered:
+                comparison_indexes = [
+                    index for index, header in enumerate(headers) if header not in VOLATILE_SHEET_FIELDS
+                ]
+                if all(old_rendered[index] == new_rendered[index] for index in comparison_indexes):
                     continue
                 updates.append(
                     {"range": f"'{title}'!A{sheet_row}:{last_column}{sheet_row}", "values": [rendered]}
                 )
             else:
                 appends.append(rendered)
-        for start in range(0, len(updates), 300):
-            chunk = updates[start : start + 300]
+        for start in range(0, len(updates), 1000):
+            chunk = updates[start : start + 1000]
             self._call(
                 lambda chunk=chunk: self.service.spreadsheets().values().batchUpdate(
                     spreadsheetId=self.spreadsheet_id,
@@ -1259,20 +1298,16 @@ def run_monitor(
                 detail = details.get(key)
                 if detail is None and key in existing:
                     previous = existing[key]
-                    detail = {
-                        "estado": previous.get("estado", ""),
-                        "fechaRecibida": previous.get("fecha_recibida", ""),
-                        "fechaRespuesta": previous.get("fecha_respuesta", ""),
-                        "fechaProceso": previous.get("fecha_proceso", ""),
-                        "fechaCompletada": previous.get("fecha_completada", ""),
-                        "fechaFinal": previous.get("fecha_final", ""),
-                        "observacionProceso": previous.get("observacion_estado", ""),
+                    payload = {
+                        field: value
+                        for field, value in previous.items()
+                        if not field.startswith("_")
+                        and field not in {"primera_deteccion", "ultima_deteccion", "condicion"}
                     }
-                    payload = _request_payload(row, detail)
-                    payload["detalle_disponible"] = bool(previous.get("detalle_disponible"))
                 else:
                     payload = _request_payload(row, detail)
                 payloads.append(payload)
+            payloads = deduplicate_payloads(payloads)
             applied = repository.apply_records(
                 source="solicitudes",
                 category="solicitudes",
@@ -1304,9 +1339,34 @@ def run_monitor(
         # Fichas trabajadas: new, updated, corrected, enabled and disabled.
         started = time.monotonic()
         try:
-            rows = client.fetch_worked_fichas()
-            payloads = [_ficha_payload(row) for row in rows]
+            ficha_passes = max(1, min(4, int(os.environ.get("CTNI_FICHA_PASSES", "2"))))
+            source_rows: list[dict[str, Any]] = []
+            for _pass_number in range(ficha_passes):
+                source_rows.extend(client.fetch_worked_fichas())
             existing_fichas = repository.get_records("fichas")
+            observed_payloads = deduplicate_payloads([_ficha_payload(row) for row in source_rows])
+            stable_candidates: list[dict[str, Any]] = list(observed_payloads)
+            observed_keys = {clean_text(row.get("record_key")) for row in observed_payloads}
+            for key in observed_keys:
+                previous = existing_fichas.get(key)
+                if previous:
+                    stable_candidates.append(
+                        {
+                            field: value
+                            for field, value in previous.items()
+                            if not field.startswith("_")
+                            and field not in {"primera_deteccion", "ultima_deteccion", "condicion"}
+                        }
+                    )
+            payloads = deduplicate_payloads(stable_candidates)
+            stored_watermark = official_id_number(
+                repository.get_metadata("fichas:max_official_id")
+            )
+            existing_watermark = max(
+                (official_id_number(row.get("id_oficial")) for row in existing_fichas.values()),
+                default=-1,
+            )
+            notification_watermark = max(stored_watermark, existing_watermark)
             for payload in payloads:
                 previous = existing_fichas.get(clean_text(payload.get("record_key")))
                 if previous and clean_text(previous.get("confirmacion_publicada")):
@@ -1315,8 +1375,21 @@ def run_monitor(
                 source="fichas",
                 category="fichas",
                 records=payloads,
-                event_decider=_ficha_event_decider,
+                event_decider=lambda previous, current, is_new: _ficha_event_decider(
+                    previous,
+                    current,
+                    is_new,
+                    minimum_new_id=notification_watermark,
+                ),
             )
+            current_watermark = max(
+                notification_watermark,
+                max(
+                    (official_id_number(row.get("id_oficial")) for row in payloads),
+                    default=-1,
+                ),
+            )
+            repository.set_metadata("fichas:max_official_id", str(current_watermark))
             if applied.baseline:
                 result.baseline_sources.append("fichas")
             # ConsultarFichas is deliberately secondary and only confirms newly detected official fichas.
@@ -1324,6 +1397,7 @@ def run_monitor(
                 row
                 for row in applied.changed_records
                 if row.get("condicion") == "Nuevo" and row.get("accion") == "Elaborada"
+                and official_id_number(row.get("id_oficial")) > notification_watermark
             ]
             for payload in new_fichas:
                 try:
@@ -1352,10 +1426,12 @@ def run_monitor(
                 or (parse_source_date(row.get("fecha")) or date.max) >= cutoff
             ]
             result.events.extend(applied.events)
-            result.counts["fichas"] = len(rows)
+            result.counts["fichas"] = len(set(existing_fichas) | observed_keys)
+            result.counts["fichas_observadas"] = len(observed_payloads)
+            result.counts["fichas_filas_fuente"] = len(source_rows)
             result.source_status["fichas"] = "success"
             repository.record_health(
-                "fichas", status="success", count=len(rows), duration_seconds=time.monotonic() - started
+                "fichas", status="success", count=len(payloads), duration_seconds=time.monotonic() - started
             )
         except Exception as exc:
             result.source_status["fichas"] = "error"
