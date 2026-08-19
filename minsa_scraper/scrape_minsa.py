@@ -2591,7 +2591,19 @@ def scrape_ctni_fichas(driver: Chrome, max_pages: int = 0) -> pd.DataFrame:
 
 
     detail_executor.shutdown(wait=True, cancel_futures=False)
-    return pd.concat(dataframes, ignore_index=True) if dataframes else pd.DataFrame()
+    if not dataframes:
+        return pd.DataFrame()
+    combined = pd.concat(dataframes, ignore_index=True)
+    # La pagina de origen es solo un dato interno de navegacion. Algunas
+    # versiones antiguas del archivo conservaron ese encabezado con mojibake,
+    # generando una columna enorme que no pertenece al catalogo oficial.
+    pagination_columns = [
+        column
+        for column in combined.columns
+        if str(column).strip().lower() in {"pagina", "página"}
+        or str(column).strip().lower().endswith("gina")
+    ]
+    return combined.drop(columns=pagination_columns, errors="ignore")
 
 
 
