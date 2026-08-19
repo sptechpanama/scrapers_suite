@@ -108,6 +108,7 @@ JOB_TIMEOUT_SECONDS_DEFAULTS = {
     "rir1": 5400,
     "cotizacion_panama": 1200,
     "sunday_db_minsa": 14400,
+    "ctni": 7200,
 }
 
 JOB_STARTUP_CATCHUP_SECONDS_DEFAULTS = {
@@ -116,6 +117,7 @@ JOB_STARTUP_CATCHUP_SECONDS_DEFAULTS = {
 
 REQUIRED_FALLBACK_JOB_NAMES = {
     "sunday_db_minsa",
+    "ctni",
 }
 
 MAX_QUEUE_LOG_ITEMS = 12
@@ -149,6 +151,7 @@ JOB_NAME_LABELS = {
     "clrir": "Cotizaciones Programadas",
     "rir1": "Licitaciones",
     "sunday_db_minsa": "Base PanamáCompra + MINSA",
+    "ctni": "Monitor CTNI",
     "intel_estudio_ficha": "Estudio de ficha (Inteligencia CT)",
 }
 
@@ -528,6 +531,24 @@ def _extract_rs_sp_summary(stdout: str) -> Optional[Dict[str, object]]:
     return None
 
 
+def _extract_ctni_summary(stdout: str) -> Optional[Dict[str, object]]:
+    if not stdout:
+        return None
+    for line in stdout.splitlines()[::-1]:
+        line = line.strip()
+        if not line.startswith("CTNI_SUMMARY_JSON="):
+            continue
+        raw = line.split("CTNI_SUMMARY_JSON=", 1)[-1].strip()
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
 def _ct_rir_email_config() -> tuple[str, str, list[str]]:
     sender = str(
         os.environ.get("ORQUESTADOR_CT_RIR_EMAIL_FROM", CT_RIR_EMAIL_DEFAULT_FROM)
@@ -563,6 +584,19 @@ def _rs_sp_email_config() -> tuple[str, str, list[str]]:
             "ORQUESTADOR_RS_SP_EMAIL_TO",
             ",".join(RS_SP_EMAIL_DEFAULT_TO),
         )
+    ).strip()
+    recipients = [item.strip() for item in raw_recipients.split(",") if item.strip()]
+    return sender, password, recipients
+
+
+def _ctni_email_config() -> tuple[str, str, list[str]]:
+    """Reutiliza por defecto exactamente la configuración existente de CT_RIR."""
+    default_sender, default_password, default_recipients = _ct_rir_email_config()
+    sender = str(os.environ.get("ORQUESTADOR_CTNI_EMAIL_FROM", default_sender)).strip()
+    password = str(os.environ.get("ORQUESTADOR_CTNI_EMAIL_APP_PASSWORD", default_password)).strip()
+    password = password.replace(" ", "")
+    raw_recipients = str(
+        os.environ.get("ORQUESTADOR_CTNI_EMAIL_TO", ",".join(default_recipients))
     ).strip()
     recipients = [item.strip() for item in raw_recipients.split(",") if item.strip()]
     return sender, password, recipients
@@ -1113,6 +1147,142 @@ def _send_pending_rs_sp_email() -> tuple[bool, str, int]:
     return True, "", len(ordered_entries)
 
 
+def _queue_ctni_notifications(job_name: str, stdout: str, finished_at: datetime) -> int:
+    summary = _extract_ctni_summary(stdout)
+    if not summary:
+        return 0
+    events = summary.get("events")
+    if not isinstance(events, list) or not events:
+        return 0
+
+    state = load_state()
+    pending_entries = state.setdefault("ctni_email_pending", [])
+    sent_keys = state.setdefault("ctni_email_sent_keys", {})
+    pending_keys = {
+        str(item.get("unique_key") or "")
+        for item in pending_entries
+        if isinstance(item, dict)
+    }
+    queued = 0
+    for raw_event in events:
+        if not isinstance(raw_event, dict):
+            continue
+        unique_key = str(raw_event.get("event_id") or "").strip()
+        if not unique_key:
+            unique_key = "|".join(
+                str(raw_event.get(key) or "").strip()
+                for key in ("categoria", "tipo_evento", "numero_formulario", "numero_ficha", "fecha", "enlace")
+            )
+        if not unique_key or unique_key in sent_keys or unique_key in pending_keys:
+            continue
+        entry = {
+            "unique_key": unique_key,
+            "job": job_name,
+            "categoria": str(raw_event.get("categoria") or "").strip(),
+            "tipo_evento": str(raw_event.get("tipo_evento") or "").strip(),
+            "producto": str(raw_event.get("producto") or "").strip(),
+            "numero_formulario": str(raw_event.get("numero_formulario") or "").strip(),
+            "numero_ficha": str(raw_event.get("numero_ficha") or "").strip(),
+            "subcomite": str(raw_event.get("subcomite") or "").strip(),
+            "fecha": str(raw_event.get("fecha") or "").strip(),
+            "hora": str(raw_event.get("hora") or "").strip(),
+            "estado": str(raw_event.get("estado") or "").strip(),
+            "enlace": str(raw_event.get("enlace") or "").strip(),
+            "queued_at": finished_at.isoformat(timespec="seconds"),
+        }
+        pending_entries.append(entry)
+        pending_keys.add(unique_key)
+        queued += 1
+
+    if queued:
+        state["ctni_email_pending"] = pending_entries[-1000:]
+        state["ctni_email_last_queue"] = {
+            "job": job_name,
+            "count": queued,
+            "queued_at": finished_at.isoformat(timespec="seconds"),
+        }
+        save_state(state)
+    return queued
+
+
+def _send_pending_ctni_email() -> tuple[bool, str, int]:
+    state = load_state()
+    pending_entries = state.get("ctni_email_pending", [])
+    if not isinstance(pending_entries, list) or not pending_entries:
+        return True, "", 0
+
+    sender, password, recipients = _ctni_email_config()
+    if not sender or not password or not recipients:
+        return False, "Configuración incompleta de correo CTNI/CT_RIR", 0
+
+    entries = [item for item in pending_entries if isinstance(item, dict)]
+    if not entries:
+        return True, "", 0
+
+    lines = ["Se detectaron novedades oficiales en el portal CTNI/MINSA.", ""]
+    for index, entry in enumerate(entries, start=1):
+        number = entry.get("numero_formulario") or entry.get("numero_ficha") or "Sin número"
+        lines.extend(
+            [
+                f"{index}. {entry.get('tipo_evento') or 'Novedad CTNI'}",
+                f"   Categoría: {entry.get('categoria', '')}",
+                f"   Formulario/Ficha: {number}",
+                f"   Producto: {entry.get('producto', '')}",
+                f"   Subcomité: {entry.get('subcomite', '')}",
+                f"   Fecha/Hora: {entry.get('fecha', '')} {entry.get('hora', '')}".rstrip(),
+                f"   Estado: {entry.get('estado', '')}",
+                f"   Enlace: {entry.get('enlace', '')}",
+                "",
+            ]
+        )
+
+    now_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    msg = EmailMessage()
+    msg["Subject"] = f"CTNI: {len(entries)} novedad(es) detectada(s) - {now_local}"
+    msg["From"] = sender
+    msg["To"] = ", ".join(recipients)
+    msg.set_content("\n".join(lines).strip() + "\n")
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context, timeout=30) as server:
+        server.login(sender, password)
+        server.send_message(msg)
+
+    sent_keys = state.setdefault("ctni_email_sent_keys", {})
+    sent_at = datetime.now().isoformat(timespec="seconds")
+    for entry in entries:
+        key = str(entry.get("unique_key") or "").strip()
+        if key:
+            sent_keys[key] = sent_at
+    if len(sent_keys) > 10000:
+        kept = sorted(sent_keys, key=lambda key: sent_keys[key])[-6000:]
+        state["ctni_email_sent_keys"] = {key: sent_keys[key] for key in kept}
+    state["ctni_email_pending"] = []
+    state["ctni_email_last_sent"] = {
+        "count": len(entries),
+        "sent_at": sent_at,
+        "recipients": recipients,
+        "subject": msg["Subject"],
+    }
+    save_state(state)
+    return True, "", len(entries)
+
+
+def _process_ctni_notifications(job_name: str, stdout: str, finished_at: datetime) -> None:
+    if job_name != "ctni":
+        return
+    queued = _queue_ctni_notifications(job_name, stdout, finished_at)
+    ok, detail, sent_count = _send_pending_ctni_email()
+    if ok and sent_count:
+        logging.info(
+            "Correo CTNI enviado con %s novedad(es); %s agregada(s) en esta corrida",
+            sent_count,
+            queued,
+        )
+    elif not ok:
+        logging.warning("No se pudo enviar correo CTNI: %s", detail or "sin detalle")
+
+
 def _queue_scan_based_notifications(job_name: str, module_name: str, finished_at: datetime) -> int:
     scanner = _scan_ct_rir_candidates if module_name == "ct_rir" else _scan_rs_sp_candidates
     unique_builder = _build_ct_rir_unique_key if module_name == "ct_rir" else _build_rs_sp_unique_key
@@ -1636,6 +1806,11 @@ def run_job(job: JobConfig, execution: Optional[ExecutionRequest] = None) -> tup
                         "No se pudo procesar escaneo RS_SP para el job %s",
                         job.name,
                     )
+            if job.name == "ctni":
+                try:
+                    _process_ctni_notifications(job.name, stdout, end_time)
+                except Exception:  # pylint: disable=broad-except
+                    logging.exception("No se pudo procesar la notificación CTNI")
             update_last_run(job.name, "success", started_at=start_time, finished_at=end_time)
             return "success", ""
         else:
@@ -1996,6 +2171,11 @@ def run_job_interruptible(
                         "No se pudo procesar escaneo RS_SP para el job %s",
                         job.name,
                     )
+            if job.name == "ctni":
+                try:
+                    _process_ctni_notifications(job.name, result.stdout, end_time)
+                except Exception:  # pylint: disable=broad-except
+                    logging.exception("No se pudo procesar la notificación CTNI")
             update_last_run(job.name, "success", started_at=start_time, finished_at=end_time)
             return "success", ""
 

@@ -58,6 +58,23 @@
                                ]
                  },
                  {
+                     "name": "ctni",
+                     "python": "C:/Users/rodri/scrapers_repo/.venv/Scripts/python.exe",
+                     "script": "C:/Users/rodri/scrapers_repo/ctni_monitor/scrape_ctni.py",
+                     "days_of_week": [
+                         "mon",
+                         "tue",
+                         "wed",
+                         "thu",
+                         "fri",
+                         "sat",
+                         "sun"
+                     ],
+                     "times": [
+                         "05:15"
+                     ]
+                 },
+                 {
                      "name": "cotizacion_panama",
                      "python": "C:/Users/rodri/scrapers_repo/.venv/Scripts/python.exe",
                      "script": "C:/Users/rodri/selenium_cotizacion/cotizacion_worker.py",
