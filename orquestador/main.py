@@ -613,7 +613,12 @@ def _normalize_text(value: object) -> str:
 
 
 def _normalize_keyword_term(value: object) -> str:
-    return _normalize_text(value)
+    raw = str(value or "").strip()
+    root_match = raw.endswith("*")
+    normalized = _normalize_text(raw[:-1] if root_match else raw)
+    if normalized and root_match:
+        return f"{normalized}*"
+    return normalized
 
 
 def _normalize_ficha_code(value: object) -> str:
@@ -760,9 +765,19 @@ def _match_keywords_in_text(text: object, keywords: list[str]) -> list[str]:
     for keyword in keywords:
         if not keyword:
             continue
-        pattern = rf"(?<![0-9a-z]){r'\s+'.join(re.escape(part) for part in keyword.split())}(?![0-9a-z])"
+        normalized_keyword = _normalize_keyword_term(keyword)
+        root_match = normalized_keyword.endswith("*")
+        term_body = normalized_keyword[:-1].strip() if root_match else normalized_keyword
+        token_pattern = r"\s+".join(
+            re.escape(part) for part in term_body.split() if part
+        )
+        if not token_pattern:
+            continue
+        if root_match:
+            token_pattern += r"[0-9a-z]*"
+        pattern = rf"(?<![0-9a-z]){token_pattern}(?![0-9a-z])"
         if re.search(pattern, normalized):
-            matches.append(keyword)
+            matches.append(normalized_keyword)
     return matches
 
 
