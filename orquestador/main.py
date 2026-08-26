@@ -11,6 +11,7 @@ import re
 import smtplib
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import unicodedata
@@ -49,6 +50,16 @@ from sheets_bridge import (
 )
 
 BASE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = BASE_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from common.keyword_watch import (  # noqa: E402
+    DEFAULT_RS_SP_KEYWORDS as SHARED_RS_SP_DEFAULT_KEYWORDS,
+    match_keywords_in_text as shared_match_keywords_in_text,
+    normalize_keyword_term as shared_normalize_keyword_term,
+)
+
 CONFIG_PATH = BASE_DIR / "config.json"
 STATE_PATH = BASE_DIR / "state.json"
 DEFAULT_ORQUESTADOR_CREDENTIALS = BASE_DIR / "pure-beach-474203-p1-fdc9557f33d0.json"
@@ -200,7 +211,7 @@ PANAMACOMPRA_RS_SP_SCAN_SHEETS = [
     "ap_sin_requisitos",
     "ap_con_ct",
 ]
-PANAMACOMPRA_DEFAULT_RS_SP_KEYWORDS = ("chiller", "york", "daikin")
+PANAMACOMPRA_DEFAULT_RS_SP_KEYWORDS = SHARED_RS_SP_DEFAULT_KEYWORDS
 
 
 class SingleInstanceRunningError(RuntimeError):
@@ -639,7 +650,7 @@ def _normalize_text(value: object) -> str:
 
 
 def _normalize_keyword_term(value: object) -> str:
-    return _normalize_text(value)
+    return shared_normalize_keyword_term(value)
 
 
 def _normalize_ficha_code(value: object) -> str:
@@ -738,7 +749,7 @@ def _column_index_map(headers: list[object]) -> dict[str, int]:
 
 
 def _row_value(row: list[object], mapping: dict[str, int], key: str) -> str:
-    idx = mapping.get(key)
+    idx = mapping.get(_normalize_text(key))
     if idx is None or idx >= len(row):
         return ""
     return str(row[idx] or "").strip()
@@ -778,18 +789,17 @@ def _load_rs_sp_keywords_for_notifications() -> list[str]:
     return out
 
 
-def _match_keywords_in_text(text: object, keywords: list[str]) -> list[str]:
-    normalized = _normalize_text(text)
-    if not normalized:
-        return []
-    matches: list[str] = []
-    for keyword in keywords:
-        if not keyword:
-            continue
-        pattern = rf"(?<![0-9a-z]){r'\s+'.join(re.escape(part) for part in keyword.split())}(?![0-9a-z])"
-        if re.search(pattern, normalized):
-            matches.append(keyword)
-    return matches
+def _match_keywords_in_text(
+    text: object,
+    keywords: list[str],
+    *,
+    reference_amount: object = None,
+) -> list[str]:
+    return shared_match_keywords_in_text(
+        text,
+        keywords,
+        reference_amount=reference_amount,
+    )
 
 
 def _scan_ct_rir_candidates() -> list[dict[str, object]]:
@@ -874,7 +884,11 @@ def _scan_rs_sp_candidates() -> list[dict[str, object]]:
                 continue
 
             text_parts = [_row_value(row, mapping, key) for key in text_keys]
-            matched = _match_keywords_in_text(" ".join(text_parts), keywords)
+            matched = _match_keywords_in_text(
+                " ".join(text_parts),
+                keywords,
+                reference_amount=precio,
+            )
             if not matched:
                 continue
 
