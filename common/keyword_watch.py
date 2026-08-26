@@ -46,6 +46,7 @@ HVAC_OVER_15K_KEYWORDS = (
     "bomba de calor>15k",
     "climatizacion*>15k",
 )
+KEYWORD_RULES_VERSION = 2
 DEFAULT_RS_SP_KEYWORDS = (
     "chiller",
     "york",
@@ -85,6 +86,16 @@ def _normalize_text(value: object) -> str:
     text = re.sub(r"[^0-9a-z]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+@lru_cache(maxsize=1)
+def _legacy_hvac_rule_aliases() -> dict[str, str]:
+    """Recupera las reglas HVAC que un UI anterior guardó como ``... 15k``."""
+
+    return {
+        _normalize_text(rule.replace("*", "").replace(">", " ")): rule
+        for rule in HVAC_OVER_15K_KEYWORDS
+    }
 
 
 def _format_rule_amount(value: float) -> str:
@@ -144,6 +155,8 @@ def parse_keyword_rule(value: object) -> KeywordRule | None:
     raw = str(value or "").strip()
     if not raw:
         return None
+    if ">" not in raw:
+        raw = _legacy_hvac_rule_aliases().get(_normalize_text(raw), raw)
     minimum_amount: float | None = None
     amount_match = _AMOUNT_SUFFIX_RE.fullmatch(raw)
     if amount_match:

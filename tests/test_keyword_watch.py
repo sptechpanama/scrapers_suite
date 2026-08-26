@@ -23,6 +23,13 @@ def test_exact_root_and_amount_rules_are_backward_compatible():
     assert rule.minimum_amount == 15_000
 
 
+def test_known_legacy_hvac_rows_are_recovered_safely():
+    assert normalize_keyword_term("aire acondicion 15k") == "aire acondicion*>15k"
+    assert normalize_keyword_term("split 15k") == "split>15k"
+    assert normalize_keyword_term("climatizacion 15k") == "climatizacion*>15k"
+    assert normalize_keyword_term("proyecto especial 15k") == "proyecto especial 15k"
+
+
 def test_threshold_is_strict_and_requires_a_valid_reference_amount():
     keywords = ["aires acondicion*>15k", "split>15k", "vrf>15k"]
     text = "Compra de aires acondicionados tipo split con sistema VRF"
