@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from common.keyword_watch import (
+    DEFAULT_RS_SP_NEGATIVE_KEYWORDS,
     DEFAULT_RS_SP_KEYWORDS,
     match_keywords_in_text,
+    match_negative_keywords_in_text,
+    negative_keywords_in_matching_context,
     normalize_keyword_term,
     parse_keyword_rule,
     parse_reference_amount,
@@ -88,3 +91,45 @@ def test_hvac_defaults_include_root_and_amount_rules():
     assert "aires acondicion*>15k" in DEFAULT_RS_SP_KEYWORDS
     assert "vrf>15k" in DEFAULT_RS_SP_KEYWORDS
     assert "climatizacion*>15k" in DEFAULT_RS_SP_KEYWORDS
+
+
+def test_negative_context_aliases_are_precise():
+    assert match_negative_keywords_in_text(
+        "Alquiler de habitaciones (hotel)",
+        DEFAULT_RS_SP_NEGATIVE_KEYWORDS,
+    ) == ["habitacion de hotel"]
+    assert match_negative_keywords_in_text(
+        "Cambio de correas del serpentín del vehículo",
+        DEFAULT_RS_SP_NEGATIVE_KEYWORDS,
+    ) == ["correa del serpentin"]
+    assert match_negative_keywords_in_text(
+        "Serpentín de aire acondicionado para hotel",
+        DEFAULT_RS_SP_NEGATIVE_KEYWORDS,
+    ) == []
+
+
+def test_summary_excludes_negative_only_in_the_positive_matching_context():
+    columns = ["titulo", "descripcion", "item_1", "precio_referencia", "enlace"]
+    rows = [
+        ["Mantenimiento automotriz", "Servicio", "Aire acondicionado", "20000", "vehicle"],
+        ["Sistema del edificio", "Servicio", "Aire acondicionado central", "20000", "building"],
+    ]
+    result = summarize_keyword_rows(
+        rows=rows,
+        cols=columns,
+        keyword_terms=["aire acondicionado*>15k"],
+        negative_terms=DEFAULT_RS_SP_NEGATIVE_KEYWORDS,
+        source_sheet="cl_abiertas",
+        job_name="clv",
+    )
+    assert result is not None
+    assert result["count"] == 1
+    assert result["rows"][0]["enlace"] == "building"
+
+
+def test_negative_helper_ignores_unrelated_nonmatching_fields():
+    assert negative_keywords_in_matching_context(
+        title="Proyecto fotovoltaico",
+        matched_field_values=["Paneles fotovoltaicos"],
+        negative_keywords=DEFAULT_RS_SP_NEGATIVE_KEYWORDS,
+    ) == []

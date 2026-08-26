@@ -55,8 +55,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from common.keyword_watch import (  # noqa: E402
+    DEFAULT_RS_SP_NEGATIVE_KEYWORDS as SHARED_RS_SP_DEFAULT_NEGATIVE_KEYWORDS,
     DEFAULT_RS_SP_KEYWORDS as SHARED_RS_SP_DEFAULT_KEYWORDS,
     match_keywords_in_text as shared_match_keywords_in_text,
+    negative_keywords_in_matching_context as shared_negative_keywords_in_matching_context,
     normalize_keyword_term as shared_normalize_keyword_term,
 )
 
@@ -181,6 +183,7 @@ PANAMACOMPRA_SPREADSHEET_ID = os.environ.get(
 )
 PANAMACOMPRA_CT_RIR_FICHAS_SHEET = "ct_rir_fichas"
 PANAMACOMPRA_RS_SP_KEYWORDS_SHEET = "pc_palabras_clave"
+PANAMACOMPRA_RS_SP_NEGATIVE_KEYWORDS_SHEET = "pc_palabras_negativas"
 PANAMACOMPRA_CT_RIR_DIRECT_SHEETS = {
     "cl_abiertas_ct_rir",
     "cl_prog_ct_rir",
@@ -212,6 +215,7 @@ PANAMACOMPRA_RS_SP_SCAN_SHEETS = [
     "ap_con_ct",
 ]
 PANAMACOMPRA_DEFAULT_RS_SP_KEYWORDS = SHARED_RS_SP_DEFAULT_KEYWORDS
+PANAMACOMPRA_DEFAULT_RS_SP_NEGATIVE_KEYWORDS = SHARED_RS_SP_DEFAULT_NEGATIVE_KEYWORDS
 
 
 class SingleInstanceRunningError(RuntimeError):
@@ -789,6 +793,33 @@ def _load_rs_sp_keywords_for_notifications() -> list[str]:
     return out
 
 
+def _load_rs_sp_negative_keywords_for_notifications() -> list[str]:
+    values = _read_panamacompra_sheet(
+        PANAMACOMPRA_RS_SP_NEGATIVE_KEYWORDS_SHEET
+    )
+    if not values:
+        return [
+            _normalize_keyword_term(term)
+            for term in PANAMACOMPRA_DEFAULT_RS_SP_NEGATIVE_KEYWORDS
+            if _normalize_keyword_term(term)
+        ]
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in values:
+        if not row:
+            continue
+        token = _normalize_keyword_term(row[0])
+        if token and token not in seen:
+            seen.add(token)
+            out.append(token)
+    if out and out[0] == "palabra clave":
+        out = out[1:]
+    # Una hoja existente con solo encabezado representa una lista vacia
+    # elegida por el usuario; no se restauran defaults silenciosamente.
+    return out
+
+
 def _match_keywords_in_text(
     text: object,
     keywords: list[str],
@@ -858,6 +889,7 @@ def _scan_ct_rir_candidates() -> list[dict[str, object]]:
 
 def _scan_rs_sp_candidates() -> list[dict[str, object]]:
     keywords = _load_rs_sp_keywords_for_notifications()
+    negative_keywords = _load_rs_sp_negative_keywords_for_notifications()
     if not keywords:
         return []
 
@@ -883,13 +915,28 @@ def _scan_rs_sp_candidates() -> list[dict[str, object]]:
             if not titulo and not enlace:
                 continue
 
-            text_parts = [_row_value(row, mapping, key) for key in text_keys]
-            matched = _match_keywords_in_text(
-                " ".join(text_parts),
-                keywords,
-                reference_amount=precio,
-            )
+            matched: list[str] = []
+            matched_field_values: list[str] = []
+            for key in text_keys:
+                field_value = _row_value(row, mapping, key)
+                field_matches = _match_keywords_in_text(
+                    field_value,
+                    keywords,
+                    reference_amount=precio,
+                )
+                if not field_matches:
+                    continue
+                matched_field_values.append(field_value)
+                for term in field_matches:
+                    if term not in matched:
+                        matched.append(term)
             if not matched:
+                continue
+            if shared_negative_keywords_in_matching_context(
+                title=titulo,
+                matched_field_values=matched_field_values,
+                negative_keywords=negative_keywords,
+            ):
                 continue
 
             entry = {

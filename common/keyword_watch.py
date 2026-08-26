@@ -46,13 +46,35 @@ HVAC_OVER_15K_KEYWORDS = (
     "bomba de calor>15k",
     "climatizacion*>15k",
 )
-KEYWORD_RULES_VERSION = 2
+KEYWORD_RULES_VERSION = 3
 DEFAULT_RS_SP_KEYWORDS = (
     "chiller",
     "york",
     "daikin",
     *HVAC_OVER_15K_KEYWORDS,
 )
+DEFAULT_RS_SP_NEGATIVE_KEYWORDS = (
+    "automotriz",
+    "habitacion de hotel",
+    "bloqueador solar",
+    "protector solar",
+    "oracle solaris",
+    "correa del serpentin",
+)
+_NEGATIVE_KEYWORD_ALIASES = {
+    "habitacion de hotel": (
+        "habitacion de hotel",
+        "habitaciones de hotel",
+        "habitacion hotel",
+        "habitaciones hotel",
+    ),
+    "correa del serpentin": (
+        "correa del serpentin",
+        "correas del serpentin",
+        "correa de serpentin",
+        "correas de serpentin",
+    ),
+}
 _AMOUNT_SUFFIX_RE = re.compile(
     r"^(?P<term>.*?)\s*>\s*(?:usd|us\$|b/?\.?|\$)?\s*"
     r"(?P<amount>[0-9][0-9.,\s]*)\s*(?P<unit>[km]?)\s*$",
@@ -248,11 +270,60 @@ def match_keywords_in_text(
     return matches
 
 
+def match_negative_keywords_in_text(
+    text: object,
+    negative_keywords: Iterable[object],
+) -> list[str]:
+    normalized_text = _normalize_text(text)
+    if not normalized_text:
+        return []
+
+    matches: list[str] = []
+    seen: set[str] = set()
+    for raw_keyword in negative_keywords:
+        rule = parse_keyword_rule(raw_keyword)
+        if rule is None:
+            continue
+        variants = _NEGATIVE_KEYWORD_ALIASES.get(rule.term, (rule.term,))
+        if not any(
+            (pattern := _compiled_keyword_pattern(variant)) is not None
+            and pattern.search(normalized_text)
+            for variant in variants
+        ):
+            continue
+        if rule.canonical not in seen:
+            seen.add(rule.canonical)
+            matches.append(rule.canonical)
+    return matches
+
+
+def negative_keywords_in_matching_context(
+    *,
+    title: object,
+    matched_field_values: Iterable[object],
+    negative_keywords: Iterable[object],
+) -> list[str]:
+    configured = [
+        normalize_keyword_term(term)
+        for term in negative_keywords
+        if normalize_keyword_term(term)
+    ]
+    matches: list[str] = []
+    seen: set[str] = set()
+    for context in (title, *tuple(matched_field_values)):
+        for term in match_negative_keywords_in_text(context, configured):
+            if term not in seen:
+                seen.add(term)
+                matches.append(term)
+    return matches
+
+
 def summarize_keyword_rows(
     *,
     rows: list[list[object]],
     cols: list[str],
     keyword_terms: Iterable[object],
+    negative_terms: Iterable[object] = (),
     source_sheet: str,
     job_name: str,
     preview_limit: int = 100,
@@ -291,19 +362,35 @@ def summarize_keyword_rows(
     preview_rows: list[dict[str, object]] = []
     match_count = 0
     for row in rows:
-        parts: list[str] = []
+        matched: list[str] = []
+        matched_field_values: list[str] = []
         for col in text_columns:
             idx = col_idx.get(col, -1)
             if idx >= 0 and idx < len(row):
-                parts.append(str(row[idx] or ""))
+                field_value = str(row[idx] or "")
+                field_matches = match_keywords_in_text(
+                    field_value,
+                    normalized_terms,
+                    reference_amount=(
+                        row[col_idx.get(price_column, -1)]
+                        if 0 <= col_idx.get(price_column, -1) < len(row)
+                        else None
+                    ),
+                )
+                if field_matches:
+                    matched_field_values.append(field_value)
+                    for term in field_matches:
+                        if term not in matched:
+                            matched.append(term)
         price_idx = col_idx.get(price_column, -1)
         reference_amount = row[price_idx] if 0 <= price_idx < len(row) else None
-        matched = match_keywords_in_text(
-            " ".join(parts),
-            normalized_terms,
-            reference_amount=reference_amount,
-        )
         if not matched:
+            continue
+        if negative_keywords_in_matching_context(
+            title=row_text(row, "titulo"),
+            matched_field_values=matched_field_values,
+            negative_keywords=negative_terms,
+        ):
             continue
         match_count += 1
         if len(preview_rows) >= preview_limit:
