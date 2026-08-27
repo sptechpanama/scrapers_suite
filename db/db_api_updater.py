@@ -66,6 +66,7 @@ DEFAULT_WORKERS = 12
 DEFAULT_BACKUP_KEEP = 4
 API_TIMEOUT = (10, 60)
 STATES = {1011: "Adjudicado", 16: "Desierto"}
+RESULT_ENRICHMENT_VERSION = "2026-08-26-actas-v1"
 
 BASE_COLUMNS = {
     "fecha_actualizacion": "TEXT",
@@ -93,6 +94,10 @@ BASE_COLUMNS = {
     "fecha_adjudicacion": "TEXT",
     "total_items_ofertados": "TEXT",
     "num_participantes": "TEXT",
+    "proponentes_json": "TEXT",
+    "ganadores_json": "TEXT",
+    "resultado_fuente_version": "TEXT",
+    "resultado_fuente_estado": "TEXT",
 }
 
 _thread_local = threading.local()
@@ -652,6 +657,10 @@ def fallback_row(record: dict[str, Any], state_name: str, run_stamp: str, matche
         "fecha_adjudicacion": state_date if state_name == "Adjudicado" else "",
         "total_items_ofertados": "",
         "num_participantes": "",
+        "proponentes_json": "[]",
+        "ganadores_json": "[]",
+        "resultado_fuente_version": "",
+        "resultado_fuente_estado": "detalle_principal_fallido",
     }
     row.update(classification)
     return row
@@ -668,6 +677,181 @@ def _component_rows(component: dict[str, Any]) -> list[dict[str, Any]]:
             if isinstance(nested, list):
                 return [item for item in nested if isinstance(item, dict)]
     return []
+
+
+def _nested_dicts(value: Any) -> Iterable[dict[str, Any]]:
+    """Recorre contenedores variables de las actas sin asumir una sola forma."""
+
+    if isinstance(value, dict):
+        yield value
+        for nested in value.values():
+            yield from _nested_dicts(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _nested_dicts(nested)
+
+
+def _offer_name(value: dict[str, Any]) -> str:
+    company = value.get("empresa") if isinstance(value.get("empresa"), dict) else {}
+    return str(
+        company.get("nombreComercial")
+        or company.get("razonSocial")
+        or value.get("nombreComercial")
+        or value.get("razonSocial")
+        or value.get("nombreProponente")
+        or value.get("proveedor")
+        or ""
+    ).strip()
+
+
+def _offer_ruc(value: dict[str, Any]) -> str:
+    company = value.get("empresa") if isinstance(value.get("empresa"), dict) else {}
+    return str(company.get("ruc") or value.get("ruc") or "").strip()
+
+
+def _offer_amount(value: dict[str, Any]) -> float:
+    direct = _first_money(
+        value,
+        ("nuevoPrecioTotal", "precioTotal", "montoTotal", "totalOferta", "total"),
+    )
+    if direct is not None:
+        return round(float(direct), 2)
+
+    offered_items = value.get("procesosOfertasItems")
+    if isinstance(offered_items, list):
+        total = 0.0
+        found = False
+        for item in offered_items:
+            if not isinstance(item, dict):
+                continue
+            amount = _first_money(
+                item,
+                ("nuevoPrecioTotal", "precioTotal", "montoTotal", "total"),
+            )
+            if amount is not None:
+                total += float(amount)
+                found = True
+        if found:
+            return round(total, 2)
+    return 0.0
+
+
+def _offers_from_components(
+    components: Iterable[dict[str, Any]],
+    component_types: set[str],
+    *,
+    source: str,
+) -> list[dict[str, Any]]:
+    offers: list[dict[str, Any]] = []
+    normalized_types = {normalize_text(value).replace(" ", "") for value in component_types}
+    for component in components:
+        component_type = normalize_text(component.get("tipo")).replace(" ", "")
+        if component_type not in normalized_types:
+            continue
+        for candidate in _nested_dicts(component.get("value")):
+            name = _offer_name(candidate)
+            if not name:
+                continue
+            # Evita materializar el subobjeto ``empresa`` ademas de su oferta.
+            if set(candidate).issubset({"nombreComercial", "razonSocial", "ruc"}):
+                continue
+            offers.append(
+                {
+                    "nombre": name,
+                    "ruc": _offer_ruc(candidate),
+                    "monto": _offer_amount(candidate),
+                    "fuente": source,
+                }
+            )
+    return offers
+
+
+def _dedupe_offers(values: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Consolida la misma empresa repetida en apertura y adjudicacion."""
+
+    result: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for value in values:
+        name = str(value.get("nombre") or "").strip()
+        key = normalize_text(name)
+        if not key:
+            continue
+        if key not in result:
+            result[key] = dict(value)
+            order.append(key)
+            continue
+        current = result[key]
+        if float(value.get("monto") or 0.0) > float(current.get("monto") or 0.0):
+            current["monto"] = float(value.get("monto") or 0.0)
+        if not current.get("ruc") and value.get("ruc"):
+            current["ruc"] = value.get("ruc")
+        sources = {
+            item.strip()
+            for item in f"{current.get('fuente', '')},{value.get('fuente', '')}".split(",")
+            if item.strip()
+        }
+        current["fuente"] = ",".join(sorted(sources))
+    return [result[key] for key in order]
+
+
+def _official_result_pages(
+    components: list[dict[str, Any]],
+    *,
+    tipo: int,
+    flow: int,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Carga apertura/adjudicacion, donde Panama Compra guarda el resultado real.
+
+    Algunos LP/CM no publican proponentes ni adjudicatarios en la pantalla
+    principal. Las rutas oficiales vienen declaradas en
+    ``componentProcesosActasPliego`` y se consumen con el mismo contrato usado
+    por el frontend. Un fallo temporal no elimina el detalle principal: la
+    version de enriquecimiento queda pendiente para reintentarlo.
+    """
+
+    actas = [
+        item
+        for component in components
+        if normalize_text(component.get("tipo")).replace(" ", "")
+        == "componentprocesosactaspliego"
+        for item in _component_rows(component)
+    ]
+    requests_to_make: list[tuple[str, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for acta in actas:
+        route = str(acta.get("rutaNueva") or "").strip()
+        route_norm = normalize_text(f"{route} {acta.get('nombre', '')}")
+        if not route or not any(
+            token in route_norm
+            for token in ("acta apertura", "ver acta apertura", "adjudicacion")
+        ):
+            continue
+        payload = dict(acta.get("paramsBody") or {})
+        payload["idTipoProceso"] = tipo
+        payload["idProcesosContratacionFlujos"] = flow
+        key = f"{route}|{json.dumps(payload, sort_keys=True, default=str)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        requests_to_make.append((route, payload))
+
+    result_components: list[dict[str, Any]] = []
+    failures = 0
+    for route, payload in requests_to_make:
+        endpoint = f"{API_ROOT}{route.rstrip('/')}"
+        if not endpoint.endswith("/get-page"):
+            endpoint += "/get-page"
+        try:
+            page = request_json("POST", endpoint, payload=payload).get("result") or {}
+            result_components.extend(
+                item
+                for item in (page.get("pageComponentes") or [])
+                if isinstance(item, dict)
+            )
+        except Exception as exc:
+            failures += 1
+            log("ACTA_WARN", f"flujo={flow} ruta={route}: {exc}")
+    return result_components, len(requests_to_make), failures
 
 
 def _item_description(item: dict[str, Any]) -> str:
@@ -771,7 +955,6 @@ def parse_detail(
     labels = _component_labels(components)
 
     items: list[dict[str, Any]] = []
-    offers: list[dict[str, Any]] = []
     actas: list[dict[str, Any]] = []
     for component in components:
         component_type = str(component.get("tipo") or "")
@@ -779,10 +962,15 @@ def parse_detail(
         rows = _component_rows(component)
         if component_type_normalized in {"componentitems", "componentitemspliego"}:
             items.extend(rows)
-        elif component_type == "componentOfertasAdjudicadasProponentes":
-            offers.extend(rows)
-        elif component_type == "componentProcesosActasPliego":
+        elif component_type_normalized == "componentprocesosactaspliego":
             actas.extend(rows)
+
+    result_components, result_routes, result_failures = _official_result_pages(
+        components,
+        tipo=tipo,
+        flow=flow,
+    )
+    all_result_components = [*components, *result_components]
 
     title = _label(labels, "Título") or str(record.get("titulo") or "").strip()
     description = _label(labels, "Descripción") or str(record.get("observaciones") or "").strip()
@@ -799,23 +987,26 @@ def parse_detail(
         {"titulo": title, "descripcion": description, **item_fields}
     )
 
-    proponentes: list[tuple[str, float]] = []
-    for offer in offers:
-        company = offer.get("empresa") if isinstance(offer.get("empresa"), dict) else {}
-        name = str(
-            company.get("nombreComercial")
-            or company.get("razonSocial")
-            or offer.get("nombreComercial")
-            or ""
-        ).strip()
-        total = 0.0
-        for offered_item in offer.get("procesosOfertasItems") or []:
-            if isinstance(offered_item, dict):
-                amount = money_number(offered_item.get("precioTotal"))
-                if amount is not None:
-                    total += amount
-        if name:
-            proponentes.append((name, round(total, 2)))
+    winners = _dedupe_offers(
+        _offers_from_components(
+            all_result_components,
+            {"componentOfertasAdjudicadasProponentes"},
+            source="adjudicacion_oficial",
+        )
+    )
+    participants = _dedupe_offers(
+        [
+            *_offers_from_components(
+                all_result_components,
+                {
+                    "componentProcesosActasCuadroCotizacionesOR",
+                    "componentProcesosActasCuadroCotizacionesOD",
+                },
+                source="acta_apertura",
+            ),
+            *winners,
+        ]
+    )
 
     award_date = ""
     for acta in actas:
@@ -839,6 +1030,31 @@ def parse_detail(
     publication = _label(labels, "Fecha de Publicación") or record.get("fechaPublicacion")
     reason = _label(labels, "Razón Social")
     commercial = _label(labels, "Nombre Comercial")
+    if state_name == "Desierto":
+        # Una propuesta residual no convierte un acto desierto en adjudicado.
+        reason = ""
+        commercial = ""
+        winners = []
+    elif winners:
+        commercial = str(winners[0].get("nombre") or commercial).strip()
+        reason = reason or commercial
+
+    winner_total = round(sum(float(value.get("monto") or 0.0) for value in winners), 2)
+    result_complete = result_failures == 0 and (
+        state_name == "Desierto"
+        or bool(winners)
+        or bool(reason or commercial)
+    )
+    if result_failures:
+        result_status = "actas_con_error_temporal"
+    elif result_complete:
+        result_status = (
+            "completo_actas_oficiales"
+            if result_routes
+            else "completo_detalle_principal"
+        )
+    else:
+        result_status = "adjudicatario_pendiente"
     row: dict[str, Any] = {
         "fecha_actualizacion": run_stamp,
         "publicacion": format_date(publication),
@@ -855,22 +1071,42 @@ def parse_detail(
         "source_flow_id": str(flow),
         "source_tipo_proceso": str(tipo),
         "source_record_json": json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str),
-        "razon_social": reason or (proponentes[0][0] if proponentes else ""),
-        "nombre_comercial": commercial or (proponentes[0][0] if proponentes else ""),
+        "razon_social": reason,
+        "nombre_comercial": commercial,
         "fecha_adjudicacion": award_date,
-        "total_items_ofertados": f"{proponentes[0][1]:.2f}" if proponentes else "",
-        "num_participantes": str(len(proponentes)) if offers else "0",
+        "total_items_ofertados": f"{winner_total:.2f}" if winners else "",
+        "num_participantes": str(len(participants)),
+        "proponentes_json": json.dumps(
+            participants,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        "ganadores_json": json.dumps(
+            winners,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        "resultado_fuente_version": RESULT_ENRICHMENT_VERSION if result_complete else "",
+        "resultado_fuente_estado": result_status,
     }
     row.update(classification)
-    for index, (name, amount) in enumerate(proponentes, 1):
-        row[f"Proponente {index}"] = name
-        row[f"Precio Proponente {index}"] = f"{amount:.2f}"
+    for index, participant in enumerate(participants, 1):
+        row[f"Proponente {index}"] = str(participant.get("nombre") or "")
+        row[f"Precio Proponente {index}"] = (
+            f"{float(participant.get('monto') or 0.0):.2f}"
+        )
     return row
 
 
 def ensure_columns(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> list[str]:
     existing = {row[1] for row in conn.execute("PRAGMA table_info(actos_publicos)")}
-    wanted = set(BASE_COLUMNS)
+    # Incluye las columnas dinamicas ya existentes para limpiar propuestas
+    # obsoletas cuando una reconciliacion devuelve menos participantes.
+    wanted = set(BASE_COLUMNS) | {
+        column
+        for column in existing
+        if re.fullmatch(r"(?:Proponente|Precio Proponente) \d+", column)
+    }
     for row in rows:
         wanted.update(
             key
@@ -1164,13 +1400,14 @@ def filter_new_records(records: list[dict[str, Any]]) -> tuple[list[dict[str, An
 
     La API filtra por fecha de publicación, no por fecha de adjudicación. Por
     eso cada corrida vuelve a listar una ventana histórica amplia, pero solo
-    descarga el detalle costoso cuando el enlace no existe, quedó fallido o
-    cambió entre ``Desierto`` y ``Adjudicado``.
+    descarga el detalle costoso cuando el enlace no existe, quedó fallido,
+    cambió entre ``Desierto`` y ``Adjudicado`` o aún carece del resultado
+    oficial enriquecido (participantes/ganadores de las actas).
     """
     if not records:
         return [], 0
     links = [process_link(record) for record in records]
-    existing_states: dict[str, str] = {}
+    existing_details: dict[str, dict[str, str]] = {}
     with connect_db() as conn:
         # Un enlace con detalle fallido ya existe por el fallback básico. Debe
         # volver a procesarse hasta completar el detalle, no quedar omitido para
@@ -1178,26 +1415,73 @@ def filter_new_records(records: list[dict[str, Any]]) -> tuple[list[dict[str, An
         failed_flows = {
             int(row[0]) for row in conn.execute("SELECT flow_id FROM db_failed_processes")
         }
+        table_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(actos_publicos)")
+        }
+        first_proponent_expr = (
+            'COALESCE("Proponente 1",\'\')'
+            if "Proponente 1" in table_columns
+            else "''"
+        )
         for offset in range(0, len(links), 800):
             chunk = links[offset : offset + 800]
             placeholders = ",".join("?" for _ in chunk)
-            existing_states.update(
-                (str(row[0]), normalize_text(row[1]))
-                for row in conn.execute(
-                    f"SELECT enlace,estado FROM actos_publicos WHERE enlace IN ({placeholders})", chunk
-                )
+            query = (
+                "SELECT enlace,estado,resultado_fuente_version,razon_social,"
+                "nombre_comercial,proponentes_json,ganadores_json,"
+                "resultado_fuente_estado,"
+                f"{first_proponent_expr} AS first_proponent "
+                f"FROM actos_publicos WHERE enlace IN ({placeholders})"
             )
+            for row in conn.execute(query, chunk):
+                existing_details[str(row[0])] = {
+                    "estado": normalize_text(row[1]),
+                    "version": str(row[2] or "").strip(),
+                    "razon_social": str(row[3] or "").strip(),
+                    "nombre_comercial": str(row[4] or "").strip(),
+                    "proponentes_json": str(row[5] or "").strip(),
+                    "ganadores_json": str(row[6] or "").strip(),
+                    "resultado_fuente_estado": str(row[7] or "").strip(),
+                    "first_proponent": str(row[8] or "").strip(),
+                }
     selected: list[dict[str, Any]] = []
     for record, link in zip(records, links):
         flow = int(record.get("idProcesosContratacionFlujos") or 0)
         target_state = normalize_text(
             record.get("_target_state") or record.get("nombreRealizado") or ""
         )
-        existing_state = existing_states.get(link)
+        existing = existing_details.get(link)
+        existing_state = existing.get("estado") if existing else None
+        has_participant = bool(
+            existing
+            and (
+                existing.get("first_proponent")
+                or existing.get("proponentes_json") not in {"", "[]", "null"}
+            )
+        )
+        has_winner = bool(
+            existing
+            and (
+                existing.get("razon_social")
+                or existing.get("nombre_comercial")
+                or existing.get("ganadores_json") not in {"", "[]", "null"}
+            )
+        )
+        needs_result_enrichment = bool(
+            existing
+            and existing.get("version") != RESULT_ENRICHMENT_VERSION
+            and (
+                not has_participant
+                or (target_state == "adjudicado" and not has_winner)
+                or existing.get("resultado_fuente_estado")
+                == "actas_con_error_temporal"
+            )
+        )
         if (
-            existing_state is None
+            existing is None
             or flow in failed_flows
             or (target_state and target_state != existing_state)
+            or needs_result_enrichment
         ):
             selected.append(record)
     return selected, len(records) - len(selected)

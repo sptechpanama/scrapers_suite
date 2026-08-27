@@ -66,10 +66,27 @@ def test_known_unchanged_act_is_skipped_but_state_change_is_selected(tmp_path) -
         new_record = _record(303, "Adjudicado")
         with updater.connect_db() as connection:
             connection.executemany(
-                "INSERT INTO actos_publicos(enlace,estado) VALUES(?,?)",
+                """INSERT INTO actos_publicos(
+                       enlace,estado,razon_social,proponentes_json,
+                       ganadores_json,resultado_fuente_version
+                   ) VALUES(?,?,?,?,?,?)""",
                 [
-                    (updater.process_link(adjudicated), "Adjudicado"),
-                    (updater.process_link(changed), "Desierto"),
+                    (
+                        updater.process_link(adjudicated),
+                        "Adjudicado",
+                        "GANADOR",
+                        '[{"nombre":"GANADOR","monto":100}]',
+                        '[{"nombre":"GANADOR","monto":100}]',
+                        updater.RESULT_ENRICHMENT_VERSION,
+                    ),
+                    (
+                        updater.process_link(changed),
+                        "Desierto",
+                        "",
+                        "[]",
+                        "[]",
+                        updater.RESULT_ENRICHMENT_VERSION,
+                    ),
                 ],
             )
 
@@ -102,3 +119,35 @@ def test_failed_detail_is_retried_even_when_state_is_unchanged(tmp_path) -> None
 
     assert selected == [record]
     assert known == 0
+
+
+def test_incomplete_result_is_enriched_once(tmp_path) -> None:
+    database = tmp_path / "panamacompra.db"
+    record = _record(505, "Adjudicado")
+    with mock.patch.object(updater, "DB_PATH", database):
+        updater.init_db()
+        link = updater.process_link(record)
+        with updater.connect_db() as connection:
+            connection.execute(
+                "INSERT INTO actos_publicos(enlace,estado) VALUES(?,?)",
+                (link, "Adjudicado"),
+            )
+
+        selected, known = updater.filter_new_records([record])
+        assert selected == [record]
+        assert known == 0
+
+        with updater.connect_db() as connection:
+            connection.execute(
+                """UPDATE actos_publicos SET
+                       razon_social='RS ENGINEERING',
+                       proponentes_json='[{"nombre":"RS ENGINEERING","monto":72000}]',
+                       ganadores_json='[{"nombre":"RS ENGINEERING","monto":72000}]',
+                       resultado_fuente_version=?
+                   WHERE enlace=?""",
+                (updater.RESULT_ENRICHMENT_VERSION, link),
+            )
+
+        selected, known = updater.filter_new_records([record])
+        assert selected == []
+        assert known == 1
