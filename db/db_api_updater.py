@@ -61,6 +61,7 @@ DETAIL_ENDPOINT = (
 API_PAGE_SIZE = 5000
 DEFAULT_WINDOW_DAYS = 7
 DEFAULT_OVERLAP_DAYS = 14
+DEFAULT_TERMINAL_LOOKBACK_DAYS = 180
 DEFAULT_WORKERS = 12
 DEFAULT_BACKUP_KEEP = 4
 API_TIMEOUT = (10, 60)
@@ -1159,11 +1160,17 @@ def dedupe_records(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def filter_new_records(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
-    """Separa actos nuevos antes de solicitar sus detalles (la operación costosa)."""
+    """Selecciona actos nuevos, fallidos o cuyo estado terminal cambió.
+
+    La API filtra por fecha de publicación, no por fecha de adjudicación. Por
+    eso cada corrida vuelve a listar una ventana histórica amplia, pero solo
+    descarga el detalle costoso cuando el enlace no existe, quedó fallido o
+    cambió entre ``Desierto`` y ``Adjudicado``.
+    """
     if not records:
         return [], 0
     links = [process_link(record) for record in records]
-    existing: set[str] = set()
+    existing_states: dict[str, str] = {}
     with connect_db() as conn:
         # Un enlace con detalle fallido ya existe por el fallback básico. Debe
         # volver a procesarse hasta completar el detalle, no quedar omitido para
@@ -1174,18 +1181,25 @@ def filter_new_records(records: list[dict[str, Any]]) -> tuple[list[dict[str, An
         for offset in range(0, len(links), 800):
             chunk = links[offset : offset + 800]
             placeholders = ",".join("?" for _ in chunk)
-            existing.update(
-                row[0]
+            existing_states.update(
+                (str(row[0]), normalize_text(row[1]))
                 for row in conn.execute(
-                    f"SELECT enlace FROM actos_publicos WHERE enlace IN ({placeholders})", chunk
+                    f"SELECT enlace,estado FROM actos_publicos WHERE enlace IN ({placeholders})", chunk
                 )
             )
-    selected = [
-        record
-        for record, link in zip(records, links)
-        if link not in existing
-        or int(record.get("idProcesosContratacionFlujos") or 0) in failed_flows
-    ]
+    selected: list[dict[str, Any]] = []
+    for record, link in zip(records, links):
+        flow = int(record.get("idProcesosContratacionFlujos") or 0)
+        target_state = normalize_text(
+            record.get("_target_state") or record.get("nombreRealizado") or ""
+        )
+        existing_state = existing_states.get(link)
+        if (
+            existing_state is None
+            or flow in failed_flows
+            or (target_state and target_state != existing_state)
+        ):
+            selected.append(record)
     return selected, len(records) - len(selected)
 
 
@@ -1504,6 +1518,13 @@ def determine_range(args: argparse.Namespace) -> tuple[date, date]:
         else:
             latest = latest_source_date()
             start = (latest - timedelta(days=args.overlap_days)) if latest else date(2024, 1, 1)
+        # Un acto puede publicarse hoy y adjudicarse varias semanas después.
+        # Como la API solo permite recuperarlo por fecha de publicación, el
+        # solapamiento corto no basta. El filtro posterior evita volver a pedir
+        # detalles costosos cuando el acto y su estado no cambiaron.
+        terminal_lookback_days = max(0, int(args.terminal_lookback_days))
+        if terminal_lookback_days:
+            start = min(start, end - timedelta(days=terminal_lookback_days))
     if start > end:
         start = max(end - timedelta(days=args.overlap_days), date(2024, 1, 1))
     return start, end
@@ -1515,6 +1536,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--to-date", default=os.environ.get("DB_UPDATE_TO", ""), help="YYYY-MM-DD inclusivo")
     parser.add_argument("--window-days", type=int, default=int(os.environ.get("DB_UPDATE_WINDOW_DAYS", DEFAULT_WINDOW_DAYS)))
     parser.add_argument("--overlap-days", type=int, default=int(os.environ.get("DB_UPDATE_OVERLAP_DAYS", DEFAULT_OVERLAP_DAYS)))
+    parser.add_argument(
+        "--terminal-lookback-days",
+        type=int,
+        default=int(
+            os.environ.get(
+                "DB_UPDATE_TERMINAL_LOOKBACK_DAYS",
+                DEFAULT_TERMINAL_LOOKBACK_DAYS,
+            )
+        ),
+        help=(
+            "Días de publicaciones anteriores que se vuelven a listar para "
+            "capturar adjudicaciones/desiertos tardíos; 0 desactiva la barrera"
+        ),
+    )
     parser.add_argument("--workers", type=int, default=int(os.environ.get("DB_UPDATE_WORKERS", DEFAULT_WORKERS)))
     parser.add_argument("--skip-publish", action="store_true")
     parser.add_argument("--skip-drive", action="store_true")

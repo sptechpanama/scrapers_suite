@@ -29,6 +29,18 @@ def test_weekly_command_reclassifies_and_republishes_everything() -> None:
     assert "--require-postgres" in command
     assert "--force-reclassify" in command
     assert "--postgres-full" in command
+    assert "--from-date" in command
+    assert command[command.index("--from-date") + 1] == "2024-01-01"
+
+
+def test_weekly_historical_start_can_be_configured() -> None:
+    with mock.patch.dict(
+        os.environ,
+        {"DB_FULL_RECONCILE_FROM": "2025-01-01"},
+        clear=False,
+    ):
+        command = pipeline.updater_command("full")
+    assert command[command.index("--from-date") + 1] == "2025-01-01"
 
 
 def test_analytics_publication_is_mandatory() -> None:

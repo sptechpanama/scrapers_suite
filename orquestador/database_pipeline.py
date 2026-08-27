@@ -34,6 +34,7 @@ GEAPP_ROOT = Path(os.environ.get("GEAPP_ROOT", str(Path.home() / "GEAPP"))).reso
 PC_ANALYTICS_BUILDER = GEAPP_ROOT / "scripts" / "build_inteligencia_pc.py"
 PC_ANALYTICS_DB = REPO_ROOT / "data" / "db" / "inteligencia_pc.db"
 COMPONENT_PREFIX = "ORQUESTADOR_COMPONENT_STATE="
+DEFAULT_FULL_RECONCILE_FROM = "2024-01-01"
 
 
 def _now() -> datetime:
@@ -152,7 +153,17 @@ def updater_command(mode: str) -> list[str]:
         "--require-postgres",
     ]
     if mode == "full":
-        command.extend(["--force-reclassify", "--postgres-full"])
+        command.extend(
+            [
+                "--force-reclassify",
+                "--postgres-full",
+                "--from-date",
+                os.environ.get(
+                    "DB_FULL_RECONCILE_FROM",
+                    DEFAULT_FULL_RECONCILE_FROM,
+                ),
+            ]
+        )
     return command
 
 
