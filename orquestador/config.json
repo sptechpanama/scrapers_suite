@@ -75,6 +75,17 @@
                      ]
                  },
                  {
+                     "name": "otras_fuentes",
+                     "python": "C:/Users/rodri/scrapers_repo/.venv/Scripts/python.exe",
+                     "script": "C:/Users/rodri/scrapers_repo/orquestador/run_otras_fuentes.py",
+                     "days_of_week": [
+                         "mon", "tue", "wed", "thu", "fri", "sat", "sun"
+                     ],
+                     "times": [
+                         "06:20", "12:20", "18:20"
+                     ]
+                 },
+                 {
                      "name": "cotizacion_panama",
                      "python": "C:/Users/rodri/scrapers_repo/.venv/Scripts/python.exe",
                      "script": "C:/Users/rodri/selenium_cotizacion/cotizacion_worker.py",

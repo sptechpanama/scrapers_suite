@@ -122,6 +122,7 @@ JOB_TIMEOUT_SECONDS_DEFAULTS = {
     "cotizacion_panama": 1200,
     "sunday_db_minsa": 14400,
     "ctni": 7200,
+    "otras_fuentes": 3600,
 }
 
 JOB_STARTUP_CATCHUP_SECONDS_DEFAULTS = {
@@ -131,6 +132,7 @@ JOB_STARTUP_CATCHUP_SECONDS_DEFAULTS = {
 REQUIRED_FALLBACK_JOB_NAMES = {
     "sunday_db_minsa",
     "ctni",
+    "otras_fuentes",
 }
 
 MAX_QUEUE_LOG_ITEMS = 12
@@ -165,6 +167,7 @@ JOB_NAME_LABELS = {
     "rir1": "Licitaciones",
     "sunday_db_minsa": "Base PanamáCompra + MINSA",
     "ctni": "Monitor CTNI",
+    "otras_fuentes": "Otras fuentes",
     "intel_estudio_ficha": "Estudio de ficha (Inteligencia CT)",
 }
 
@@ -559,6 +562,22 @@ def _extract_ctni_summary(stdout: str) -> Optional[Dict[str, object]]:
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
+def _extract_otras_fuentes_summary(stdout: str) -> Optional[Dict[str, object]]:
+    if not stdout:
+        return None
+    for line in stdout.splitlines()[::-1]:
+        line = line.strip()
+        if not line.startswith("OTRAS_FUENTES_SUMMARY_JSON="):
+            continue
+        raw = line.split("OTRAS_FUENTES_SUMMARY_JSON=", 1)[-1].strip()
+        try:
+            payload = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
             return None
         return payload if isinstance(payload, dict) else None
     return None
@@ -1344,6 +1363,67 @@ def _process_ctni_notifications(job_name: str, stdout: str, finished_at: datetim
         logging.warning("No se pudo enviar correo CTNI: %s", detail or "sin detalle")
 
 
+def _process_otras_fuentes_notifications(job_name: str, stdout: str, finished_at: datetime) -> None:
+    """Envía una sola alerta deduplicada por los eventos relevantes de la corrida."""
+    if job_name != "otras_fuentes":
+        return
+    summary = _extract_otras_fuentes_summary(stdout)
+    events = summary.get("events", []) if isinstance(summary, dict) else []
+    if not isinstance(events, list) or not events:
+        return
+
+    state = load_state()
+    sent_keys = state.setdefault("otras_fuentes_email_sent_keys", {})
+    fresh = [
+        event for event in events
+        if isinstance(event, dict)
+        and str(event.get("id") or "").strip()
+        and str(event.get("id") or "").strip() not in sent_keys
+    ]
+    if not fresh:
+        return
+    sender, password, recipients = _ctni_email_config()
+    if not sender or not password or not recipients:
+        logging.warning("No se envió correo Otras fuentes: configuración incompleta")
+        return
+
+    lines = ["Se detectaron oportunidades nuevas o modificadas en fuentes externas.", ""]
+    for index, event in enumerate(fresh, start=1):
+        lines.extend(
+            [
+                f"{index}. {event.get('title') or 'Oportunidad'}",
+                f"   Fuente: {event.get('source', '')}",
+                f"   Evento: {event.get('event_type', '')}",
+                f"   Empresa objetivo: {event.get('matched_company', '')}",
+                f"   Prioridad: {event.get('priority', '')} | Score: {event.get('fit_score', '')}",
+                f"   Fecha límite: {event.get('deadline', '')}",
+                f"   Enlace: {event.get('source_url', '')}",
+                "",
+            ]
+        )
+    msg = EmailMessage()
+    msg["Subject"] = f"Otras fuentes: {len(fresh)} oportunidad(es) - {finished_at:%Y-%m-%d %H:%M}"
+    msg["From"] = sender
+    msg["To"] = ", ".join(recipients)
+    msg.set_content("\n".join(lines).strip() + "\n")
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context, timeout=30) as server:
+        server.login(sender, password)
+        server.send_message(msg)
+
+    sent_at = finished_at.isoformat(timespec="seconds")
+    for event in fresh:
+        sent_keys[str(event.get("id"))] = sent_at
+    if len(sent_keys) > 10000:
+        kept = sorted(sent_keys, key=lambda key: sent_keys[key])[-6000:]
+        state["otras_fuentes_email_sent_keys"] = {key: sent_keys[key] for key in kept}
+    state["otras_fuentes_email_last_sent"] = {
+        "count": len(fresh), "sent_at": sent_at, "recipients": recipients,
+    }
+    save_state(state)
+    logging.info("Correo Otras fuentes enviado con %s oportunidad(es)", len(fresh))
+
+
 def _queue_scan_based_notifications(job_name: str, module_name: str, finished_at: datetime) -> int:
     scanner = _scan_ct_rir_candidates if module_name == "ct_rir" else _scan_rs_sp_candidates
     unique_builder = _build_ct_rir_unique_key if module_name == "ct_rir" else _build_rs_sp_unique_key
@@ -1872,6 +1952,11 @@ def run_job(job: JobConfig, execution: Optional[ExecutionRequest] = None) -> tup
                     _process_ctni_notifications(job.name, stdout, end_time)
                 except Exception:  # pylint: disable=broad-except
                     logging.exception("No se pudo procesar la notificación CTNI")
+            if job.name == "otras_fuentes":
+                try:
+                    _process_otras_fuentes_notifications(job.name, stdout, end_time)
+                except Exception:  # pylint: disable=broad-except
+                    logging.exception("No se pudo procesar la notificación Otras fuentes")
             update_last_run(job.name, "success", started_at=start_time, finished_at=end_time)
             return "success", ""
         else:
@@ -2237,6 +2322,11 @@ def run_job_interruptible(
                     _process_ctni_notifications(job.name, result.stdout, end_time)
                 except Exception:  # pylint: disable=broad-except
                     logging.exception("No se pudo procesar la notificación CTNI")
+            if job.name == "otras_fuentes":
+                try:
+                    _process_otras_fuentes_notifications(job.name, result.stdout, end_time)
+                except Exception:  # pylint: disable=broad-except
+                    logging.exception("No se pudo procesar la notificación Otras fuentes")
             update_last_run(job.name, "success", started_at=start_time, finished_at=end_time)
             return "success", ""
 

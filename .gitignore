@@ -9,3 +9,4 @@ orquestador/pure-beach-474203-p1-fdc9557f33d0.json
 credentials/*.json
 data/db/*.db
 data/ctni/*.db*
+data/otras_fuentes/*.db*
