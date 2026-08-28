@@ -159,6 +159,13 @@ DEFAULT_JOB_DATA = [
         "days_of_week": ["mon", "wed", "fri"],
         "times": ["09:00"],
     },
+    {
+        "name": "otras_fuentes",
+        "python": "C:/Users/rodri/scrapers_repo/.venv/Scripts/python.exe",
+        "script": "C:/Users/rodri/scrapers_repo/orquestador/run_otras_fuentes.py",
+        "days_of_week": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+        "times": ["06:20", "12:20", "18:20"],
+    },
 ]
 
 JOB_NAME_LABELS = {
