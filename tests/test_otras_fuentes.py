@@ -14,10 +14,15 @@ from otras_fuentes.adapters import (
     EnaAdapter,
     EnsaAdapter,
     IdaanAdapter,
+    IdbAdapter,
     UngmAdapter,
+    UngmInternationalAdapter,
+    UnicefAdapter,
+    WorldBankAdapter,
 )
 from otras_fuentes.classifier import classify_opportunity
 from otras_fuentes.models import Opportunity, SourceDocument, SourceFetchResult
+from otras_fuentes.monitor import DEFAULT_ADAPTERS
 from otras_fuentes.storage import OpportunityStore
 
 
@@ -30,6 +35,14 @@ class FakeClient:
 
     def post(self, *_args, **_kwargs):
         return SimpleNamespace(response=self.response)
+
+
+def test_monitor_registers_all_sources_once():
+    sources = [adapter.source for adapter in DEFAULT_ADAPTERS]
+    assert len(sources) == len(set(sources)) == 11
+    assert {"idb", "world_bank", "ungm", "ungm_international", "unicef"}.issubset(
+        sources
+    )
 
 
 @pytest.mark.parametrize(
@@ -83,6 +96,7 @@ def test_ungm_and_ciudad_saber_public_payloads_are_parsed():
     </div>"""
     ungm = UngmAdapter(client=FakeClient(text=ungm_html))
     assert ungm.fetch().opportunities[0].external_id == "987"
+    assert ungm.fetch().opportunities[0].deadline == "2026-08-30"
 
     payload = {
         "data": [
@@ -99,6 +113,155 @@ def test_ungm_and_ciudad_saber_public_payloads_are_parsed():
     }
     cds = CiudadSaberAdapter(client=FakeClient(payload=payload))
     assert cds.fetch().opportunities[0].external_id == "7"
+
+
+def test_idb_current_notice_is_mapped_and_awards_are_ignored():
+    payload = {
+        "success": True,
+        "result": {
+            "records": [
+                {
+                    "_id": 1,
+                    "noticeid": "38815",
+                    "type": "SPECIFIC",
+                    "countryname": "EL SALVADOR",
+                    "projectnumber": "ES-L1151",
+                    "proyecturl": "https://www.iadb.org/en/project/ES-L1151",
+                    "noticetitle": "Suministro de equipos médicos",
+                    "documenturl": "https://idbdocs.iadb.org/notice-38815.pdf",
+                    "projectname": "Programa hospitalario",
+                    "publicationdate": "2026-08-27 08:00:00.000000000",
+                    "deadline": "2099-09-29",
+                    "sectorenglnm": "HEALTH",
+                },
+                {
+                    "_id": 2,
+                    "noticeid": "award-1",
+                    "type": "CONTRACT AWARD",
+                    "noticetitle": "Resultado adjudicado",
+                    "deadline": "2099-09-29",
+                },
+            ]
+        },
+    }
+    result = IdbAdapter(client=FakeClient(payload=payload)).fetch()
+    assert result.status == "success"
+    assert [item.external_id for item in result.opportunities] == ["38815"]
+    assert result.opportunities[0].country == "EL SALVADOR"
+    assert result.opportunities[0].documents[0].url.endswith("notice-38815.pdf")
+
+
+def test_world_bank_current_notice_is_mapped():
+    payload = {
+        "procnotices": [
+            {
+                "id": "OP00465428",
+                "notice_type": "Invitation for Bids",
+                "noticedate": "27-Aug-2026",
+                "notice_status": "Published",
+                "submission_deadline_date": "30-Sep-2099",
+                "project_ctry_name": "Panama",
+                "project_id": "P123",
+                "project_name": "Hospital infrastructure",
+                "bid_reference_no": "PA-01",
+                "bid_description": "Medical equipment and HVAC",
+                "procurement_group": "Goods",
+                "procurement_method_name": "Request for Bids",
+                "contact_organization": "Ministry of Health",
+            }
+        ]
+    }
+    result = WorldBankAdapter(client=FakeClient(payload=payload)).fetch()
+    assert result.status == "success"
+    assert result.opportunities[0].external_id == "OP00465428"
+    assert result.opportunities[0].source_url.endswith("/OP00465428")
+    assert result.opportunities[0].deadline == "2099-09-30"
+
+
+def test_ungm_international_and_unicef_are_separate_without_duplicates():
+    generic_html = """
+    <div class="dataRow" data-noticeid="200">
+      <div class="resultTitle"><a href="/Public/Notice/200"><span class="ungm-title">Solar photovoltaic system</span></a></div>
+      <div class="tableCell">a</div><div class="tableCell">b</div><div class="tableCell">c</div>
+      <div class="tableCell">24-Aug-2026</div><div class="tableCell">UNDP</div>
+      <div class="tableCell">RFQ</div><div class="tableCell">CO-200</div><div class="tableCell">Colombia</div>
+      <div data-description="Deadline"><span>30-Aug-2099</span></div>
+    </div>"""
+    international = UngmInternationalAdapter(client=FakeClient(text=generic_html)).fetch()
+    assert international.status == "success"
+    assert [item.external_id for item in international.opportunities] == ["200"]
+    assert international.opportunities[0].source == "ungm_international"
+
+    unicef_html = generic_html.replace("data-noticeid=\"200\"", "data-noticeid=\"201\"")
+    unicef_html = unicef_html.replace("UNDP", "UNICEF")
+    unicef = UnicefAdapter(client=FakeClient(text=unicef_html)).fetch()
+    assert unicef.status == "success"
+    assert [item.external_id for item in unicef.opportunities] == ["201"]
+    assert unicef.opportunities[0].source_type == "Oportunidad UNICEF"
+
+    generic = UngmAdapter(client=FakeClient(text=unicef_html)).fetch()
+    assert generic.opportunities == []
+
+
+def test_new_international_source_gets_its_own_silent_baseline(tmp_path):
+    store = OpportunityStore.sqlite(tmp_path / "monitor.db")
+    old = SourceFetchResult(
+        source="ungm", opportunities=[_relevant("Chiller", external_id="PA-1")]
+    )
+    store.ingest_source(
+        "run-1", "2026-08-28T08:00:00+00:00", "2026-08-28T08:01:00+00:00", old
+    )
+    international = SourceFetchResult(
+        source="ungm_international",
+        opportunities=[
+            Opportunity(
+                source="ungm_international",
+                external_id="INT-1",
+                title="Medical equipment",
+                source_url="https://www.ungm.org/Public/Notice/INT-1",
+                matched_company="RIR",
+                matched_keywords=["medical equipment"],
+                priority="Alta",
+            ).normalize()
+        ],
+    )
+    stats = store.ingest_source(
+        "run-2",
+        "2026-08-28T09:00:00+00:00",
+        "2026-08-28T09:01:00+00:00",
+        international,
+    )
+    assert (stats.new, stats.events, stats.baseline_created) == (1, 0, True)
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("title", "expected_company"),
+    [
+        ("Supply of medical devices and laboratory equipment", "RIR"),
+        ("Solar photovoltaic HVAC and chilled water system", "RS/SP"),
+        ("Fornecimento de equipamento medico e material hospitalar", "RIR"),
+        ("Sistema de ar condicionado e agua gelada", "RS/SP"),
+    ],
+)
+def test_classifier_supports_international_english_and_portuguese(title, expected_company):
+    item = Opportunity(
+        source="world_bank",
+        external_id=title,
+        title=title,
+        source_url="https://example.test/notice",
+    )
+    assert expected_company in classify_opportunity(item).matched_company
+
+
+def test_hospital_alone_does_not_create_international_rir_noise():
+    item = Opportunity(
+        source="idb",
+        external_id="hospital-it",
+        title="Information technology services for hospitals",
+        source_url="https://example.test/hospital-it",
+    )
+    assert classify_opportunity(item).matched_company == ""
 
 
 def _relevant(title: str, *, external_id: str = "A-1") -> Opportunity:

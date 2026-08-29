@@ -81,6 +81,10 @@ SOURCE_NAMES = {
     "idaan": "IDAAN",
     "ena": "ENA Corredores",
     "ungm": "UN Global Marketplace",
+    "ungm_international": "UNGM regional y global",
+    "idb": "Banco Interamericano de Desarrollo",
+    "world_bank": "Banco Mundial",
+    "unicef": "UNICEF",
     "cruz_roja": "Cruz Roja Panameña",
     "ciudad_saber": "Ciudad del Saber",
 }

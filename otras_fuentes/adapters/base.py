@@ -55,6 +55,8 @@ def parse_date(value: object) -> str:
         "%d-%m-%Y",
         "%d/%m/%Y",
         "%d-%b-%Y",
+        "%d-%b-%Y %H:%M",
+        "%d-%b-%Y %H:%M:%S",
         "%a, %d %b %Y %H:%M:%S %z",
         "%d %B %Y",
     ):

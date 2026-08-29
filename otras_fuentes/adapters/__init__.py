@@ -4,7 +4,9 @@ from .cruz_roja import CruzRojaAdapter
 from .ena import EnaAdapter
 from .ensa import EnsaAdapter
 from .idaan import IdaanAdapter
-from .ungm import UngmAdapter
+from .idb import IdbAdapter
+from .ungm import UngmAdapter, UngmInternationalAdapter, UnicefAdapter
+from .world_bank import WorldBankAdapter
 
 __all__ = [
     "AcpAdapter",
@@ -13,5 +15,9 @@ __all__ = [
     "EnaAdapter",
     "EnsaAdapter",
     "IdaanAdapter",
+    "IdbAdapter",
     "UngmAdapter",
+    "UngmInternationalAdapter",
+    "UnicefAdapter",
+    "WorldBankAdapter",
 ]

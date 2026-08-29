@@ -15,7 +15,7 @@ from otras_fuentes import run_monitor
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Monitor diario de siete fuentes externas")
+    parser = argparse.ArgumentParser(description="Monitor diario de fuentes externas")
     parser.add_argument("--require-postgres", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(
@@ -30,4 +30,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

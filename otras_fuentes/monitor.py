@@ -12,7 +12,11 @@ from .adapters import (
     EnaAdapter,
     EnsaAdapter,
     IdaanAdapter,
+    IdbAdapter,
     UngmAdapter,
+    UngmInternationalAdapter,
+    UnicefAdapter,
+    WorldBankAdapter,
 )
 from .adapters.base import SourceAdapter
 from .classifier import classify_opportunity
@@ -27,6 +31,10 @@ DEFAULT_ADAPTERS: tuple[Type[SourceAdapter], ...] = (
     IdaanAdapter,
     EnaAdapter,
     UngmAdapter,
+    UngmInternationalAdapter,
+    IdbAdapter,
+    WorldBankAdapter,
+    UnicefAdapter,
     CruzRojaAdapter,
     CiudadSaberAdapter,
 )

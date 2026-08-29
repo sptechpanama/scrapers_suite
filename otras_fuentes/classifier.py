@@ -19,6 +19,10 @@ RIR_DEFAULT_KEYWORDS = (
     "dispositivos medicos",
     "equipo medico",
     "equipos medicos",
+    "equipamiento medico",
+    "suministro medico",
+    "suministros medicos",
+    "material medico",
     "insumo medico",
     "insumos medicos",
     "medico quirurgico",
@@ -28,6 +32,27 @@ RIR_DEFAULT_KEYWORDS = (
     "esterilizacion",
     "diagnostico",
     "material sanitario",
+    "insumo hospitalario",
+    "insumos hospitalarios",
+    "medical device*",
+    "medical equipment",
+    "medical suppl*",
+    "surgical suppl*",
+    "hospital equipment",
+    "laboratory equipment",
+    "reagent*",
+    "sterilization",
+    "diagnostic*",
+    "patient monitor*",
+    "anesthesia",
+    "anaesthesia",
+    "oxygen therapy",
+    "medical consumable*",
+    "biomedical equipment",
+    "dispositivo medico*",
+    "equipamento medico*",
+    "material hospitalar",
+    "insumo hospitalar",
 )
 
 RS_DEFAULT_KEYWORDS = (
@@ -36,7 +61,10 @@ RS_DEFAULT_KEYWORDS = (
     "energia solar",
     "refrigeracion",
     "agua helada",
-    "manejador* de aire",
+    "manejador de aire",
+    "manejadora de aire",
+    "manejadores de aire",
+    "manejadoras de aire",
     "vrf",
     "vrv",
     "torre de enfriamiento",
@@ -45,6 +73,28 @@ RS_DEFAULT_KEYWORDS = (
     "electromecanico*",
     "sistema electrico",
     "planta electrica",
+    "hvac",
+    "ahu",
+    "air handling unit*",
+    "chilled water",
+    "cooling tower*",
+    "chiller*",
+    "air conditioning",
+    "air conditioner*",
+    "solar pv",
+    "solar photovoltaic",
+    "photovoltaic*",
+    "electrical work*",
+    "electrical system*",
+    "generator*",
+    "genset*",
+    "water treatment",
+    "wastewater treatment",
+    "ar condicionado",
+    "agua gelada",
+    "torre de resfriamento",
+    "energia fotovoltaica",
+    "sistema eletrico",
 )
 
 
@@ -96,6 +146,13 @@ def classify_opportunity(opportunity: Opportunity) -> Opportunity:
 
     rs = list(dict.fromkeys(matches["RS/SP"]))
     rir = list(dict.fromkeys(matches["RIR"]))
+    # En los portales globales la palabra "hospital" aparece también en
+    # consultorías, obras civiles o software. Se conserva la regla histórica
+    # para las fuentes existentes, pero no basta por sí sola para clasificar
+    # una oportunidad internacional nueva como RIR.
+    if opportunity.source in {"idb", "world_bank", "ungm_international", "unicef"}:
+        if rir == ["hospital*"]:
+            rir = []
     companies = [name for name, values in (("RS/SP", rs), ("RIR", rir)) if values]
     all_matches = list(dict.fromkeys([*rs, *rir]))
     score = min(100.0, len(all_matches) * 24.0 + field_weight)
@@ -116,4 +173,3 @@ def classify_opportunity(opportunity: Opportunity) -> Opportunity:
 
 def should_alert(opportunity: Opportunity) -> bool:
     return bool(opportunity.matched_company) and opportunity.priority in {"Alta", "Media"}
-
