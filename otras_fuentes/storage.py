@@ -50,6 +50,8 @@ CREATE TABLE IF NOT EXISTS external_opportunities (
 CREATE INDEX IF NOT EXISTS idx_external_opportunities_dates ON external_opportunities(publication_date, deadline);
 CREATE INDEX IF NOT EXISTS idx_external_opportunities_source ON external_opportunities(source, last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_external_opportunities_cross ON external_opportunities(cross_source_key);
+CREATE INDEX IF NOT EXISTS idx_external_opportunities_published ON external_opportunities(publication_date DESC, first_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_external_opportunities_filters ON external_opportunities(source, status, priority, is_active);
 CREATE TABLE IF NOT EXISTS external_opportunity_documents (
     id TEXT PRIMARY KEY, opportunity_id TEXT NOT NULL, title TEXT, url TEXT NOT NULL,
     document_type TEXT, first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
