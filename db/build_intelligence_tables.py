@@ -1404,6 +1404,92 @@ def _postgres_url(explicit: str = "") -> str:
     return clean_text(explicit or os.getenv("SUPABASE_DB_URL") or os.getenv("DATABASE_URL"))
 
 
+POSTGRES_ANALYTICS_TABLES = (
+    "intel_actos_fichas",
+    "intel_acto_proponentes",
+    "intel_metricas_ficha_mes",
+    "intel_ficha_metadata",
+    "intel_ficha_catalogo",
+    "intel_build_metadata",
+)
+
+POSTGRES_ANALYTICS_INDEXES = (
+    ("ux_intel_actos_fichas", "CREATE UNIQUE INDEX IF NOT EXISTS ux_intel_actos_fichas ON intel_actos_fichas(acto_key, ficha)"),
+    ("ix_intel_iaf_ficha", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_ficha ON intel_actos_fichas(ficha)"),
+    ("ix_intel_iaf_acto_score", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_acto_score ON intel_actos_fichas(acto_key, detection_score, ficha)"),
+    ("ix_intel_iaf_publication", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_publication ON intel_actos_fichas(publication_date)"),
+    ("ix_intel_iaf_celebration", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_celebration ON intel_actos_fichas(celebration_date)"),
+    ("ix_intel_iaf_award", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_award ON intel_actos_fichas(award_date)"),
+    ("ix_intel_iaf_update", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_update ON intel_actos_fichas(update_date)"),
+    ("ix_intel_iaf_score", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_score ON intel_actos_fichas(detection_score)"),
+    ("ix_intel_iaf_estado", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_estado ON intel_actos_fichas(estado)"),
+    ("ix_intel_iaf_entidad", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_entidad ON intel_actos_fichas(entidad)"),
+    ("ix_intel_iaf_search", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_search ON intel_actos_fichas(search_text_norm)"),
+    ("ix_intel_iap_acto", "CREATE INDEX IF NOT EXISTS ix_intel_iap_acto ON intel_acto_proponentes(acto_key)"),
+    ("ix_intel_iap_provider", "CREATE INDEX IF NOT EXISTS ix_intel_iap_provider ON intel_acto_proponentes(proveedor_norm)"),
+    ("ix_intel_iap_winner", "CREATE INDEX IF NOT EXISTS ix_intel_iap_winner ON intel_acto_proponentes(is_winner)"),
+    ("ix_intel_ifm_month_profile", "CREATE INDEX IF NOT EXISTS ix_intel_ifm_month_profile ON intel_metricas_ficha_mes(period_month, detection_profile)"),
+    ("ix_intel_ifm_ficha", "CREATE INDEX IF NOT EXISTS ix_intel_ifm_ficha ON intel_metricas_ficha_mes(ficha)"),
+    ("ix_intel_ifc_ficha", "CREATE INDEX IF NOT EXISTS ix_intel_ifc_ficha ON intel_ficha_catalogo(ficha)"),
+    ("ix_intel_ifc_oferente", "CREATE INDEX IF NOT EXISTS ix_intel_ifc_oferente ON intel_ficha_catalogo(oferente)"),
+    ("ix_intel_ifmeta_ficha", "CREATE INDEX IF NOT EXISTS ix_intel_ifmeta_ficha ON intel_ficha_metadata(ficha)"),
+    ("ix_intel_ifmeta_rs", "CREATE INDEX IF NOT EXISTS ix_intel_ifmeta_rs ON intel_ficha_metadata(registro_sanitario, ficha)"),
+    ("ix_intel_ifmeta_risk", "CREATE INDEX IF NOT EXISTS ix_intel_ifmeta_risk ON intel_ficha_metadata(clase_riesgo, ficha)"),
+    ("ix_intel_ifm_search", "CREATE INDEX IF NOT EXISTS ix_intel_ifm_search ON intel_ficha_metadata(search_text_norm)"),
+)
+
+
+def ensure_postgres_analytics_indexes(
+    database_url: str,
+    *,
+    engine: Any | None = None,
+) -> dict[str, Any]:
+    """Crea y verifica índices analíticos fuera del swap de publicación.
+
+    Cada índice se confirma de manera independiente (AUTOCOMMIT). Así un
+    timeout o una interrupción no revierte los índices que ya terminaron y la
+    siguiente ejecución puede continuar exactamente donde quedó.
+    """
+    if not database_url and engine is None:
+        raise RuntimeError("No se definio SUPABASE_DB_URL/DATABASE_URL.")
+    from sqlalchemy import create_engine, text
+
+    owns_engine = engine is None
+    active_engine = engine or create_engine(
+        database_url,
+        pool_pre_ping=True,
+        pool_recycle=240,
+        connect_args={"connect_timeout": 20},
+    )
+    started = time.perf_counter()
+    try:
+        with active_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            # El plan gratuito puede necesitar más de 90 s mientras crea el
+            # primer índice. El límite aplica solo a esta sesión de mantenimiento.
+            conn.execute(text("SET statement_timeout TO 600000"))
+            for index_name, statement in POSTGRES_ANALYTICS_INDEXES:
+                _log("INDEX", f"verificando {index_name}", started)
+                conn.execute(text(statement))
+            for table in POSTGRES_ANALYTICS_TABLES[:-1]:
+                conn.execute(text(f'ANALYZE "{table}"'))
+            rows = conn.execute(
+                text(
+                    "SELECT indexname FROM pg_indexes "
+                    "WHERE schemaname = current_schema() "
+                    "AND (indexname LIKE 'ix_intel_%' OR indexname = 'ux_intel_actos_fichas')"
+                )
+            ).fetchall()
+        present = {str(row[0]) for row in rows}
+        expected = {name for name, _ in POSTGRES_ANALYTICS_INDEXES}
+        missing = sorted(expected - present)
+        if missing:
+            raise RuntimeError("Índices analíticos faltantes: " + ", ".join(missing))
+        return {"index_count": len(expected), "indexes": sorted(expected)}
+    finally:
+        if owns_engine:
+            active_engine.dispose()
+
+
 def publish_postgres(local_db: Path, database_url: str, *, batch_size: int = WRITE_CHUNK_SIZE) -> dict[str, int]:
     """Publica con tablas staging y un swap transaccional para no dejar datos parciales."""
     if not database_url:
@@ -1412,14 +1498,7 @@ def publish_postgres(local_db: Path, database_url: str, *, batch_size: int = WRI
 
     engine = create_engine(database_url, pool_pre_ping=True, pool_recycle=240, connect_args={"connect_timeout": 20})
     source = sqlite3.connect(f"file:{local_db.as_posix()}?mode=ro", uri=True)
-    table_names = [
-        "intel_actos_fichas",
-        "intel_acto_proponentes",
-        "intel_metricas_ficha_mes",
-        "intel_ficha_metadata",
-        "intel_ficha_catalogo",
-        "intel_build_metadata",
-    ]
+    table_names = list(POSTGRES_ANALYTICS_TABLES)
     uploaded: dict[str, int] = {}
     try:
         with engine.begin() as conn:
@@ -1449,22 +1528,9 @@ def publish_postgres(local_db: Path, database_url: str, *, batch_size: int = WRI
                 conn.execute(text(f'DROP TABLE IF EXISTS "{table}__old"'))
                 conn.execute(text(f'ALTER TABLE IF EXISTS "{table}" RENAME TO "{table}__old"'))
                 conn.execute(text(f'ALTER TABLE "{table}__new" RENAME TO "{table}"'))
-            conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_intel_actos_fichas ON intel_actos_fichas(acto_key, ficha)"))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_intel_iaf_ficha ON intel_actos_fichas(ficha)"))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_intel_iaf_publication ON intel_actos_fichas(publication_date)"))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_intel_iaf_celebration ON intel_actos_fichas(celebration_date)"))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_intel_iaf_award ON intel_actos_fichas(award_date)"))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_intel_iaf_update ON intel_actos_fichas(update_date)"))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_intel_iaf_score ON intel_actos_fichas(detection_score)"))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_intel_iaf_search ON intel_actos_fichas(search_text_norm)"))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_intel_iap_acto ON intel_acto_proponentes(acto_key)"))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_intel_iap_provider ON intel_acto_proponentes(proveedor_norm)"))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_intel_ifm_month_profile ON intel_metricas_ficha_mes(period_month, detection_profile)"))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_intel_ifm_ficha ON intel_metricas_ficha_mes(ficha)"))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_intel_ifc_ficha ON intel_ficha_catalogo(ficha)"))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_intel_ifm_search ON intel_ficha_metadata(search_text_norm)"))
             for table in table_names:
                 conn.execute(text(f'DROP TABLE IF EXISTS "{table}__old"'))
+        ensure_postgres_analytics_indexes(database_url, engine=engine)
         return uploaded
     finally:
         source.close()

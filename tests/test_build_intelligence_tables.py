@@ -19,6 +19,28 @@ SPEC.loader.exec_module(builder)
 
 
 class BuilderUnitTests(unittest.TestCase):
+    def test_postgres_indexes_cover_interactive_analytics_paths(self) -> None:
+        statements = dict(builder.POSTGRES_ANALYTICS_INDEXES)
+        expected = {
+            "ux_intel_actos_fichas",
+            "ix_intel_iaf_acto_score",
+            "ix_intel_iaf_publication",
+            "ix_intel_iaf_score",
+            "ix_intel_iaf_estado",
+            "ix_intel_iaf_entidad",
+            "ix_intel_iap_acto",
+            "ix_intel_iap_provider",
+            "ix_intel_iap_winner",
+            "ix_intel_ifc_ficha",
+            "ix_intel_ifc_oferente",
+            "ix_intel_ifmeta_ficha",
+            "ix_intel_ifmeta_rs",
+            "ix_intel_ifmeta_risk",
+        }
+        self.assertTrue(expected.issubset(statements))
+        self.assertEqual(len(statements), len(builder.POSTGRES_ANALYTICS_INDEXES))
+        self.assertTrue(all("IF NOT EXISTS" in statement for statement in statements.values()))
+
     def test_money_formats(self) -> None:
         cases = {
             "B/. 12,345.67": 12345.67,
