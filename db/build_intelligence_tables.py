@@ -1265,7 +1265,7 @@ def build_local_analytics(
                 _log("BUILD", f"{processed:,}/{min(source_count, limit or source_count):,} actos", started)
 
         # Materializa tendencias mensuales para los cuatro ejes temporales y
-        # los tres perfiles. La tabla maestra sigue consultando hechos cuando
+        # los cuatro perfiles usados por Streamlit. La tabla maestra sigue consultando hechos cuando
         # hay filtros arbitrarios; las tendencias comunes quedan listas sin
         # volver a recorrer toda la base operacional.
         target.executescript(
@@ -1300,7 +1300,8 @@ def build_local_analytics(
                        winner, participant_count, detection_score, 'actualizacion', substr(update_date, 1, 7)
                 FROM intel_actos_fichas WHERE update_date IS NOT NULL AND length(update_date) >= 7
             ), profiles(detection_profile, threshold) AS (
-                VALUES ('flexible', 55.0), ('moderado', 70.0), ('estricto', 92.0)
+                VALUES ('muy_flexible', 70.0), ('flexible', 85.0),
+                       ('moderado', 90.0), ('estricto', 96.0)
             )
             INSERT INTO intel_metricas_ficha_mes (
                 date_basis, period_month, detection_profile, ficha, actos, actos_ficha_unica,
@@ -1418,6 +1419,7 @@ POSTGRES_ANALYTICS_INDEXES = (
     ("ix_intel_iaf_ficha", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_ficha ON intel_actos_fichas(ficha)"),
     ("ix_intel_iaf_acto_score", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_acto_score ON intel_actos_fichas(acto_key, detection_score, ficha)"),
     ("ix_intel_iaf_publication", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_publication ON intel_actos_fichas(publication_date)"),
+    ("ix_intel_iaf_publication_profile", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_publication_profile ON intel_actos_fichas(publication_date, acto_key, ficha) WHERE detection_score >= 70"),
     ("ix_intel_iaf_celebration", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_celebration ON intel_actos_fichas(celebration_date)"),
     ("ix_intel_iaf_award", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_award ON intel_actos_fichas(award_date)"),
     ("ix_intel_iaf_update", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_update ON intel_actos_fichas(update_date)"),
@@ -1434,8 +1436,6 @@ POSTGRES_ANALYTICS_INDEXES = (
     ("ix_intel_ifmeta_ficha", "CREATE INDEX IF NOT EXISTS ix_intel_ifmeta_ficha ON intel_ficha_metadata(ficha)"),
     ("ix_intel_ifmeta_rs", "CREATE INDEX IF NOT EXISTS ix_intel_ifmeta_rs ON intel_ficha_metadata(registro_sanitario, ficha)"),
     ("ix_intel_ifmeta_risk", "CREATE INDEX IF NOT EXISTS ix_intel_ifmeta_risk ON intel_ficha_metadata(clase_riesgo, ficha)"),
-    ("ix_intel_iaf_search_trgm", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_search_trgm ON intel_actos_fichas USING gin (search_text_norm gin_trgm_ops)"),
-    ("ix_intel_ifmeta_search_trgm", "CREATE INDEX IF NOT EXISTS ix_intel_ifmeta_search_trgm ON intel_ficha_metadata USING gin (search_text_norm gin_trgm_ops)"),
 )
 
 
@@ -1443,6 +1443,7 @@ def ensure_postgres_analytics_indexes(
     database_url: str,
     *,
     engine: Any | None = None,
+    analyze: bool = False,
 ) -> dict[str, Any]:
     """Crea y verifica índices analíticos fuera del swap de publicación.
 
@@ -1467,12 +1468,22 @@ def ensure_postgres_analytics_indexes(
             # El plan gratuito puede necesitar más de 90 s mientras crea el
             # primer índice. El límite aplica solo a esta sesión de mantenimiento.
             conn.execute(text("SET statement_timeout TO 600000"))
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
             for index_name, statement in POSTGRES_ANALYTICS_INDEXES:
                 _log("INDEX", f"verificando {index_name}", started)
                 conn.execute(text(statement))
-            for table in POSTGRES_ANALYTICS_TABLES[:-1]:
-                conn.execute(text(f'ANALYZE "{table}"'))
+            # ANALYZE completo puede tardar varios minutos en el plan gratuito
+            # y no debe bloquear una publicacion correcta. PostgreSQL mantiene
+            # sus estadisticas mediante autovacuum; se deja como mantenimiento
+            # explicito y opcional para ventanas controladas.
+            if analyze:
+                conn.execute(text("SET statement_timeout TO 120000"))
+                for table in POSTGRES_ANALYTICS_TABLES[:-1]:
+                    try:
+                        _log("ANALYZE", f"actualizando {table}", started)
+                        conn.execute(text(f'ANALYZE "{table}"'))
+                    except Exception as exc:
+                        _log("WARN", f"ANALYZE omitido para {table}: {exc}", started)
+                        conn.execute(text("ROLLBACK"))
             rows = conn.execute(
                 text(
                     "SELECT indexname FROM pg_indexes "
@@ -1485,7 +1496,11 @@ def ensure_postgres_analytics_indexes(
         missing = sorted(expected - present)
         if missing:
             raise RuntimeError("Índices analíticos faltantes: " + ", ".join(missing))
-        return {"index_count": len(expected), "indexes": sorted(expected)}
+        return {
+            "index_count": len(expected),
+            "indexes": sorted(expected),
+            "analyze_requested": bool(analyze),
+        }
     finally:
         if owns_engine:
             active_engine.dispose()

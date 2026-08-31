@@ -25,6 +25,7 @@ class BuilderUnitTests(unittest.TestCase):
             "ux_intel_actos_fichas",
             "ix_intel_iaf_acto_score",
             "ix_intel_iaf_publication",
+            "ix_intel_iaf_publication_profile",
             "ix_intel_iaf_score",
             "ix_intel_iaf_estado",
             "ix_intel_iaf_entidad",
@@ -420,8 +421,8 @@ class BuilderIntegrationTests(unittest.TestCase):
             verified = builder.verify_analytics(output_db)
             self.assertEqual(result["fact_rows"], 1)
             self.assertEqual(verified["intel_actos_fichas"], 1)
-            self.assertEqual(result["monthly_rows"], 12)
-            self.assertEqual(verified["intel_metricas_ficha_mes"], 12)
+            self.assertEqual(result["monthly_rows"], 16)
+            self.assertEqual(verified["intel_metricas_ficha_mes"], 16)
             with closing(sqlite3.connect(output_db)) as analytics:
                 fact = analytics.execute(
                     "SELECT ficha,is_unique_ficha,reference_amount_attributed,award_amount_attributed,"
