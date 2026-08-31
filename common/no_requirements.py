@@ -12,7 +12,7 @@ NO_REQUIREMENTS_MIXED = "Acto mixto"
 
 
 def normalize_ficha_code(value: object) -> str:
-    text = str(value if value is not None else "").strip().replace("*", "")
+    text = str(value if value is not None else "").replace("*", "").strip()
     text = re.sub(r"\.0$", "", text)
     return text if re.fullmatch(r"\d{3,8}", text) else ""
 
@@ -95,4 +95,3 @@ def scope_column_values(
         if current != expected:
             changes += 1
     return values, changes
-

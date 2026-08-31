@@ -67,7 +67,7 @@ class NoRequirementsClassificationTests(unittest.TestCase):
         self.assertEqual(changes, 2)
 
     def test_ficha_label_parser_preserves_order(self) -> None:
-        self.assertEqual(ficha_codes_from_label("*100, 200; 100"), ["100", "200"])
+        self.assertEqual(ficha_codes_from_label("*100, * 200; 100"), ["100", "200"])
 
 
 class NoRequirementsCatalogTests(unittest.TestCase):
