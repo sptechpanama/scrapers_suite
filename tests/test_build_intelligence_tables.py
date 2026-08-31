@@ -32,6 +32,7 @@ class BuilderUnitTests(unittest.TestCase):
             "ix_intel_iap_acto",
             "ix_intel_iap_provider",
             "ix_intel_iap_winner",
+            "ix_intel_ifm_basis_profile_month_ficha",
             "ix_intel_ifc_ficha",
             "ix_intel_ifc_oferente",
             "ix_intel_ifmeta_ficha",

@@ -1109,6 +1109,7 @@ def _create_local_indexes(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_iap_provider ON intel_acto_proponentes(proveedor_norm);
         CREATE INDEX IF NOT EXISTS idx_iap_winner ON intel_acto_proponentes(is_winner);
         CREATE INDEX IF NOT EXISTS idx_ifm_month_profile ON intel_metricas_ficha_mes(period_month, detection_profile);
+        CREATE INDEX IF NOT EXISTS idx_ifm_basis_profile_month_ficha ON intel_metricas_ficha_mes(date_basis, detection_profile, period_month, ficha);
         CREATE INDEX IF NOT EXISTS idx_ifm_ficha ON intel_metricas_ficha_mes(ficha);
         CREATE INDEX IF NOT EXISTS idx_ifc_ficha ON intel_ficha_catalogo(ficha);
         CREATE INDEX IF NOT EXISTS idx_ifc_oferente ON intel_ficha_catalogo(oferente);
@@ -1430,6 +1431,7 @@ POSTGRES_ANALYTICS_INDEXES = (
     ("ix_intel_iap_provider", "CREATE INDEX IF NOT EXISTS ix_intel_iap_provider ON intel_acto_proponentes(proveedor_norm)"),
     ("ix_intel_iap_winner", "CREATE INDEX IF NOT EXISTS ix_intel_iap_winner ON intel_acto_proponentes(is_winner)"),
     ("ix_intel_ifm_month_profile", "CREATE INDEX IF NOT EXISTS ix_intel_ifm_month_profile ON intel_metricas_ficha_mes(period_month, detection_profile)"),
+    ("ix_intel_ifm_basis_profile_month_ficha", "CREATE INDEX IF NOT EXISTS ix_intel_ifm_basis_profile_month_ficha ON intel_metricas_ficha_mes(date_basis, detection_profile, period_month, ficha)"),
     ("ix_intel_ifm_ficha", "CREATE INDEX IF NOT EXISTS ix_intel_ifm_ficha ON intel_metricas_ficha_mes(ficha)"),
     ("ix_intel_ifc_ficha", "CREATE INDEX IF NOT EXISTS ix_intel_ifc_ficha ON intel_ficha_catalogo(ficha)"),
     ("ix_intel_ifc_oferente", "CREATE INDEX IF NOT EXISTS ix_intel_ifc_oferente ON intel_ficha_catalogo(oferente)"),
