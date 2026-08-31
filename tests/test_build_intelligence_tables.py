@@ -32,6 +32,7 @@ class BuilderUnitTests(unittest.TestCase):
             "ix_intel_iap_acto",
             "ix_intel_iap_provider",
             "ix_intel_iap_winner",
+            "ux_intel_iapc_acto",
             "ix_intel_ifm_basis_profile_month_ficha",
             "ix_intel_ifc_ficha",
             "ix_intel_ifc_oferente",
@@ -421,7 +422,9 @@ class BuilderIntegrationTests(unittest.TestCase):
             )
             verified = builder.verify_analytics(output_db)
             self.assertEqual(result["fact_rows"], 1)
+            self.assertEqual(result["profile_count_rows"], 1)
             self.assertEqual(verified["intel_actos_fichas"], 1)
+            self.assertEqual(verified["intel_acto_profile_counts"], 1)
             self.assertEqual(result["monthly_rows"], 16)
             self.assertEqual(verified["intel_metricas_ficha_mes"], 16)
             with closing(sqlite3.connect(output_db)) as analytics:
@@ -431,6 +434,11 @@ class BuilderIntegrationTests(unittest.TestCase):
                 ).fetchone()
                 self.assertEqual(fact[:4], ("43358", 1, 10000.0, 9000.0))
                 self.assertIn("kit circuito paciente", fact[4])
+                profile_counts = analytics.execute(
+                    "SELECT muy_flexible_count,flexible_count,moderado_count,estricto_count "
+                    "FROM intel_acto_profile_counts",
+                ).fetchone()
+                self.assertEqual(profile_counts, (1, 1, 1, 1))
                 monthly = analytics.execute(
                     "SELECT actos,actos_ficha_unica,monto_referencia,monto_adjudicado "
                     "FROM intel_metricas_ficha_mes WHERE date_basis='publicacion' "

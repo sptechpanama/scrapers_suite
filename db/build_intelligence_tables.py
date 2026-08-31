@@ -37,7 +37,7 @@ DEFAULT_ALIAS_JSON = REPO_ROOT / "data" / "fichas" / "ficha_aliases.json"
 DEFAULT_CLASSIFICATION_XLSX = REPO_ROOT / "data" / "fichas" / "todas_las_fichas.xlsx"
 DEFAULT_RISK_CLASS_XLSX = REPO_ROOT / "minsa_scraper" / "outputs" / "fichas_ctni.xlsx"
 
-ANALYTICS_SCHEMA_VERSION = "3.4.1"
+ANALYTICS_SCHEMA_VERSION = "3.5.0"
 SOURCE_CHUNK_SIZE = 5_000
 WRITE_CHUNK_SIZE = 5_000
 SQLITE_MAX_BOUND_PARAMETERS = 30_000
@@ -978,6 +978,7 @@ def _create_local_schema(connection: sqlite3.Connection) -> None:
 
         DROP TABLE IF EXISTS intel_actos_fichas;
         DROP TABLE IF EXISTS intel_acto_proponentes;
+        DROP TABLE IF EXISTS intel_acto_profile_counts;
         DROP TABLE IF EXISTS intel_metricas_ficha_mes;
         DROP TABLE IF EXISTS intel_ficha_metadata;
         DROP TABLE IF EXISTS intel_ficha_catalogo;
@@ -1034,6 +1035,14 @@ def _create_local_schema(connection: sqlite3.Connection) -> None:
             offered_amount REAL NOT NULL DEFAULT 0,
             is_winner INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (acto_key, ordinal)
+        );
+
+        CREATE TABLE intel_acto_profile_counts (
+            acto_key TEXT PRIMARY KEY,
+            muy_flexible_count INTEGER NOT NULL DEFAULT 0,
+            flexible_count INTEGER NOT NULL DEFAULT 0,
+            moderado_count INTEGER NOT NULL DEFAULT 0,
+            estricto_count INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE intel_metricas_ficha_mes (
@@ -1108,6 +1117,7 @@ def _create_local_indexes(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_iap_acto ON intel_acto_proponentes(acto_key);
         CREATE INDEX IF NOT EXISTS idx_iap_provider ON intel_acto_proponentes(proveedor_norm);
         CREATE INDEX IF NOT EXISTS idx_iap_winner ON intel_acto_proponentes(is_winner);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_iapc_acto ON intel_acto_profile_counts(acto_key);
         CREATE INDEX IF NOT EXISTS idx_ifm_month_profile ON intel_metricas_ficha_mes(period_month, detection_profile);
         CREATE INDEX IF NOT EXISTS idx_ifm_basis_profile_month_ficha ON intel_metricas_ficha_mes(date_basis, detection_profile, period_month, ficha);
         CREATE INDEX IF NOT EXISTS idx_ifm_ficha ON intel_metricas_ficha_mes(ficha);
@@ -1265,6 +1275,28 @@ def build_local_analytics(
             if processed % 25_000 < len(chunk):
                 _log("BUILD", f"{processed:,}/{min(source_count, limit or source_count):,} actos", started)
 
+        # La unicidad cambia con el perfil seleccionado. Se materializan los
+        # cuatro conteos una sola vez para que Streamlit no reagrupe toda la
+        # tabla de hechos en cada interacción.
+        target.execute(
+            """
+            INSERT INTO intel_acto_profile_counts (
+                acto_key, muy_flexible_count, flexible_count,
+                moderado_count, estricto_count
+            )
+            SELECT acto_key,
+                   COUNT(DISTINCT CASE WHEN detection_score >= 70 THEN ficha END),
+                   COUNT(DISTINCT CASE WHEN detection_score >= 85 THEN ficha END),
+                   COUNT(DISTINCT CASE WHEN detection_score >= 90 THEN ficha END),
+                   COUNT(DISTINCT CASE WHEN detection_score >= 96 THEN ficha END)
+            FROM intel_actos_fichas
+            GROUP BY acto_key
+            """
+        )
+        profile_count_rows = int(
+            target.execute("SELECT COUNT(*) FROM intel_acto_profile_counts").fetchone()[0]
+        )
+
         # Materializa tendencias mensuales para los cuatro ejes temporales y
         # los cuatro perfiles usados por Streamlit. La tabla maestra sigue consultando hechos cuando
         # hay filtros arbitrarios; las tendencias comunes quedan listas sin
@@ -1313,7 +1345,13 @@ def build_local_analytics(
             )
             SELECT d.date_basis, d.period_month, p.detection_profile, d.ficha,
                    COUNT(DISTINCT d.acto_key),
-                   COUNT(DISTINCT CASE WHEN d.is_unique_ficha = 1 THEN d.acto_key END),
+                   COUNT(DISTINCT CASE WHEN
+                       CASE p.detection_profile
+                           WHEN 'muy_flexible' THEN c.muy_flexible_count
+                           WHEN 'flexible' THEN c.flexible_count
+                           WHEN 'moderado' THEN c.moderado_count
+                           WHEN 'estricto' THEN c.estricto_count
+                       END = 1 THEN d.acto_key END),
                    COUNT(DISTINCT NULLIF(trim(d.entidad), '')),
                    SUM(d.reference_amount_attributed), SUM(d.award_amount_attributed),
                    SUM(d.reference_amount_context), SUM(d.award_amount_context),
@@ -1323,6 +1361,7 @@ def build_local_analytics(
                    AVG(d.participant_count), AVG(d.detection_score)
             FROM dated d
             CROSS JOIN profiles p
+            INNER JOIN intel_acto_profile_counts c ON c.acto_key = d.acto_key
             WHERE d.detection_score >= p.threshold
               AND d.period_month GLOB '[12][0-9][0-9][0-9]-[01][0-9]'
             GROUP BY d.date_basis, d.period_month, p.detection_profile, d.ficha;
@@ -1363,6 +1402,7 @@ def build_local_analytics(
             "source_rows": str(processed),
             "fact_rows": str(fact_count),
             "proponent_rows": str(proponent_count),
+            "profile_count_rows": str(profile_count_rows),
             "monthly_rows": str(monthly_count),
             "metadata_rows": str(len(metadata)),
             "classification_xlsx": str(classification_xlsx.resolve()) if classification_xlsx.exists() else "",
@@ -1395,6 +1435,7 @@ def build_local_analytics(
         "source_rows": processed,
         "fact_rows": fact_count,
         "proponent_rows": proponent_count,
+        "profile_count_rows": profile_count_rows,
         "monthly_rows": monthly_count,
         "metadata_rows": len(metadata),
         "catalog_rows": len(catalog),
@@ -1409,6 +1450,7 @@ def _postgres_url(explicit: str = "") -> str:
 POSTGRES_ANALYTICS_TABLES = (
     "intel_actos_fichas",
     "intel_acto_proponentes",
+    "intel_acto_profile_counts",
     "intel_metricas_ficha_mes",
     "intel_ficha_metadata",
     "intel_ficha_catalogo",
@@ -1430,6 +1472,7 @@ POSTGRES_ANALYTICS_INDEXES = (
     ("ix_intel_iap_acto", "CREATE INDEX IF NOT EXISTS ix_intel_iap_acto ON intel_acto_proponentes(acto_key)"),
     ("ix_intel_iap_provider", "CREATE INDEX IF NOT EXISTS ix_intel_iap_provider ON intel_acto_proponentes(proveedor_norm)"),
     ("ix_intel_iap_winner", "CREATE INDEX IF NOT EXISTS ix_intel_iap_winner ON intel_acto_proponentes(is_winner)"),
+    ("ux_intel_iapc_acto", "CREATE UNIQUE INDEX IF NOT EXISTS ux_intel_iapc_acto ON intel_acto_profile_counts(acto_key)"),
     ("ix_intel_ifm_month_profile", "CREATE INDEX IF NOT EXISTS ix_intel_ifm_month_profile ON intel_metricas_ficha_mes(period_month, detection_profile)"),
     ("ix_intel_ifm_basis_profile_month_ficha", "CREATE INDEX IF NOT EXISTS ix_intel_ifm_basis_profile_month_ficha ON intel_metricas_ficha_mes(date_basis, detection_profile, period_month, ficha)"),
     ("ix_intel_ifm_ficha", "CREATE INDEX IF NOT EXISTS ix_intel_ifm_ficha ON intel_metricas_ficha_mes(ficha)"),
@@ -1563,6 +1606,7 @@ def verify_analytics(local_db: Path) -> dict[str, Any]:
             for table in (
                 "intel_actos_fichas",
                 "intel_acto_proponentes",
+                "intel_acto_profile_counts",
                 "intel_metricas_ficha_mes",
                 "intel_ficha_metadata",
                 "intel_ficha_catalogo",
