@@ -40,6 +40,11 @@ if str(COMMON_DIR) not in sys.path:
     sys.path.append(str(COMMON_DIR))
 
 from ficha_utils import detectar_fichas_tokens
+from no_requirements import (
+    NO_REQUIREMENTS_SCOPE_COLUMN,
+    classify_no_requirements_scope,
+    scope_column_values,
+)
 from keyword_watch import (
     DEFAULT_RS_SP_KEYWORDS,
     normalize_keyword_term,
@@ -429,6 +434,26 @@ def ensure_header(sheet, header):
     rng = f"{sheet}!A1:{_col_letter(width)}{len(new_rows)}"
     gs_update(rng, new_rows)
     LOG("SHEETS", f"{sheet}: header reordenado y alineado")
+
+
+def ensure_no_requirements_scope(sheet):
+    if "sin_requisitos" not in str(sheet).lower():
+        return
+    rows = gs_get(f"{sheet}!A1:ZZ")
+    values, changes = scope_column_values(
+        rows,
+        no_requirements=FICHAS_SIN_REQ,
+        requires_ct=FICHAS_CON_CT,
+        requires_rs=FICHAS_CON_RS,
+    )
+    if not values or not changes:
+        return
+    scope_idx = find_idx(rows[0], NO_REQUIREMENTS_SCOPE_COLUMN)
+    if scope_idx is None:
+        return
+    column = _col_letter(scope_idx + 1)
+    gs_update(f"{sheet}!{column}2:{column}{len(values) + 1}", values)
+    LOG("SHEETS", f"{sheet}: clasificacion pura/mixta actualizada en {changes} fila(s)")
 
 def delete_rows(sheet, rows_1b):
     sid = gs_sheet_id(sheet)
@@ -901,6 +926,12 @@ def scrape(page: PageTools, link: str):
     fd_ct = next((code for code in fichas_base if code in FICHAS_CON_CT), None)
     fd_sr = next((code for code in fichas_base if code in FICHAS_SIN_REQ), None)
     fd_rs = next((code for code in fichas_base if code in FICHAS_CON_RS), None)
+    no_requirements_scope = classify_no_requirements_scope(
+        fichas_base,
+        no_requirements=FICHAS_SIN_REQ,
+        requires_ct=FICHAS_CON_CT,
+        requires_rs=FICHAS_CON_RS,
+    )
 
     return {
         "publicacion": publ,
@@ -919,6 +950,7 @@ def scrape(page: PageTools, link: str):
     "has_rs": bool(fd_rs),
     "ficha_detectada": ", ".join(ficha_tokens) if ficha_tokens else "No Detectada",
     "fichas_base": fichas_base,
+    NO_REQUIREMENTS_SCOPE_COLUMN: no_requirements_scope,
     }
 
 def clasifica(info):
@@ -1290,12 +1322,17 @@ def main():
             'Fecha de Actualización',
             'publicacion', 'enlace', 'titulo', 'precio_referencia', 'fecha',
             'entidad', 'unidad solicitante', 'termino_entrega', 'ficha_detectada',
+        ]
+        if "sin_requisitos" in str(sheet).lower():
+            base.append(NO_REQUIREMENTS_SCOPE_COLUMN)
+        base += [
             'Prioritario', 'Descartar',
             'descripcion'
         ]
 
         if df.empty:
             ensure_header(sheet, base)
+            ensure_no_requirements_scope(sheet)
             return [], base
 
         # Orden requerido: ... ficha_detectada, Prioritario, Descartar, descripcion, item_1..item_n
@@ -1314,6 +1351,7 @@ def main():
             df['Descartar'] = df['Descartar'].replace("", "")
 
         ensure_header(sheet, desired)
+        ensure_no_requirements_scope(sheet)
         vals_existing = gs_get(f"{sheet}!A1:ZZ")
         existing_norm = set()
         existing_acto = set()
