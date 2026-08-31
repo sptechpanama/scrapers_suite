@@ -1424,7 +1424,6 @@ POSTGRES_ANALYTICS_INDEXES = (
     ("ix_intel_iaf_score", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_score ON intel_actos_fichas(detection_score)"),
     ("ix_intel_iaf_estado", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_estado ON intel_actos_fichas(estado)"),
     ("ix_intel_iaf_entidad", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_entidad ON intel_actos_fichas(entidad)"),
-    ("ix_intel_iaf_search", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_search ON intel_actos_fichas(search_text_norm)"),
     ("ix_intel_iap_acto", "CREATE INDEX IF NOT EXISTS ix_intel_iap_acto ON intel_acto_proponentes(acto_key)"),
     ("ix_intel_iap_provider", "CREATE INDEX IF NOT EXISTS ix_intel_iap_provider ON intel_acto_proponentes(proveedor_norm)"),
     ("ix_intel_iap_winner", "CREATE INDEX IF NOT EXISTS ix_intel_iap_winner ON intel_acto_proponentes(is_winner)"),
@@ -1435,7 +1434,8 @@ POSTGRES_ANALYTICS_INDEXES = (
     ("ix_intel_ifmeta_ficha", "CREATE INDEX IF NOT EXISTS ix_intel_ifmeta_ficha ON intel_ficha_metadata(ficha)"),
     ("ix_intel_ifmeta_rs", "CREATE INDEX IF NOT EXISTS ix_intel_ifmeta_rs ON intel_ficha_metadata(registro_sanitario, ficha)"),
     ("ix_intel_ifmeta_risk", "CREATE INDEX IF NOT EXISTS ix_intel_ifmeta_risk ON intel_ficha_metadata(clase_riesgo, ficha)"),
-    ("ix_intel_ifm_search", "CREATE INDEX IF NOT EXISTS ix_intel_ifm_search ON intel_ficha_metadata(search_text_norm)"),
+    ("ix_intel_iaf_search_trgm", "CREATE INDEX IF NOT EXISTS ix_intel_iaf_search_trgm ON intel_actos_fichas USING gin (search_text_norm gin_trgm_ops)"),
+    ("ix_intel_ifmeta_search_trgm", "CREATE INDEX IF NOT EXISTS ix_intel_ifmeta_search_trgm ON intel_ficha_metadata USING gin (search_text_norm gin_trgm_ops)"),
 )
 
 
@@ -1467,6 +1467,7 @@ def ensure_postgres_analytics_indexes(
             # El plan gratuito puede necesitar más de 90 s mientras crea el
             # primer índice. El límite aplica solo a esta sesión de mantenimiento.
             conn.execute(text("SET statement_timeout TO 600000"))
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
             for index_name, statement in POSTGRES_ANALYTICS_INDEXES:
                 _log("INDEX", f"verificando {index_name}", started)
                 conn.execute(text(statement))
