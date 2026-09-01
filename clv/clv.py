@@ -51,6 +51,16 @@ from keyword_watch import (
     normalize_keyword_term,
     summarize_keyword_rows,
 )
+from purchase_unit_details import (
+    CONTACT_EMAIL_COLUMN,
+    CONTACT_NAME_COLUMN,
+    CONTACT_PHONE_COLUMN,
+    CONTACT_ROLE_COLUMN,
+    DEPENDENCY_COLUMN,
+    PROVINCE_COLUMN,
+    PURCHASE_UNIT_COLUMN,
+    extract_purchase_unit_details,
+)
 from cl_lifecycle import (
     RETRY_STATES as CL_RETRY_STATES,
     apply_observation as apply_cl_observation,
@@ -1221,8 +1231,9 @@ def scrape(page: PageTools, link: str):
     titulo  = _first_text_by_xpaths(page.d, xp["titulo"])
     precio  = _first_text_by_xpaths(page.d, xp["precio"])
     fecha   = _first_text_by_xpaths(page.d, xp["fecha"])
-    entidad = _first_text_by_xpaths(page.d, xp["entidad"])
-    unidad  = _first_text_by_xpaths(page.d, xp["unidad"], default="")
+    purchase_details = extract_purchase_unit_details(page.d)
+    entidad = purchase_details.get("entidad") or _first_text_by_xpaths(page.d, xp["entidad"])
+    unidad  = purchase_details.get(PURCHASE_UNIT_COLUMN) or _first_text_by_xpaths(page.d, xp["unidad"], default="")
     termino = _first_text_by_xpaths(page.d, xp["termino"])
     desc    = _first_text_by_xpaths(page.d, xp["desc"])
     pub     = _first_text_by_xpaths(page.d, xp["pub"])
@@ -1269,8 +1280,15 @@ def scrape(page: PageTools, link: str):
         "titulo": titulo,
         "precio_referencia": precio,   # string original; se convierte luego a número
         "fecha": fecha,
-    "entidad": entidad,
-    "unidad solicitante": unidad,
+        "entidad": entidad,
+        DEPENDENCY_COLUMN: purchase_details.get(DEPENDENCY_COLUMN, ""),
+        "unidad solicitante": unidad,
+        PURCHASE_UNIT_COLUMN: unidad,
+        PROVINCE_COLUMN: purchase_details.get(PROVINCE_COLUMN, ""),
+        CONTACT_NAME_COLUMN: purchase_details.get(CONTACT_NAME_COLUMN, ""),
+        CONTACT_ROLE_COLUMN: purchase_details.get(CONTACT_ROLE_COLUMN, ""),
+        CONTACT_PHONE_COLUMN: purchase_details.get(CONTACT_PHONE_COLUMN, ""),
+        CONTACT_EMAIL_COLUMN: purchase_details.get(CONTACT_EMAIL_COLUMN, ""),
         "termino_entrega": termino,
         "descripcion": desc,           # <-- descripción general (va tras checkboxes)
         "items": items,                # <-- lista de ítems
@@ -1535,7 +1553,10 @@ def main():
         base = [
             'Fecha de Actualización',
             'publicacion', 'enlace', 'titulo', 'precio_referencia', 'fecha',
-            'entidad', 'unidad solicitante', 'termino_entrega', 'ficha_detectada',
+            'entidad', DEPENDENCY_COLUMN, 'unidad solicitante', PURCHASE_UNIT_COLUMN,
+            PROVINCE_COLUMN, CONTACT_NAME_COLUMN, CONTACT_ROLE_COLUMN,
+            CONTACT_PHONE_COLUMN, CONTACT_EMAIL_COLUMN,
+            'termino_entrega', 'ficha_detectada',
         ]
         if "sin_requisitos" in str(sheet).lower():
             base.append(NO_REQUIREMENTS_SCOPE_COLUMN)

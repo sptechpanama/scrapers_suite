@@ -50,6 +50,16 @@ from keyword_watch import (
     normalize_keyword_term,
     summarize_keyword_rows,
 )
+from purchase_unit_details import (
+    CONTACT_EMAIL_COLUMN,
+    CONTACT_NAME_COLUMN,
+    CONTACT_PHONE_COLUMN,
+    CONTACT_ROLE_COLUMN,
+    DEPENDENCY_COLUMN,
+    PROVINCE_COLUMN,
+    PURCHASE_UNIT_COLUMN,
+    extract_purchase_unit_details,
+)
 
 SCRAPE_WAIT_SECONDS = 10
 SCRAPE_FALLBACK_WAIT_SECONDS = 8
@@ -894,9 +904,10 @@ def scrape(page: PageTools, link: str):
     titulo  = _first_text_by_xpaths(page.d, xp["titulo"])
     precio  = _first_text_by_xpaths(page.d, xp["precio"])
     fecha   = _first_text_by_xpaths(page.d, xp["fecha"])
-    entidad = _first_text_by_xpaths(page.d, xp["entidad"])
+    purchase_details = extract_purchase_unit_details(page.d)
+    entidad = purchase_details.get("entidad") or _first_text_by_xpaths(page.d, xp["entidad"])
     termino = _first_text_by_xpaths(page.d, xp["termino"])
-    unidad  = _first_text_by_xpaths(page.d, xp.get("unidad", []), default="")
+    unidad  = purchase_details.get(PURCHASE_UNIT_COLUMN) or _first_text_by_xpaths(page.d, xp.get("unidad", []), default="")
     desc    = _first_text_by_xpaths(page.d, xp["desc"])
     pub     = _first_text_by_xpaths(page.d, xp["pub"])
 
@@ -939,9 +950,16 @@ def scrape(page: PageTools, link: str):
         "titulo": titulo,
         "precio_referencia": precio,
         "fecha": fecha,
-    "entidad": entidad,
-    "unidad solicitante": unidad,
-    "termino_entrega": termino,
+        "entidad": entidad,
+        DEPENDENCY_COLUMN: purchase_details.get(DEPENDENCY_COLUMN, ""),
+        "unidad solicitante": unidad,
+        PURCHASE_UNIT_COLUMN: unidad,
+        PROVINCE_COLUMN: purchase_details.get(PROVINCE_COLUMN, ""),
+        CONTACT_NAME_COLUMN: purchase_details.get(CONTACT_NAME_COLUMN, ""),
+        CONTACT_ROLE_COLUMN: purchase_details.get(CONTACT_ROLE_COLUMN, ""),
+        CONTACT_PHONE_COLUMN: purchase_details.get(CONTACT_PHONE_COLUMN, ""),
+        CONTACT_EMAIL_COLUMN: purchase_details.get(CONTACT_EMAIL_COLUMN, ""),
+        "termino_entrega": termino,
         "descripcion": desc,
         "items": items,
         "mix": mix,
@@ -1054,7 +1072,14 @@ def repair_suspicious_rows(sheet: str, page_tools: "PageTools", threshold: int =
         _set_row_value_by_header(hmap, out, "precio_referencia", "" if price_num is None else f"{price_num:.2f}")
         _set_row_value_by_header(hmap, out, "fecha", info.get("fecha", ""))
         _set_row_value_by_header(hmap, out, "entidad", info.get("entidad", ""))
+        _set_row_value_by_header(hmap, out, DEPENDENCY_COLUMN, info.get(DEPENDENCY_COLUMN, ""))
         _set_row_value_by_header(hmap, out, "unidad solicitante", info.get("unidad solicitante", ""))
+        _set_row_value_by_header(hmap, out, PURCHASE_UNIT_COLUMN, info.get(PURCHASE_UNIT_COLUMN, ""))
+        _set_row_value_by_header(hmap, out, PROVINCE_COLUMN, info.get(PROVINCE_COLUMN, ""))
+        _set_row_value_by_header(hmap, out, CONTACT_NAME_COLUMN, info.get(CONTACT_NAME_COLUMN, ""))
+        _set_row_value_by_header(hmap, out, CONTACT_ROLE_COLUMN, info.get(CONTACT_ROLE_COLUMN, ""))
+        _set_row_value_by_header(hmap, out, CONTACT_PHONE_COLUMN, info.get(CONTACT_PHONE_COLUMN, ""))
+        _set_row_value_by_header(hmap, out, CONTACT_EMAIL_COLUMN, info.get(CONTACT_EMAIL_COLUMN, ""))
         _set_row_value_by_header(hmap, out, "termino_entrega", info.get("termino_entrega", ""))
         _set_row_value_by_header(hmap, out, "ficha_detectada", info.get("ficha_detectada", ""))
         _set_row_value_by_header(hmap, out, "descripcion", info.get("descripcion", ""))
@@ -1321,7 +1346,10 @@ def main():
         base = [
             'Fecha de Actualización',
             'publicacion', 'enlace', 'titulo', 'precio_referencia', 'fecha',
-            'entidad', 'unidad solicitante', 'termino_entrega', 'ficha_detectada',
+            'entidad', DEPENDENCY_COLUMN, 'unidad solicitante', PURCHASE_UNIT_COLUMN,
+            PROVINCE_COLUMN, CONTACT_NAME_COLUMN, CONTACT_ROLE_COLUMN,
+            CONTACT_PHONE_COLUMN, CONTACT_EMAIL_COLUMN,
+            'termino_entrega', 'ficha_detectada',
         ]
         if "sin_requisitos" in str(sheet).lower():
             base.append(NO_REQUIREMENTS_SCOPE_COLUMN)
