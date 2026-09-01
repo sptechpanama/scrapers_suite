@@ -189,23 +189,100 @@ def build_sheets_service():
     return build("sheets", "v4", credentials=credentials, cache_discovery=False)
 
 
+def execute_with_backoff(request, *, label: str, attempts: int = 7):
+    """Ejecuta una petición de Google tolerando cuotas y fallos transitorios."""
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return request.execute()
+        except Exception as exc:
+            last_error = exc
+            response = getattr(exc, "resp", None)
+            status = int(getattr(response, "status", 0) or 0)
+            retryable = status in {429, 500, 502, 503, 504} or status == 0
+            if not retryable or attempt >= attempts:
+                raise
+            retry_after = 0.0
+            try:
+                retry_after = float((response or {}).get("retry-after") or 0)
+            except (TypeError, ValueError, AttributeError):
+                retry_after = 0.0
+            delay = max(retry_after, min(65.0, (2 ** (attempt - 1)) + random.random()))
+            log("SHEETS", f"{label}: reintento {attempt}/{attempts} en {delay:.1f}s ({status or type(exc).__name__})")
+            time.sleep(delay)
+    raise RuntimeError(f"{label}: {last_error}")
+
+
 def read_sheet(service, spreadsheet_id: str, sheet: str) -> list[list[str]]:
-    response = (
+    request = (
         service.spreadsheets()
         .values()
         .get(spreadsheetId=spreadsheet_id, range=f"'{sheet}'!A1:ZZ")
-        .execute()
     )
+    response = execute_with_backoff(request, label=f"leer {sheet}")
     return response.get("values") or []
 
 
-def available_target_sheets(service, spreadsheet_id: str) -> list[str]:
-    metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    available = {
-        item.get("properties", {}).get("title")
-        for item in metadata.get("sheets") or []
-    }
-    return [sheet for sheet in TARGET_SHEETS if sheet in available]
+def load_sheet_grid_metadata(service, spreadsheet_id: str) -> dict[str, dict[str, int]]:
+    request = service.spreadsheets().get(
+        spreadsheetId=spreadsheet_id,
+        fields="sheets(properties(sheetId,title,gridProperties(columnCount)))",
+    )
+    metadata = execute_with_backoff(request, label="leer estructura del archivo")
+    result: dict[str, dict[str, int]] = {}
+    for item in metadata.get("sheets") or []:
+        properties = item.get("properties") or {}
+        title = str(properties.get("title") or "")
+        if not title:
+            continue
+        result[title] = {
+            "sheet_id": int(properties.get("sheetId") or 0),
+            "column_count": int(
+                (properties.get("gridProperties") or {}).get("columnCount") or 0
+            ),
+        }
+    return result
+
+
+def ensure_sheet_column_capacity(
+    service,
+    spreadsheet_id: str,
+    sheet: str,
+    required_columns: int,
+    grid_metadata: dict[str, dict[str, int]],
+) -> None:
+    """Amplia la cuadrícula cuando una hoja llegó a su límite de columnas.
+
+    Google Sheets no amplía automáticamente la cuadrícula al escribir por API.
+    Algunas pestañas operativas vacías conservan cientos de columnas históricas,
+    por lo que un encabezado nuevo puede quedar justo fuera del límite actual.
+    """
+    properties = grid_metadata.get(sheet)
+    if not properties:
+        raise RuntimeError(f"No se encontró la pestaña {sheet!r} para ampliar su cuadrícula")
+    current = int(properties.get("column_count") or 0)
+    if current >= required_columns:
+        return
+    new_count = max(required_columns, current + 16)
+    request = service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={
+            "requests": [
+                {
+                    "updateSheetProperties": {
+                        "properties": {
+                            "sheetId": int(properties["sheet_id"]),
+                            "gridProperties": {"columnCount": new_count},
+                        },
+                        "fields": "gridProperties.columnCount",
+                    }
+                }
+            ]
+        },
+    )
+    execute_with_backoff(request, label=f"ampliar {sheet}")
+    properties["column_count"] = new_count
+    log("GRID", f"{sheet}: columnas {current:,} -> {new_count:,}")
 
 
 def extract_links(rows: list[list[str]]) -> list[str]:
@@ -297,6 +374,7 @@ def update_sheet_columns(
     spreadsheet_id: str,
     sheet: str,
     results: dict[str, dict[str, str]],
+    grid_metadata: dict[str, dict[str, int]],
     *,
     dry_run: bool,
 ) -> dict[str, int]:
@@ -326,6 +404,7 @@ def update_sheet_columns(
         target_index = header_map[normalize_header(column)]
         previous_index = previous_indexes[column]
         values = [[column]]
+        column_changed = previous_index is None
         for row in rows[1:]:
             url = _old_value(row, link_index).strip()
             old = _old_value(row, previous_index)
@@ -336,8 +415,10 @@ def update_sheet_columns(
                 matched += 1
             if new != old:
                 changed += 1
+                column_changed = True
         letter = col_letter(target_index + 1)
-        updates.append({"range": f"'{sheet}'!{letter}1:{letter}{len(values)}", "values": values})
+        if column_changed:
+            updates.append({"range": f"'{sheet}'!{letter}1:{letter}{len(values)}", "values": values})
 
     aliases = {"entidad": "entidad", "unidad solicitante": PURCHASE_UNIT_COLUMN}
     for existing_name, detail_name in aliases.items():
@@ -345,6 +426,7 @@ def update_sheet_columns(
         if target_index is None:
             continue
         values = [[header[target_index]]]
+        column_changed = False
         for row in rows[1:]:
             url = _old_value(row, link_index).strip()
             old = _old_value(row, target_index)
@@ -352,14 +434,27 @@ def update_sheet_columns(
             values.append([new])
             if new != old:
                 changed += 1
+                column_changed = True
         letter = col_letter(target_index + 1)
-        updates.append({"range": f"'{sheet}'!{letter}1:{letter}{len(values)}", "values": values})
+        if column_changed:
+            updates.append({"range": f"'{sheet}'!{letter}1:{letter}{len(values)}", "values": values})
 
     if updates and not dry_run:
-        service.spreadsheets().values().batchUpdate(
+        required_columns = max(
+            header_map[normalize_header(column)] + 1 for column in target_keys
+        )
+        ensure_sheet_column_capacity(
+            service,
+            spreadsheet_id,
+            sheet,
+            required_columns,
+            grid_metadata,
+        )
+        request = service.spreadsheets().values().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={"valueInputOption": "RAW", "data": updates},
-        ).execute()
+        )
+        execute_with_backoff(request, label=f"actualizar {sheet}")
     return {"rows": max(0, len(rows) - 1), "matched": matched, "changed": changed}
 
 
@@ -405,7 +500,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     service = build_sheets_service()
-    sheets = available_target_sheets(service, args.spreadsheet_id)
+    grid_metadata = load_sheet_grid_metadata(service, args.spreadsheet_id)
+    sheets = [sheet for sheet in TARGET_SHEETS if sheet in grid_metadata]
     all_links: list[str] = []
     for sheet in sheets:
         links = extract_links(read_sheet(service, args.spreadsheet_id, sheet))
@@ -428,6 +524,7 @@ def main() -> int:
             args.spreadsheet_id,
             sheet,
             results,
+            grid_metadata,
             dry_run=args.dry_run,
         )
         total_changed += stats["changed"]
