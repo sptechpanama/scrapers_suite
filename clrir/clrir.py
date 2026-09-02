@@ -42,8 +42,16 @@ if str(COMMON_DIR) not in sys.path:
 
 from ficha_utils import detectar_fichas_tokens
 from no_requirements import (
+    ADJUDICATION_TYPE_COLUMN,
+    ADJUDICATION_UNKNOWN,
+    NO_REQUIREMENTS_FICHAS_COLUMN,
+    NO_REQUIREMENTS_MIXED,
     NO_REQUIREMENTS_SCOPE_COLUMN,
-    classify_no_requirements_scope,
+    REQUIREMENTS_FICHAS_COLUMN,
+    UNCLASSIFIED_FICHAS_COLUMN,
+    adjudication_type_from_cells,
+    evaluate_no_requirements,
+    resolve_adjudication_type,
     scope_column_values,
 )
 from keyword_watch import (
@@ -741,7 +749,9 @@ def _restart_scrape_driver(driver):
     return new_driver, PageTools(new_driver)
 
 class PageTools:
-    def __init__(self, driver): self.d = driver
+    def __init__(self, driver):
+        self.d = driver
+        self.adjudication_by_url = {}
     def js_count(self, css):
         try: return self.d.execute_script("return document.querySelectorAll(arguments[0]).length;", css)
         except JavascriptException: return -1
@@ -810,7 +820,21 @@ class PageTools:
     def collect_links(self):
         anchors = self.find_css(CFG["css_links"])
         LOG("CAP", f"anchors={len(anchors)} | js={self.js_count(CFG['css_links'])}")
-        return [self.a_url(a) for a in anchors if self.a_url(a)]
+        urls = []
+        for anchor in anchors:
+            url = self.a_url(anchor)
+            if not url:
+                continue
+            urls.append(url)
+            try:
+                row = anchor.find_element(By.XPATH, "./ancestor::tr[1]")
+                cells = row.find_elements(By.XPATH, "./th|./td")
+                mode = adjudication_type_from_cells([cells[-1].text] if cells else [])
+                if mode != ADJUDICATION_UNKNOWN:
+                    self.adjudication_by_url[normalize_url(url)] = mode
+            except (NoSuchElementException, StaleElementReferenceException):
+                continue
+        return urls
 
 # =========================
 # REGLAS / SCRAPE (detalle)
@@ -847,8 +871,7 @@ def want_descartar(info):
     if med:
         return True, f"med:{med}"
     fichas_base = info.get('fichas_base') or []
-    has_sr = any(code in FICHAS_SIN_REQ for code in fichas_base)
-    if (not has_sr) and any(code in FICHAS_CON_RS for code in fichas_base):
+    if (not info.get("_eligible_sin_requisitos")) and any(code in FICHAS_CON_RS for code in fichas_base):
         return True, "RS"
     return False, ""
 
@@ -877,7 +900,7 @@ def _wait_any_xpath(driver, xps, to=25):
         return False
     WebDriverWait(driver, to).until(any_present)
 
-def scrape(page: PageTools, link: str):
+def scrape(page: PageTools, link: str, adjudication_type: str = ""):
     xp = CFG["xpath_map"]
     try:
         page.d.get(link)
@@ -936,11 +959,19 @@ def scrape(page: PageTools, link: str):
     fd_ct = next((code for code in fichas_base if code in FICHAS_CON_CT), None)
     fd_sr = next((code for code in fichas_base if code in FICHAS_SIN_REQ), None)
     fd_rs = next((code for code in fichas_base if code in FICHAS_CON_RS), None)
-    no_requirements_scope = classify_no_requirements_scope(
+    resolved_adjudication_type = resolve_adjudication_type(adjudication_type)
+    if resolved_adjudication_type == ADJUDICATION_UNKNOWN:
+        try:
+            detail_text = page.d.find_element(By.TAG_NAME, "body").text
+        except Exception:
+            detail_text = ""
+        resolved_adjudication_type = resolve_adjudication_type(adjudication_type, detail_text)
+    no_requirements = evaluate_no_requirements(
         fichas_base,
         no_requirements=FICHAS_SIN_REQ,
         requires_ct=FICHAS_CON_CT,
         requires_rs=FICHAS_CON_RS,
+        adjudication_type=resolved_adjudication_type,
     )
 
     return {
@@ -967,11 +998,19 @@ def scrape(page: PageTools, link: str):
     "has_rs": bool(fd_rs),
     "ficha_detectada": ", ".join(ficha_tokens) if ficha_tokens else "No Detectada",
     "fichas_base": fichas_base,
-    NO_REQUIREMENTS_SCOPE_COLUMN: no_requirements_scope,
+    NO_REQUIREMENTS_FICHAS_COLUMN: ", ".join(no_requirements.no_requirements_fichas),
+    REQUIREMENTS_FICHAS_COLUMN: no_requirements.requirements_label,
+    UNCLASSIFIED_FICHAS_COLUMN: ", ".join(no_requirements.unclassified_fichas),
+    ADJUDICATION_TYPE_COLUMN: no_requirements.adjudication_type,
+    NO_REQUIREMENTS_SCOPE_COLUMN: no_requirements.scope,
+    "_eligible_sin_requisitos": no_requirements.eligible,
+    "_no_requirements_reason": no_requirements.reason,
     }
 
 def clasifica(info):
-    return "sr" if info["has_sr"] else ("rs" if info["has_rs"] else ("ct" if info["has_ct"] else "sf"))
+    if info.get("_eligible_sin_requisitos"):
+        return "sr"
+    return "rs" if info["has_rs"] else ("ct" if info["has_ct"] else "sf")
 
 # =========================
 # MAIN (flujo completo)
@@ -1066,6 +1105,7 @@ def main():
             break
 
     LOG("DONE", f"enlaces extraídos={len(links)}")
+    listing_adjudication_by_url = dict(PT.adjudication_by_url)
     try: driver.quit()
     except: pass
 
@@ -1101,7 +1141,7 @@ def main():
         for attempt in range(1, max_attempts + 1):
             t0 = time.time()
             try:
-                info = scrape(PT, link)
+                info = scrape(PT, link, listing_adjudication_by_url.get(key, ""))
                 LOG("SCRAPE", f"ok ({time.time()-t0:.1f}s)")
                 break
             except TimeoutException:
@@ -1117,6 +1157,15 @@ def main():
         if info is None:
             LOG("SCRAPE", "falló el enlace tras reintentos; salto definitivo")
             continue
+
+        if (
+            info.get(NO_REQUIREMENTS_SCOPE_COLUMN) == NO_REQUIREMENTS_MIXED
+            and not info.get("_eligible_sin_requisitos")
+        ):
+            LOG(
+                "SIN-REQ",
+                f"no publicado como sin requisitos: {info.get('_no_requirements_reason', '')}",
+            )
 
         # Descarte por precio/RS/med
         desc, mot = want_descartar(info)
@@ -1166,7 +1215,11 @@ def main():
                 df[col] = df["items"].apply(lambda lst: (lst[i-1] if isinstance(lst, list) and len(lst) >= i else ""))
             df.drop(columns=["items"], inplace=True, errors="ignore")
 
-        df.drop(columns=["fichas_base"], inplace=True, errors="ignore")
+        df.drop(
+            columns=["fichas_base", "_eligible_sin_requisitos", "_no_requirements_reason"],
+            inplace=True,
+            errors="ignore",
+        )
 
         df.fillna("", inplace=True)
         return df
@@ -1179,6 +1232,8 @@ def main():
             PROVINCE_COLUMN, CONTACT_NAME_COLUMN, CONTACT_ROLE_COLUMN,
             CONTACT_PHONE_COLUMN, CONTACT_EMAIL_COLUMN,
             'termino_entrega', 'ficha_detectada',
+            NO_REQUIREMENTS_FICHAS_COLUMN, REQUIREMENTS_FICHAS_COLUMN,
+            UNCLASSIFIED_FICHAS_COLUMN, ADJUDICATION_TYPE_COLUMN,
         ]
         if "sin_requisitos" in str(sheet).lower():
             base.append(NO_REQUIREMENTS_SCOPE_COLUMN)
