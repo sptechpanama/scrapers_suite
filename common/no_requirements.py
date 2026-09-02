@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 
@@ -18,6 +18,15 @@ UNCLASSIFIED_FICHAS_COLUMN = "Fichas por verificar"
 ADJUDICATION_BY_LINE = "Renglón"
 ADJUDICATION_GLOBAL = "Global"
 ADJUDICATION_UNKNOWN = "No identificado"
+NO_REQUIREMENTS_EMPTY_VALUE = "Ninguna"
+NO_REQUIREMENTS_NOT_APPLICABLE = "No aplica"
+NO_REQUIREMENTS_METADATA_COLUMNS = (
+    NO_REQUIREMENTS_FICHAS_COLUMN,
+    REQUIREMENTS_FICHAS_COLUMN,
+    UNCLASSIFIED_FICHAS_COLUMN,
+    ADJUDICATION_TYPE_COLUMN,
+    NO_REQUIREMENTS_SCOPE_COLUMN,
+)
 
 
 @dataclass(frozen=True)
@@ -207,6 +216,121 @@ def ficha_codes_from_label(value: object) -> list[str]:
             ordered.append(code)
             seen.add(code)
     return ordered
+
+
+def display_ficha_codes(values: Iterable[object]) -> str:
+    """Devuelve una celda legible y nunca vacía para una categoría de fichas."""
+
+    codes = _ordered_ficha_codes(values)
+    return ", ".join(codes) if codes else NO_REQUIREMENTS_EMPTY_VALUE
+
+
+def no_requirements_metadata_header(headers: Sequence[object]) -> list[str]:
+    """Inserta el bloque auditable inmediatamente después de ``ficha_detectada``.
+
+    La función es idempotente y conserva todas las columnas ajenas al bloque.
+    Esto permite migrar hojas antiguas sin desplazar datos por posición.
+    """
+
+    source = [str(value).strip() for value in headers]
+    metadata_keys = {_normalized_text(value) for value in NO_REQUIREMENTS_METADATA_COLUMNS}
+    without_metadata = [value for value in source if _normalized_text(value) not in metadata_keys]
+    ficha_key = _normalized_text("ficha_detectada")
+    insert_at = next(
+        (
+            index + 1
+            for index, value in enumerate(without_metadata)
+            if _normalized_text(value) == ficha_key
+        ),
+        len(without_metadata),
+    )
+    return (
+        without_metadata[:insert_at]
+        + list(NO_REQUIREMENTS_METADATA_COLUMNS)
+        + without_metadata[insert_at:]
+    )
+
+
+def no_requirements_metadata_values(
+    rows: Sequence[Sequence[object]],
+    *,
+    no_requirements: Iterable[object],
+    requires_ct: Iterable[object],
+    requires_rs: Iterable[object],
+    adjudication_by_url: Mapping[str, object] | None = None,
+    link_normalizer: Callable[[str], str] | None = None,
+    ficha_column: str = "ficha_detectada",
+    link_column: str = "enlace",
+) -> tuple[dict[str, list[list[str]]], dict[str, int]]:
+    """Calcula las cinco columnas auditables para todas las filas históricas.
+
+    La modalidad recién capturada del listado oficial tiene prioridad. Cuando
+    el acto ya no está en el listado, se conserva una modalidad válida que ya
+    estuviera guardada; en último caso se escribe ``No identificado``. Las
+    categorías vacías se publican como ``Ninguna`` para evitar ``None`` en la
+    aplicación.
+    """
+
+    if not rows:
+        return {}, {}
+
+    header = [str(value).strip() for value in rows[0]]
+    indexes = {_normalized_text(value): index for index, value in enumerate(header)}
+    ficha_idx = indexes.get(_normalized_text(ficha_column))
+    link_idx = indexes.get(_normalized_text(link_column))
+    column_indexes = {
+        column: indexes.get(_normalized_text(column))
+        for column in NO_REQUIREMENTS_METADATA_COLUMNS
+    }
+    if ficha_idx is None or any(index is None for index in column_indexes.values()):
+        return {}, {}
+
+    mode_map = dict(adjudication_by_url or {})
+    normalizer = link_normalizer or (lambda value: str(value or "").strip())
+    values = {column: [] for column in NO_REQUIREMENTS_METADATA_COLUMNS}
+    changes = {column: 0 for column in NO_REQUIREMENTS_METADATA_COLUMNS}
+
+    for source_row in rows[1:]:
+        row = list(source_row)
+        ficha_value = row[ficha_idx] if ficha_idx < len(row) else ""
+        current_mode_idx = column_indexes[ADJUDICATION_TYPE_COLUMN]
+        current_mode = row[current_mode_idx] if current_mode_idx < len(row) else ""
+
+        official_mode: object = ""
+        if link_idx is not None and link_idx < len(row):
+            raw_link = str(row[link_idx] or "").strip()
+            if raw_link:
+                normalized_link = normalizer(raw_link)
+                official_mode = mode_map.get(normalized_link, mode_map.get(raw_link, ""))
+        if normalize_adjudication_type(official_mode) == ADJUDICATION_UNKNOWN:
+            official_mode = current_mode
+
+        decision = evaluate_no_requirements(
+            ficha_codes_from_label(ficha_value),
+            no_requirements=no_requirements,
+            requires_ct=requires_ct,
+            requires_rs=requires_rs,
+            adjudication_type=official_mode,
+        )
+        expected = {
+            NO_REQUIREMENTS_FICHAS_COLUMN: display_ficha_codes(decision.no_requirements_fichas),
+            REQUIREMENTS_FICHAS_COLUMN: (
+                decision.requirements_label or NO_REQUIREMENTS_EMPTY_VALUE
+            ),
+            UNCLASSIFIED_FICHAS_COLUMN: display_ficha_codes(decision.unclassified_fichas),
+            ADJUDICATION_TYPE_COLUMN: decision.adjudication_type,
+            NO_REQUIREMENTS_SCOPE_COLUMN: (
+                decision.scope or NO_REQUIREMENTS_NOT_APPLICABLE
+            ),
+        }
+        for column, expected_value in expected.items():
+            values[column].append([expected_value])
+            column_idx = column_indexes[column]
+            current_value = str(row[column_idx]).strip() if column_idx < len(row) else ""
+            if current_value != expected_value:
+                changes[column] += 1
+
+    return values, changes
 
 
 def classify_no_requirements_scope(

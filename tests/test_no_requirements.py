@@ -9,14 +9,21 @@ from common.no_requirements import (
     ADJUDICATION_BY_LINE,
     ADJUDICATION_GLOBAL,
     ADJUDICATION_UNKNOWN,
+    ADJUDICATION_TYPE_COLUMN,
+    NO_REQUIREMENTS_EMPTY_VALUE,
+    NO_REQUIREMENTS_FICHAS_COLUMN,
     NO_REQUIREMENTS_MIXED,
     NO_REQUIREMENTS_ONLY,
     NO_REQUIREMENTS_SCOPE_COLUMN,
+    REQUIREMENTS_FICHAS_COLUMN,
+    UNCLASSIFIED_FICHAS_COLUMN,
     adjudication_type_from_cells,
     adjudication_type_from_detail_text,
     classify_no_requirements_scope,
     evaluate_no_requirements,
     ficha_codes_from_label,
+    no_requirements_metadata_header,
+    no_requirements_metadata_values,
     normalize_adjudication_type,
     resolve_adjudication_type,
     scope_column_values,
@@ -147,6 +154,101 @@ class NoRequirementsClassificationTests(unittest.TestCase):
             resolve_adjudication_type("Global", "Modalidad de adjudicación\nRenglón"),
             ADJUDICATION_GLOBAL,
         )
+
+    def test_metadata_header_migrates_legacy_sheet_idempotently(self) -> None:
+        legacy = [
+            "enlace",
+            "ficha_detectada",
+            NO_REQUIREMENTS_SCOPE_COLUMN,
+            "Prioritario",
+            "descripcion",
+        ]
+        expected = [
+            "enlace",
+            "ficha_detectada",
+            NO_REQUIREMENTS_FICHAS_COLUMN,
+            REQUIREMENTS_FICHAS_COLUMN,
+            UNCLASSIFIED_FICHAS_COLUMN,
+            ADJUDICATION_TYPE_COLUMN,
+            NO_REQUIREMENTS_SCOPE_COLUMN,
+            "Prioritario",
+            "descripcion",
+        ]
+        migrated = no_requirements_metadata_header(legacy)
+        self.assertEqual(migrated, expected)
+        self.assertEqual(no_requirements_metadata_header(migrated), expected)
+
+    def test_historical_metadata_is_filled_from_catalogs_and_official_mode(self) -> None:
+        header = no_requirements_metadata_header(
+            ["enlace", "ficha_detectada", NO_REQUIREMENTS_SCOPE_COLUMN]
+        )
+        rows = [
+            header,
+            [
+                "https://example.test/acto/1",
+                "100, 300, 400, 999",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ],
+            [
+                "https://example.test/acto/2",
+                "100",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ],
+        ]
+        values, changes = no_requirements_metadata_values(
+            rows,
+            no_requirements=self.no_req,
+            requires_ct=self.ct,
+            requires_rs=self.rs,
+            adjudication_by_url={
+                "https://example.test/acto/1": "Renglon",
+                "https://example.test/acto/2": "Global",
+            },
+        )
+        self.assertEqual(values[NO_REQUIREMENTS_FICHAS_COLUMN], [["100"], ["100"]])
+        self.assertEqual(
+            values[REQUIREMENTS_FICHAS_COLUMN],
+            [["300 (CT), 400 (RS)"], [NO_REQUIREMENTS_EMPTY_VALUE]],
+        )
+        self.assertEqual(
+            values[UNCLASSIFIED_FICHAS_COLUMN],
+            [["999"], [NO_REQUIREMENTS_EMPTY_VALUE]],
+        )
+        self.assertEqual(
+            values[ADJUDICATION_TYPE_COLUMN],
+            [[ADJUDICATION_BY_LINE], [ADJUDICATION_GLOBAL]],
+        )
+        self.assertEqual(
+            values[NO_REQUIREMENTS_SCOPE_COLUMN],
+            [[NO_REQUIREMENTS_MIXED], [NO_REQUIREMENTS_ONLY]],
+        )
+        self.assertTrue(all(count == 2 for count in changes.values()))
+
+    def test_metadata_preserves_recognized_mode_when_act_is_not_in_listing(self) -> None:
+        header = no_requirements_metadata_header(["enlace", "ficha_detectada"])
+        row = ["https://example.test/old", "100"] + [
+            "100",
+            NO_REQUIREMENTS_EMPTY_VALUE,
+            NO_REQUIREMENTS_EMPTY_VALUE,
+            ADJUDICATION_GLOBAL,
+            NO_REQUIREMENTS_ONLY,
+        ]
+        values, changes = no_requirements_metadata_values(
+            [header, row],
+            no_requirements=self.no_req,
+            requires_ct=self.ct,
+            requires_rs=self.rs,
+        )
+        self.assertEqual(values[ADJUDICATION_TYPE_COLUMN], [[ADJUDICATION_GLOBAL]])
+        self.assertTrue(all(count == 0 for count in changes.values()))
 
 
 class NoRequirementsCatalogTests(unittest.TestCase):

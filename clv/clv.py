@@ -50,7 +50,10 @@ from no_requirements import (
     REQUIREMENTS_FICHAS_COLUMN,
     UNCLASSIFIED_FICHAS_COLUMN,
     adjudication_type_from_cells,
+    display_ficha_codes,
     evaluate_no_requirements,
+    no_requirements_metadata_header,
+    no_requirements_metadata_values,
     resolve_adjudication_type,
     scope_column_values,
 )
@@ -614,24 +617,46 @@ def ensure_header(sheet, header):
     LOG("SHEETS", f"{sheet}: header reordenado y alineado")
 
 
-def ensure_no_requirements_scope(sheet):
+def ensure_no_requirements_scope(sheet, adjudication_by_url=None):
     if "sin_requisitos" not in str(sheet).lower():
         return
     rows = gs_get(f"{sheet}!A1:ZZ")
-    values, changes = scope_column_values(
+    if not rows:
+        return
+
+    # Migra hojas antiguas conservando cada valor por nombre de columna.
+    target_header = no_requirements_metadata_header(rows[0])
+    ensure_header(sheet, target_header)
+    rows = gs_get(f"{sheet}!A1:ZZ")
+
+    values_by_column, changes_by_column = no_requirements_metadata_values(
         rows,
         no_requirements=FICHAS_SIN_REQ,
         requires_ct=FICHAS_CON_CT,
         requires_rs=FICHAS_CON_RS,
+        adjudication_by_url=adjudication_by_url,
+        link_normalizer=normalize_url,
     )
-    if not values or not changes:
+    if not values_by_column:
         return
-    scope_idx = find_idx(rows[0], NO_REQUIREMENTS_SCOPE_COLUMN)
-    if scope_idx is None:
-        return
-    column = _col_letter(scope_idx + 1)
-    gs_update(f"{sheet}!{column}2:{column}{len(values) + 1}", values)
-    LOG("SHEETS", f"{sheet}: clasificacion pura/mixta actualizada en {changes} fila(s)")
+
+    updated_cells = 0
+    for header_name, values in values_by_column.items():
+        changes = changes_by_column.get(header_name, 0)
+        if not values or not changes:
+            continue
+        column_idx = find_idx(rows[0], header_name)
+        if column_idx is None:
+            continue
+        column = _col_letter(column_idx + 1)
+        gs_update(f"{sheet}!{column}2:{column}{len(values) + 1}", values)
+        updated_cells += changes
+
+    if updated_cells:
+        detail = ", ".join(
+            f"{name}={count}" for name, count in changes_by_column.items() if count
+        )
+        LOG("SHEETS", f"{sheet}: metadata sin requisitos actualizada ({detail})")
 
 def delete_rows(sheet, rows_1b):
     sid = gs_sheet_id(sheet)
@@ -1161,6 +1186,40 @@ class PageTools:
         except NoSuchElementException:
             LOG("PAGE", "No Next."); return False
     def collect_links(self):
+        # Captura URL y modalidad en una sola operaciÃ³n del DOM. Esto evita
+        # referencias stale mientras Angular repinta la tabla.
+        try:
+            records = self.d.execute_script(
+                """
+                const selector = arguments[0];
+                return Array.from(document.querySelectorAll(selector)).map((anchor) => {
+                    const row = anchor.closest('tr');
+                    const cells = row ? Array.from(row.querySelectorAll(':scope > th, :scope > td')) : [];
+                    return {
+                        url: anchor.getAttribute('href') || anchor.getAttribute('data-uw-original-href') || '',
+                        modality: cells.length ? (cells[cells.length - 1].innerText || '') : ''
+                    };
+                });
+                """,
+                CFG["css_links"],
+            ) or []
+        except JavascriptException:
+            records = []
+        if records:
+            LOG("CAP", f"anchors={len(records)} | js={len(records)}")
+            urls = []
+            for record in records:
+                url = str(record.get("url") or "").strip()
+                if url.startswith("/"):
+                    url = f"https://{CFG['host']}{url}"
+                if not url:
+                    continue
+                urls.append(url)
+                mode = adjudication_type_from_cells([record.get("modality", "")])
+                if mode != ADJUDICATION_UNKNOWN:
+                    self.adjudication_by_url[normalize_url(url)] = mode
+            return urls
+
         anchors = self.find_css(CFG["css_links"])
         LOG("CAP", f"anchors={len(anchors)} | js={self.js_count(CFG['css_links'])}")
         urls = []
@@ -1329,9 +1388,13 @@ def scrape(page: PageTools, link: str, adjudication_type: str = ""):
         "has_rs": bool(fd_rs),
         "ficha_detectada": ficha_label,
         "fichas_base": fichas_base_ordered,
-        NO_REQUIREMENTS_FICHAS_COLUMN: ", ".join(no_requirements.no_requirements_fichas),
-        REQUIREMENTS_FICHAS_COLUMN: no_requirements.requirements_label,
-        UNCLASSIFIED_FICHAS_COLUMN: ", ".join(no_requirements.unclassified_fichas),
+        NO_REQUIREMENTS_FICHAS_COLUMN: display_ficha_codes(
+            no_requirements.no_requirements_fichas
+        ),
+        REQUIREMENTS_FICHAS_COLUMN: no_requirements.requirements_label or "Ninguna",
+        UNCLASSIFIED_FICHAS_COLUMN: display_ficha_codes(
+            no_requirements.unclassified_fichas
+        ),
         ADJUDICATION_TYPE_COLUMN: no_requirements.adjudication_type,
         NO_REQUIREMENTS_SCOPE_COLUMN: no_requirements.scope,
         "_eligible_sin_requisitos": no_requirements.eligible,
@@ -1445,6 +1508,14 @@ def main():
     )
     try: driver.quit()
     except: pass
+
+    try:
+        ensure_no_requirements_scope(
+            "cl_abiertas_rir_sin_requisitos",
+            listing_adjudication_by_url,
+        )
+    except Exception as exc:
+        LOG("SHEETS", f"cl_abiertas_rir_sin_requisitos: metadata pendiente: {type(exc).__name__}: {exc}")
 
     _, all_links = read_links_from_sheets(CFG["sheets_data"])
     all_links.update(load_cl_known_links())
