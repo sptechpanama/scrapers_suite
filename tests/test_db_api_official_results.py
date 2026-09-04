@@ -143,6 +143,25 @@ def test_parse_detail_recovers_all_participants_and_official_winner() -> None:
     assert row["resultado_fuente_estado"] == "completo_actas_oficiales"
     assert len(json.loads(row["proponentes_json"])) == 2
     assert json.loads(row["ganadores_json"])[0]["nombre"] == "RS ENGINEERING, S.A."
+    item_offers = json.loads(row["ofertas_items_json"])
+    assert item_offers == [
+        {
+            "proveedor": "RS ENGINEERING, S.A.",
+            "ruc": "1",
+            "renglon": "1",
+            "descripcion": "",
+            "cantidad": 0.0,
+            "unidad": "",
+            "precio_referencia_unitario": 0.0,
+            "precio_referencia_total": 0.0,
+            "precio_participacion_unitario": 0.0,
+            "precio_participacion_total": 72000.0,
+            "es_ganador": 1,
+            "fuente": "adjudicacion_oficial",
+        }
+    ]
+    assert row["ofertas_items_version"] == updater.RESULT_ENRICHMENT_VERSION
+    assert row["ofertas_items_estado"] == "completo"
 
 
 def test_deserted_act_keeps_participants_but_never_a_stale_winner() -> None:
@@ -186,3 +205,44 @@ def test_multiwinner_result_is_persisted_without_losing_any_winner() -> None:
         "OTRA EMPRESA",
     ]
     assert row["total_items_ofertados"] == "145500.00"
+
+
+def test_offer_item_details_preserve_official_unit_price_and_requested_line() -> None:
+    component = {
+        "tipo": "componentOfertasAdjudicadasProponentes",
+        "value": [
+            {
+                "empresa": {"nombreComercial": "PROVEEDOR UNO", "ruc": "8-1"},
+                "procesosOfertasItems": [
+                    {
+                        "precio": 12.5,
+                        "precioTotal": 133.75,
+                        "procesosContratacionItems": {
+                            "numRenglon": 3,
+                            "cantidad": 10,
+                            "unidad": "Unidad",
+                            "descripcion": "Producto ficha 43358",
+                            "precioReferencia": 160.5,
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+    assert updater._offer_item_details([component]) == [
+        {
+            "proveedor": "PROVEEDOR UNO",
+            "ruc": "8-1",
+            "renglon": "3",
+            "descripcion": "Producto ficha 43358",
+            "cantidad": 10.0,
+            "unidad": "Unidad",
+            "precio_referencia_unitario": 16.05,
+            "precio_referencia_total": 160.5,
+            "precio_participacion_unitario": 12.5,
+            "precio_participacion_total": 133.75,
+            "es_ganador": 1,
+            "fuente": "adjudicacion_oficial",
+        }
+    ]

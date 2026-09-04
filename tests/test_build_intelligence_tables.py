@@ -55,6 +55,134 @@ class BuilderUnitTests(unittest.TestCase):
         for raw, expected in cases.items():
             self.assertAlmostEqual(builder.parse_number(raw), expected, places=2)
 
+    def test_price_benchmarks_use_median_and_lower_quartile_per_unit(self) -> None:
+        eligible = pd.DataFrame(
+            [
+                {"ficha": "43358", "nombre_ficha": "KIT DE CIRCUITO"},
+                {"ficha": "99999", "nombre_ficha": "SIN HISTORICO"},
+            ]
+        )
+        samples = pd.DataFrame(
+            [
+                {
+                    **{column: None for column in builder.PRICE_SAMPLE_COLUMNS},
+                    "sample_key": f"sample-{index}",
+                    "ficha": "43358",
+                    "acto_key": f"acto-{index}",
+                    "line_number": "1",
+                    "unit_norm": "unidad",
+                    "reference_unit": reference,
+                    "participation_unit": participation,
+                    "provider": f"Proveedor {index}",
+                    "is_winner": 1 if index == 1 else 0,
+                    "sample_date": f"2026-0{index}-01",
+                    "binding_method": "ficha_renglon_explicito",
+                }
+                for index, (reference, participation) in enumerate(
+                    [(120, 100), (130, 110), (140, 120), (150, 130)], start=1
+                )
+            ],
+            columns=builder.PRICE_SAMPLE_COLUMNS,
+        )
+        result = builder.build_price_benchmarks(
+            eligible, samples, updated_at="2026-09-04T12:00:00"
+        ).set_index("ficha")
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result.loc["43358", "precio_referencia_tipico"], 135.0)
+        self.assertEqual(result.loc["43358", "precio_participacion_tipico"], 115.0)
+        self.assertEqual(result.loc["43358", "precio_competitivo_historico"], 107.5)
+        self.assertEqual(result.loc["43358", "actos_con_muestra"], 4)
+        self.assertEqual(result.loc["99999", "nivel_confianza"], "Sin muestra")
+
+    def test_price_samples_never_assign_a_multiline_act_without_line_evidence(self) -> None:
+        row = {
+            "id": 50,
+            "enlace": "https://example.test/acto/50",
+            "publicacion": "2026-09-01",
+            "fichas_detectadas_json": json.dumps(
+                [{"code": "43358", "field": "titulo", "score": 96}]
+            ),
+            "items_json": json.dumps(
+                [
+                    {"numero_renglon": "1", "cantidad": 10, "precio_referencia_total": 1000},
+                    {"numero_renglon": "2", "cantidad": 1, "precio_referencia_total": 100000},
+                ]
+            ),
+            "ofertas_items_json": json.dumps(
+                [
+                    {
+                        "renglon": "1",
+                        "cantidad": 10,
+                        "precio_participacion_unitario": 90,
+                        "proveedor": "PROVEEDOR",
+                    }
+                ]
+            ),
+        }
+        samples = builder.price_samples_for_row(
+            row, [{"ficha": "43358"}], [], "https://example.test/acto/50"
+        )
+        self.assertEqual(samples, [])
+
+    def test_price_samples_keep_explicit_line_unit_and_offer(self) -> None:
+        row = {
+            "id": 51,
+            "enlace": "https://example.test/acto/51",
+            "publicacion": "2026-09-01",
+            "fichas_detectadas_json": json.dumps(
+                [
+                    {
+                        "code": "43358",
+                        "field": "item_2",
+                        "method": "numero_explicito",
+                        "score": 100,
+                    }
+                ]
+            ),
+            "items_json": json.dumps(
+                [
+                    {
+                        "descripcion": "Otro producto",
+                        "numero_renglon": "1",
+                        "cantidad": 4,
+                        "unidad": "Caja",
+                        "precio_referencia_unitario": 20,
+                        "precio_referencia_total": 80,
+                    },
+                    {
+                        "descripcion": "Kit ficha 43358",
+                        "numero_renglon": "2",
+                        "cantidad": 10,
+                        "unidad": "Unidad",
+                        "precio_referencia_unitario": 15,
+                        "precio_referencia_total": 150,
+                    },
+                ]
+            ),
+            "ofertas_items_json": json.dumps(
+                [
+                    {
+                        "renglon": "2",
+                        "cantidad": 10,
+                        "unidad": "Unidad",
+                        "precio_participacion_unitario": 12.5,
+                        "precio_participacion_total": 125,
+                        "proveedor": "Proveedor Uno",
+                    }
+                ]
+            ),
+        }
+        samples = builder.price_samples_for_row(
+            row, [{"ficha": "43358"}], [], "https://example.test/acto/51"
+        )
+        reference = next(item for item in samples if item["sample_source"] == "api_renglon_referencia")
+        offer = next(item for item in samples if item["provider"] == "Proveedor Uno")
+        self.assertEqual(reference["line_number"], "2")
+        self.assertEqual(reference["unit_norm"], "unidad")
+        self.assertEqual(reference["reference_unit"], 15.0)
+        self.assertEqual(offer["participation_unit"], 12.5)
+        self.assertEqual(offer["unit_norm"], "unidad")
+
     def test_iso_and_local_dates_are_not_swapped(self) -> None:
         self.assertEqual(builder.parse_date("2026-07-12"), "2026-07-12")
         self.assertEqual(builder.parse_date("12/07/2026"), "2026-07-12")

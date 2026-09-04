@@ -66,7 +66,7 @@ DEFAULT_WORKERS = 12
 DEFAULT_BACKUP_KEEP = 4
 API_TIMEOUT = (10, 60)
 STATES = {1011: "Adjudicado", 16: "Desierto"}
-RESULT_ENRICHMENT_VERSION = "2026-08-26-actas-v1"
+RESULT_ENRICHMENT_VERSION = "2026-09-04-actas-renglones-v2"
 
 BASE_COLUMNS = {
     "fecha_actualizacion": "TEXT",
@@ -96,6 +96,9 @@ BASE_COLUMNS = {
     "num_participantes": "TEXT",
     "proponentes_json": "TEXT",
     "ganadores_json": "TEXT",
+    "ofertas_items_json": "TEXT",
+    "ofertas_items_version": "TEXT",
+    "ofertas_items_estado": "TEXT",
     "resultado_fuente_version": "TEXT",
     "resultado_fuente_estado": "TEXT",
 }
@@ -659,6 +662,9 @@ def fallback_row(record: dict[str, Any], state_name: str, run_stamp: str, matche
         "num_participantes": "",
         "proponentes_json": "[]",
         "ganadores_json": "[]",
+        "ofertas_items_json": "[]",
+        "ofertas_items_version": "",
+        "ofertas_items_estado": "detalle_principal_fallido",
         "resultado_fuente_version": "",
         "resultado_fuente_estado": "detalle_principal_fallido",
     }
@@ -792,6 +798,108 @@ def _dedupe_offers(values: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         }
         current["fuente"] = ",".join(sorted(sources))
     return [result[key] for key in order]
+
+
+def _offer_item_details(
+    components: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Conserva precios unitarios oficiales por proveedor y renglón.
+
+    Panamá Compra incluye esta evidencia dentro de ``procesosOfertasItems``.
+    Se guarda aparte de los totales legados para que la analítica pueda
+    comparar únicamente la ficha y el renglón explícitamente detectados, sin
+    repartir el total de un acto multificha.
+    """
+
+    records: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for component in components:
+        component_type = str(component.get("tipo") or "").strip()
+        component_type_norm = normalize_text(component_type).replace(" ", "")
+        if not any(
+            token in component_type_norm
+            for token in ("ofertasadjudicadas", "actascuadrocotizaciones")
+        ):
+            continue
+        is_winner = int("ofertasadjudicadas" in component_type_norm)
+        source = "adjudicacion_oficial" if is_winner else "acta_apertura"
+        for candidate in _nested_dicts(component.get("value")):
+            offered_items = candidate.get("procesosOfertasItems")
+            provider = _offer_name(candidate)
+            if not provider or not isinstance(offered_items, list):
+                continue
+            provider_key = normalize_text(provider)
+            for position, raw_item in enumerate(offered_items, start=1):
+                if not isinstance(raw_item, dict):
+                    continue
+                requested = raw_item.get("procesosContratacionItems")
+                requested = requested if isinstance(requested, dict) else {}
+                line_number = str(
+                    requested.get("numRenglon")
+                    or requested.get("numeroRenglon")
+                    or raw_item.get("numRenglon")
+                    or raw_item.get("numeroRenglon")
+                    or position
+                ).strip()
+                quantity = _first_money(
+                    requested,
+                    ("cantidad", "cantidadSolicitada", "cantidadRequerida", "quantity"),
+                )
+                offer_unit = _first_money(
+                    raw_item,
+                    ("precio", "precioUnitario", "nuevoPrecio", "unitPrice"),
+                )
+                offer_total = _first_money(
+                    raw_item,
+                    ("precioTotal", "nuevoPrecioTotal", "montoTotal", "total"),
+                )
+                if offer_unit is None and offer_total is not None and quantity and quantity > 0:
+                    offer_unit = offer_total / quantity
+                if offer_total is None and offer_unit is not None and quantity and quantity > 0:
+                    offer_total = offer_unit * quantity
+                reference_total = _first_money(
+                    requested,
+                    (
+                        "precioReferenciaTotal",
+                        "montoReferencia",
+                        "montoTotalReferencia",
+                        "precioTotalReferencia",
+                        "precioReferencia",
+                    ),
+                )
+                reference_unit = _first_money(
+                    requested,
+                    ("precioReferenciaUnitario", "precioUnitarioReferencia"),
+                )
+                if reference_unit is None and reference_total is not None and quantity and quantity > 0:
+                    reference_unit = reference_total / quantity
+                record = {
+                    "proveedor": provider,
+                    "ruc": _offer_ruc(candidate),
+                    "renglon": line_number,
+                    "descripcion": _item_description(requested)
+                    or _item_description(raw_item),
+                    "cantidad": float(quantity or 0.0),
+                    "unidad": str(
+                        requested.get("unidad")
+                        or requested.get("unidadMedida")
+                        or requested.get("nombreUnidad")
+                        or ""
+                    ).strip(),
+                    "precio_referencia_unitario": float(reference_unit or 0.0),
+                    "precio_referencia_total": float(reference_total or 0.0),
+                    "precio_participacion_unitario": float(offer_unit or 0.0),
+                    "precio_participacion_total": float(offer_total or 0.0),
+                    "es_ganador": is_winner,
+                    "fuente": source,
+                }
+                key = (provider_key, line_number, source)
+                previous = records.get(key)
+                if previous is None or (
+                    record["precio_participacion_unitario"] > 0
+                    and previous["precio_participacion_unitario"] <= 0
+                ):
+                    records[key] = record
+    return list(records.values())
 
 
 def _official_result_pages(
@@ -971,6 +1079,7 @@ def parse_detail(
         flow=flow,
     )
     all_result_components = [*components, *result_components]
+    offer_item_details = _offer_item_details(all_result_components)
 
     title = _label(labels, "Título") or str(record.get("titulo") or "").strip()
     description = _label(labels, "Descripción") or str(record.get("observaciones") or "").strip()
@@ -1086,6 +1195,13 @@ def parse_detail(
             ensure_ascii=False,
             separators=(",", ":"),
         ),
+        "ofertas_items_json": json.dumps(
+            offer_item_details,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        "ofertas_items_version": RESULT_ENRICHMENT_VERSION,
+        "ofertas_items_estado": "completo" if result_failures == 0 else "parcial_actas",
         "resultado_fuente_version": RESULT_ENRICHMENT_VERSION if result_complete else "",
         "resultado_fuente_estado": result_status,
     }
@@ -1423,6 +1539,16 @@ def filter_new_records(records: list[dict[str, Any]]) -> tuple[list[dict[str, An
             if "Proponente 1" in table_columns
             else "''"
         )
+        offer_items_version_expr = (
+            "COALESCE(ofertas_items_version,'')"
+            if "ofertas_items_version" in table_columns
+            else "''"
+        )
+        offer_items_status_expr = (
+            "COALESCE(ofertas_items_estado,'')"
+            if "ofertas_items_estado" in table_columns
+            else "''"
+        )
         for offset in range(0, len(links), 800):
             chunk = links[offset : offset + 800]
             placeholders = ",".join("?" for _ in chunk)
@@ -1430,7 +1556,9 @@ def filter_new_records(records: list[dict[str, Any]]) -> tuple[list[dict[str, An
                 "SELECT enlace,estado,resultado_fuente_version,razon_social,"
                 "nombre_comercial,proponentes_json,ganadores_json,"
                 "resultado_fuente_estado,"
-                f"{first_proponent_expr} AS first_proponent "
+                f"{first_proponent_expr} AS first_proponent,"
+                f"{offer_items_version_expr} AS offer_items_version,"
+                f"{offer_items_status_expr} AS offer_items_status "
                 f"FROM actos_publicos WHERE enlace IN ({placeholders})"
             )
             for row in conn.execute(query, chunk):
@@ -1443,6 +1571,8 @@ def filter_new_records(records: list[dict[str, Any]]) -> tuple[list[dict[str, An
                     "ganadores_json": str(row[6] or "").strip(),
                     "resultado_fuente_estado": str(row[7] or "").strip(),
                     "first_proponent": str(row[8] or "").strip(),
+                    "offer_items_version": str(row[9] or "").strip(),
+                    "offer_items_status": str(row[10] or "").strip(),
                 }
     selected: list[dict[str, Any]] = []
     for record, link in zip(records, links):
@@ -1477,11 +1607,19 @@ def filter_new_records(records: list[dict[str, Any]]) -> tuple[list[dict[str, An
                 == "actas_con_error_temporal"
             )
         )
+        needs_offer_item_enrichment = bool(
+            existing
+            and (
+                existing.get("offer_items_version") != RESULT_ENRICHMENT_VERSION
+                or existing.get("offer_items_status") == "parcial_actas"
+            )
+        )
         if (
             existing is None
             or flow in failed_flows
             or (target_state and target_state != existing_state)
             or needs_result_enrichment
+            or needs_offer_item_enrichment
         ):
             selected.append(record)
     return selected, len(records) - len(selected)
@@ -1666,6 +1804,10 @@ def sync_postgres(run_stamp: str, *, full: bool = False) -> bool:
     try:
         connection.autocommit = False
         with connection.cursor() as cursor:
+            # La reconciliacion completa puede superar el limite por defecto de
+            # Supabase cuando la tabla ya contiene cientos de miles de actos.
+            # El timeout queda desactivado solo dentro de esta transaccion.
+            cursor.execute("SET LOCAL statement_timeout = 0")
             cursor.execute(
                 """CREATE TABLE IF NOT EXISTS actos_publicos (
                     id BIGSERIAL PRIMARY KEY, enlace TEXT UNIQUE

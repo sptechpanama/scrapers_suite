@@ -68,8 +68,9 @@ def test_known_unchanged_act_is_skipped_but_state_change_is_selected(tmp_path) -
             connection.executemany(
                 """INSERT INTO actos_publicos(
                        enlace,estado,razon_social,proponentes_json,
-                       ganadores_json,resultado_fuente_version
-                   ) VALUES(?,?,?,?,?,?)""",
+                       ganadores_json,resultado_fuente_version,
+                       ofertas_items_version,ofertas_items_estado
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
                 [
                     (
                         updater.process_link(adjudicated),
@@ -78,6 +79,8 @@ def test_known_unchanged_act_is_skipped_but_state_change_is_selected(tmp_path) -
                         '[{"nombre":"GANADOR","monto":100}]',
                         '[{"nombre":"GANADOR","monto":100}]',
                         updater.RESULT_ENRICHMENT_VERSION,
+                        updater.RESULT_ENRICHMENT_VERSION,
+                        "completo",
                     ),
                     (
                         updater.process_link(changed),
@@ -86,6 +89,8 @@ def test_known_unchanged_act_is_skipped_but_state_change_is_selected(tmp_path) -
                         "[]",
                         "[]",
                         updater.RESULT_ENRICHMENT_VERSION,
+                        updater.RESULT_ENRICHMENT_VERSION,
+                        "completo",
                     ),
                 ],
             )
@@ -143,9 +148,14 @@ def test_incomplete_result_is_enriched_once(tmp_path) -> None:
                        razon_social='RS ENGINEERING',
                        proponentes_json='[{"nombre":"RS ENGINEERING","monto":72000}]',
                        ganadores_json='[{"nombre":"RS ENGINEERING","monto":72000}]',
-                       resultado_fuente_version=?
+                       resultado_fuente_version=?,
+                       ofertas_items_version=?, ofertas_items_estado='completo'
                    WHERE enlace=?""",
-                (updater.RESULT_ENRICHMENT_VERSION, link),
+                    (
+                        updater.RESULT_ENRICHMENT_VERSION,
+                        updater.RESULT_ENRICHMENT_VERSION,
+                        link,
+                    ),
             )
 
         selected, known = updater.filter_new_records([record])

@@ -37,7 +37,7 @@ DEFAULT_ALIAS_JSON = REPO_ROOT / "data" / "fichas" / "ficha_aliases.json"
 DEFAULT_CLASSIFICATION_XLSX = REPO_ROOT / "data" / "fichas" / "todas_las_fichas.xlsx"
 DEFAULT_RISK_CLASS_XLSX = REPO_ROOT / "minsa_scraper" / "outputs" / "fichas_ctni.xlsx"
 
-ANALYTICS_SCHEMA_VERSION = "3.5.0"
+ANALYTICS_SCHEMA_VERSION = "3.6.0"
 SOURCE_CHUNK_SIZE = 5_000
 WRITE_CHUNK_SIZE = 5_000
 SQLITE_MAX_BOUND_PARAMETERS = 30_000
@@ -122,6 +122,47 @@ CATALOG_COLUMNS = [
     "marca",
     "modelo_web",
     "estado_catalogo",
+]
+
+PRICE_SAMPLE_COLUMNS = [
+    "sample_key",
+    "ficha",
+    "acto_key",
+    "source_id",
+    "enlace",
+    "line_number",
+    "line_description",
+    "quantity",
+    "unit",
+    "unit_norm",
+    "reference_unit",
+    "reference_total",
+    "participation_unit",
+    "participation_total",
+    "provider",
+    "is_winner",
+    "sample_date",
+    "binding_method",
+    "sample_source",
+]
+
+PRICE_BENCHMARK_COLUMNS = [
+    "ficha",
+    "nombre_ficha",
+    "unidad_comparable",
+    "precio_referencia_tipico",
+    "precio_participacion_tipico",
+    "precio_competitivo_historico",
+    "actos_con_muestra",
+    "muestras_referencia",
+    "muestras_participacion",
+    "muestras_ganadoras",
+    "unidad_dominante_pct",
+    "mapeo_explicito_pct",
+    "ultima_muestra",
+    "nivel_confianza",
+    "confianza_precio",
+    "updated_at",
 ]
 
 
@@ -375,6 +416,11 @@ def parse_item_details(raw_value: object) -> list[dict[str, Any]]:
                 or item.get("quantity")
                 or item.get("cantidadSolicitada")
             )
+            unit = clean_text(
+                item.get("unidad")
+                or item.get("unidadMedida")
+                or item.get("nombreUnidad")
+            )
             reference_unit = parse_number(
                 item.get("precio_referencia_unitario")
                 or item.get("precioReferenciaUnitario")
@@ -393,6 +439,7 @@ def parse_item_details(raw_value: object) -> list[dict[str, Any]]:
             description = clean_text(item)
             line_number = str(position)
             quantity = 0.0
+            unit = ""
             reference_unit = 0.0
             reference_total = 0.0
         if not description:
@@ -403,11 +450,406 @@ def parse_item_details(raw_value: object) -> list[dict[str, Any]]:
                 "line_number": line_number,
                 "description": description,
                 "quantity": quantity,
+                "unit": unit,
                 "reference_unit": reference_unit,
                 "reference_total": reference_total,
             }
         )
     return details
+
+
+def parse_offer_item_details(raw_value: object) -> list[dict[str, Any]]:
+    """Normaliza ofertas oficiales por renglón guardadas por el actualizador."""
+
+    if isinstance(raw_value, list):
+        payload = raw_value
+    else:
+        try:
+            payload = json.loads(clean_text(raw_value) or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = []
+    if not isinstance(payload, list):
+        return []
+    output: list[dict[str, Any]] = []
+    for position, item in enumerate(payload, start=1):
+        if not isinstance(item, Mapping):
+            continue
+        quantity = parse_number(item.get("cantidad"))
+        participation_unit = parse_number(item.get("precio_participacion_unitario"))
+        participation_total = parse_number(item.get("precio_participacion_total"))
+        if participation_unit <= 0 and participation_total > 0 and quantity > 0:
+            participation_unit = participation_total / quantity
+        output.append(
+            {
+                "line_number": clean_text(item.get("renglon") or position),
+                "description": clean_text(item.get("descripcion")),
+                "quantity": quantity,
+                "unit": clean_text(item.get("unidad")),
+                "reference_unit": parse_number(item.get("precio_referencia_unitario")),
+                "reference_total": parse_number(item.get("precio_referencia_total")),
+                "participation_unit": participation_unit,
+                "participation_total": participation_total,
+                "provider": clean_text(item.get("proveedor")),
+                "is_winner": int(parse_int(item.get("es_ganador")) > 0),
+                "source": clean_text(item.get("fuente")) or "api_oferta_renglon",
+            }
+        )
+    return output
+
+
+def normalize_unit(value: object) -> str:
+    """Agrupa variantes obvias sin mezclar presentaciones incompatibles."""
+
+    normalized = normalize_text(value)
+    aliases = {
+        "unidad": "unidad",
+        "unidades": "unidad",
+        "und": "unidad",
+        "caja": "caja",
+        "cajas": "caja",
+        "paquete": "paquete",
+        "paquetes": "paquete",
+        "paq": "paquete",
+        "kit": "kit",
+        "kits": "kit",
+        "juego": "juego",
+        "juegos": "juego",
+        "rollo": "rollo",
+        "rollos": "rollo",
+        "par": "par",
+        "pares": "par",
+        "docena": "docena",
+        "docenas": "docena",
+        "litro": "litro",
+        "litros": "litro",
+        "metro": "metro",
+        "metros": "metro",
+    }
+    return aliases.get(normalized, normalized or "sin_unidad")
+
+
+def _line_identity(value: object, fallback: int = 0) -> str:
+    raw = clean_text(value)
+    match = re.search(r"\d+", raw)
+    return str(int(match.group(0))) if match else (str(fallback) if fallback else raw)
+
+
+def _price_sample_key(*parts: object) -> str:
+    raw = "|".join(clean_text(part).lower() for part in parts)
+    return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def price_samples_for_row(
+    row: Mapping[str, Any],
+    evidences: Sequence[Mapping[str, Any]],
+    proponents: Sequence[Mapping[str, Any]],
+    acto_key: str,
+) -> list[dict[str, Any]]:
+    """Crea muestras comparables sin repartir importes globales.
+
+    Solo vincula una ficha a un renglón cuando el detector indicó ese item o
+    cuando el acto contiene exactamente un renglón y una ficha distinta.
+    """
+
+    items = parse_item_details(row.get("items_json"))
+    offers = parse_offer_item_details(row.get("ofertas_items_json"))
+    distinct_count = len({clean_text(item.get("ficha")) for item in evidences})
+    sample_date = (
+        parse_date(row.get("fecha_adjudicacion"))
+        or parse_date(row.get("publicacion"))
+        or parse_date(row.get("fecha_actualizacion"))
+    )
+    source_id = clean_text(row.get("id"))
+    link = clean_text(row.get("enlace"))
+    records: dict[str, dict[str, Any]] = {}
+
+    for evidence in evidences:
+        ficha = clean_text(evidence.get("ficha"))
+        if not ficha:
+            continue
+        positions = _detected_item_positions(row, ficha)
+        explicit = bool(positions)
+        if positions:
+            matched_items = [item for item in items if int(item["position"]) in positions]
+            binding_method = "ficha_renglon_explicito"
+        elif len(items) == 1 and distinct_count == 1:
+            matched_items = list(items)
+            binding_method = "acto_un_renglon_ficha_unica"
+        else:
+            matched_items = []
+            binding_method = "sin_vinculo_renglon"
+        allowed_lines = {
+            _line_identity(item.get("line_number"), int(item.get("position") or 0))
+            for item in matched_items
+        }
+        item_by_line = {
+            _line_identity(item.get("line_number"), int(item.get("position") or 0)): item
+            for item in matched_items
+        }
+
+        for item in matched_items:
+            line_number = _line_identity(
+                item.get("line_number"), int(item.get("position") or 0)
+            )
+            reference_unit = parse_number(item.get("reference_unit"))
+            reference_total = parse_number(item.get("reference_total"))
+            quantity = parse_number(item.get("quantity"))
+            if reference_unit <= 0 and reference_total > 0 and quantity > 0:
+                reference_unit = reference_total / quantity
+            if reference_unit <= 0:
+                continue
+            sample_key = _price_sample_key(ficha, acto_key, line_number, "referencia")
+            records[sample_key] = {
+                "sample_key": sample_key,
+                "ficha": ficha,
+                "acto_key": acto_key,
+                "source_id": source_id,
+                "enlace": link,
+                "line_number": line_number,
+                "line_description": clean_text(item.get("description")),
+                "quantity": quantity,
+                "unit": clean_text(item.get("unit")),
+                "unit_norm": normalize_unit(item.get("unit")),
+                "reference_unit": reference_unit,
+                "reference_total": reference_total,
+                "participation_unit": 0.0,
+                "participation_total": 0.0,
+                "provider": "",
+                "is_winner": 0,
+                "sample_date": sample_date,
+                "binding_method": binding_method,
+                "sample_source": "api_renglon_referencia",
+            }
+
+        participation_found = False
+        for offer in offers:
+            line_number = _line_identity(offer.get("line_number"))
+            if line_number not in allowed_lines:
+                continue
+            participation_unit = parse_number(offer.get("participation_unit"))
+            if participation_unit <= 0:
+                continue
+            base_item = item_by_line.get(line_number, {})
+            quantity = parse_number(offer.get("quantity")) or parse_number(base_item.get("quantity"))
+            unit = clean_text(offer.get("unit")) or clean_text(base_item.get("unit"))
+            provider = clean_text(offer.get("provider"))
+            sample_key = _price_sample_key(
+                ficha, acto_key, line_number, normalize_text(provider), offer.get("source")
+            )
+            records[sample_key] = {
+                "sample_key": sample_key,
+                "ficha": ficha,
+                "acto_key": acto_key,
+                "source_id": source_id,
+                "enlace": link,
+                "line_number": line_number,
+                "line_description": clean_text(offer.get("description"))
+                or clean_text(base_item.get("description")),
+                "quantity": quantity,
+                "unit": unit,
+                "unit_norm": normalize_unit(unit),
+                "reference_unit": parse_number(offer.get("reference_unit"))
+                or parse_number(base_item.get("reference_unit")),
+                "reference_total": parse_number(offer.get("reference_total"))
+                or parse_number(base_item.get("reference_total")),
+                "participation_unit": participation_unit,
+                "participation_total": parse_number(offer.get("participation_total")),
+                "provider": provider,
+                "is_winner": int(parse_int(offer.get("is_winner")) > 0),
+                "sample_date": sample_date,
+                "binding_method": binding_method,
+                "sample_source": clean_text(offer.get("source")) or "api_oferta_renglon",
+            }
+            participation_found = True
+
+        # Respaldo conservador para actos de un solo renglón: el total de cada
+        # propuesta pertenece necesariamente a ese único renglón.
+        if matched_items and len(items) == 1 and distinct_count == 1 and not participation_found:
+            item = matched_items[0]
+            quantity = parse_number(item.get("quantity"))
+            if quantity > 0:
+                line_number = _line_identity(item.get("line_number"), 1)
+                for proponent in proponents:
+                    total = parse_number(proponent.get("offered_amount"))
+                    provider = clean_text(proponent.get("proveedor"))
+                    if total <= 0 or not provider:
+                        continue
+                    sample_key = _price_sample_key(
+                        ficha, acto_key, line_number, normalize_text(provider), "total_un_renglon"
+                    )
+                    records[sample_key] = {
+                        "sample_key": sample_key,
+                        "ficha": ficha,
+                        "acto_key": acto_key,
+                        "source_id": source_id,
+                        "enlace": link,
+                        "line_number": line_number,
+                        "line_description": clean_text(item.get("description")),
+                        "quantity": quantity,
+                        "unit": clean_text(item.get("unit")),
+                        "unit_norm": normalize_unit(item.get("unit")),
+                        "reference_unit": parse_number(item.get("reference_unit")),
+                        "reference_total": parse_number(item.get("reference_total")),
+                        "participation_unit": total / quantity,
+                        "participation_total": total,
+                        "provider": provider,
+                        "is_winner": int(parse_int(proponent.get("is_winner")) > 0),
+                        "sample_date": sample_date,
+                        "binding_method": "acto_un_renglon_ficha_unica",
+                        "sample_source": "propuesta_total_un_renglon",
+                    }
+    return list(records.values())
+
+
+def _robust_price_values(values: pd.Series) -> pd.Series:
+    """Descarta solo extremos estadísticos claros en escala logarítmica."""
+
+    numeric = pd.to_numeric(values, errors="coerce")
+    numeric = numeric[numeric.gt(0) & numeric.map(math.isfinite)]
+    if len(numeric) < 6:
+        return numeric
+    logged = numeric.map(math.log)
+    q1, q3 = logged.quantile([0.25, 0.75])
+    iqr = float(q3 - q1)
+    if not math.isfinite(iqr) or iqr <= 0:
+        return numeric
+    mask = logged.between(q1 - 1.5 * iqr, q3 + 1.5 * iqr)
+    retained = numeric[mask]
+    return retained if len(retained) >= max(3, len(numeric) // 2) else numeric
+
+
+def build_price_benchmarks(
+    eligible_fichas: pd.DataFrame,
+    samples: pd.DataFrame,
+    *,
+    updated_at: str,
+) -> pd.DataFrame:
+    """Resume precios unitarios para todo el universo elegible, incluso sin muestra."""
+
+    if eligible_fichas.empty:
+        return pd.DataFrame(columns=PRICE_BENCHMARK_COLUMNS)
+    sample_frame = samples.copy() if samples is not None else pd.DataFrame()
+    records: list[dict[str, Any]] = []
+    for _, eligible in eligible_fichas.drop_duplicates("ficha").iterrows():
+        ficha = clean_text(eligible.get("ficha"))
+        group = (
+            sample_frame.loc[sample_frame["ficha"].astype(str).eq(ficha)].copy()
+            if not sample_frame.empty and "ficha" in sample_frame
+            else pd.DataFrame(columns=PRICE_SAMPLE_COLUMNS)
+        )
+        comparable = group.loc[
+            pd.to_numeric(group.get("reference_unit"), errors="coerce").fillna(0).gt(0)
+            | pd.to_numeric(group.get("participation_unit"), errors="coerce").fillna(0).gt(0)
+        ].copy() if not group.empty else group
+        if comparable.empty:
+            records.append(
+                {
+                    "ficha": ficha,
+                    "nombre_ficha": clean_text(eligible.get("nombre_ficha")) or f"Ficha {ficha}",
+                    "unidad_comparable": "",
+                    "precio_referencia_tipico": None,
+                    "precio_participacion_tipico": None,
+                    "precio_competitivo_historico": None,
+                    "actos_con_muestra": 0,
+                    "muestras_referencia": 0,
+                    "muestras_participacion": 0,
+                    "muestras_ganadoras": 0,
+                    "unidad_dominante_pct": 0.0,
+                    "mapeo_explicito_pct": 0.0,
+                    "ultima_muestra": "",
+                    "nivel_confianza": "Sin muestra",
+                    "confianza_precio": "Sin muestra (0 actos, 0 ofertas; falta evidencia ficha-renglón comparable)",
+                    "updated_at": updated_at,
+                }
+            )
+            continue
+
+        participation_mask = pd.to_numeric(
+            comparable["participation_unit"], errors="coerce"
+        ).fillna(0).gt(0)
+        unit_basis = comparable.loc[participation_mask]
+        if unit_basis.empty:
+            unit_basis = comparable
+        unit_counts = unit_basis["unit_norm"].fillna("sin_unidad").astype(str).value_counts()
+        dominant_unit = str(unit_counts.index[0])
+        dominant = comparable.loc[
+            comparable["unit_norm"].fillna("sin_unidad").astype(str).eq(dominant_unit)
+        ].copy()
+        unit_dominance = 100.0 * float(unit_counts.iloc[0]) / max(1, int(unit_counts.sum()))
+
+        reference_rows = dominant.loc[
+            pd.to_numeric(dominant["reference_unit"], errors="coerce").fillna(0).gt(0)
+        ].drop_duplicates(["acto_key", "line_number"])
+        participation_rows = dominant.loc[
+            pd.to_numeric(dominant["participation_unit"], errors="coerce").fillna(0).gt(0)
+        ].drop_duplicates(["acto_key", "line_number", "provider"])
+        reference_values = _robust_price_values(reference_rows.get("reference_unit", pd.Series(dtype=float)))
+        participation_values = _robust_price_values(
+            participation_rows.get("participation_unit", pd.Series(dtype=float))
+        )
+        explicit_ratio = 100.0 * float(
+            dominant["binding_method"].fillna("").astype(str).eq("ficha_renglon_explicito").mean()
+        )
+        acts_count = int(dominant["acto_key"].nunique())
+        offer_count = int(len(participation_rows))
+        winner_count = int(
+            pd.to_numeric(participation_rows.get("is_winner"), errors="coerce").fillna(0).gt(0).sum()
+        )
+        latest = max(
+            (
+                clean_text(value)
+                for value in dominant.get("sample_date", pd.Series(dtype=str)).tolist()
+                if clean_text(value)
+            ),
+            default="",
+        )
+        if (
+            acts_count >= 5
+            and offer_count >= 8
+            and explicit_ratio >= 75
+            and unit_dominance >= 75
+        ):
+            confidence = "Alta"
+        elif acts_count >= 3 and (offer_count >= 3 or len(reference_rows) >= 4) and unit_dominance >= 60:
+            confidence = "Media"
+        else:
+            confidence = "Baja"
+        basis = (
+            f"{confidence} ({acts_count} actos, {offer_count} ofertas, "
+            f"{explicit_ratio:.0f}% ficha-renglón explícito, unidad dominante "
+            f"{unit_dominance:.0f}%, última muestra: {latest[:7] or 'sin fecha'})"
+        )
+        records.append(
+            {
+                "ficha": ficha,
+                "nombre_ficha": clean_text(eligible.get("nombre_ficha")) or f"Ficha {ficha}",
+                "unidad_comparable": dominant_unit.replace("_", " ").title(),
+                "precio_referencia_tipico": (
+                    round(float(reference_values.median()), 6) if not reference_values.empty else None
+                ),
+                "precio_participacion_tipico": (
+                    round(float(participation_values.median()), 6)
+                    if not participation_values.empty
+                    else None
+                ),
+                "precio_competitivo_historico": (
+                    round(float(participation_values.quantile(0.25)), 6)
+                    if not participation_values.empty
+                    else None
+                ),
+                "actos_con_muestra": acts_count,
+                "muestras_referencia": int(len(reference_rows)),
+                "muestras_participacion": offer_count,
+                "muestras_ganadoras": winner_count,
+                "unidad_dominante_pct": round(unit_dominance, 2),
+                "mapeo_explicito_pct": round(explicit_ratio, 2),
+                "ultima_muestra": latest,
+                "nivel_confianza": confidence,
+                "confianza_precio": basis,
+                "updated_at": updated_at,
+            }
+        )
+    return pd.DataFrame(records, columns=PRICE_BENCHMARK_COLUMNS)
 
 
 def _all_detection_entries(row: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -541,6 +983,7 @@ def source_rows(connection: sqlite3.Connection, chunk_size: int = SOURCE_CHUNK_S
         "fecha_adjudicacion", "fecha_actualizacion", "precio_referencia", "total_items_ofertados",
         "num_participantes", "razon_social", "nombre_comercial", "ficha_detectada",
         "fichas_detectadas_json", "ficha_detector_version", "ficha_catalogo_version", "items_json",
+        "ofertas_items_json",
     }
     for index in range(1, 15):
         required.add(f"Proponente {index}")
@@ -982,6 +1425,8 @@ def _create_local_schema(connection: sqlite3.Connection) -> None:
         DROP TABLE IF EXISTS intel_metricas_ficha_mes;
         DROP TABLE IF EXISTS intel_ficha_metadata;
         DROP TABLE IF EXISTS intel_ficha_catalogo;
+        DROP TABLE IF EXISTS intel_ficha_price_samples;
+        DROP TABLE IF EXISTS intel_ficha_price_benchmarks;
         DROP TABLE IF EXISTS intel_build_metadata;
 
         CREATE TABLE intel_actos_fichas (
@@ -1094,6 +1539,47 @@ def _create_local_schema(connection: sqlite3.Connection) -> None:
             estado_catalogo TEXT
         );
 
+        CREATE TABLE intel_ficha_price_samples (
+            sample_key TEXT PRIMARY KEY,
+            ficha TEXT NOT NULL,
+            acto_key TEXT NOT NULL,
+            source_id TEXT,
+            enlace TEXT,
+            line_number TEXT,
+            line_description TEXT,
+            quantity REAL,
+            unit TEXT,
+            unit_norm TEXT,
+            reference_unit REAL,
+            reference_total REAL,
+            participation_unit REAL,
+            participation_total REAL,
+            provider TEXT,
+            is_winner INTEGER NOT NULL DEFAULT 0,
+            sample_date TEXT,
+            binding_method TEXT,
+            sample_source TEXT
+        );
+
+        CREATE TABLE intel_ficha_price_benchmarks (
+            ficha TEXT PRIMARY KEY,
+            nombre_ficha TEXT,
+            unidad_comparable TEXT,
+            precio_referencia_tipico REAL,
+            precio_participacion_tipico REAL,
+            precio_competitivo_historico REAL,
+            actos_con_muestra INTEGER NOT NULL DEFAULT 0,
+            muestras_referencia INTEGER NOT NULL DEFAULT 0,
+            muestras_participacion INTEGER NOT NULL DEFAULT 0,
+            muestras_ganadoras INTEGER NOT NULL DEFAULT 0,
+            unidad_dominante_pct REAL NOT NULL DEFAULT 0,
+            mapeo_explicito_pct REAL NOT NULL DEFAULT 0,
+            ultima_muestra TEXT,
+            nivel_confianza TEXT,
+            confianza_precio TEXT,
+            updated_at TEXT
+        );
+
         CREATE TABLE intel_build_metadata (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -1124,6 +1610,10 @@ def _create_local_indexes(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_ifc_ficha ON intel_ficha_catalogo(ficha);
         CREATE INDEX IF NOT EXISTS idx_ifc_oferente ON intel_ficha_catalogo(oferente);
         CREATE INDEX IF NOT EXISTS idx_ifm_search ON intel_ficha_metadata(search_text_norm);
+        CREATE INDEX IF NOT EXISTS idx_ifps_ficha ON intel_ficha_price_samples(ficha);
+        CREATE INDEX IF NOT EXISTS idx_ifps_acto ON intel_ficha_price_samples(acto_key);
+        CREATE INDEX IF NOT EXISTS idx_ifps_date ON intel_ficha_price_samples(sample_date);
+        CREATE INDEX IF NOT EXISTS idx_ifpb_confidence ON intel_ficha_price_benchmarks(nivel_confianza, ficha);
         ANALYZE;
         """
     )
@@ -1199,6 +1689,104 @@ def load_confirmed_line_amounts(
     return output
 
 
+def load_confirmed_price_samples(source: sqlite3.Connection) -> pd.DataFrame:
+    """Convierte estudios profundos confiables en muestras unitarias reutilizables."""
+
+    table_exists = source.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='intel_ficha_line_amounts'"
+    ).fetchone()
+    if not table_exists:
+        return pd.DataFrame(columns=PRICE_SAMPLE_COLUMNS)
+    columns = {
+        str(row[1])
+        for row in source.execute("PRAGMA table_info(intel_ficha_line_amounts)")
+    }
+    required = {"ficha", "acto_url", "line_key", "requires_review"}
+    if not required.issubset(columns):
+        return pd.DataFrame(columns=PRICE_SAMPLE_COLUMNS)
+
+    def optional(column: str, fallback: str = "NULL") -> str:
+        return f'l."{column}"' if column in columns else fallback
+
+    query = f"""
+        SELECT l.ficha, l.acto_url,
+               COALESCE(NULLIF({optional('renglon_id', "''")}, ''),
+                        NULLIF({optional('renglon_numero', "''")}, ''), l.line_key) AS line_number,
+               {optional('line_description', "''")} AS line_description,
+               {optional('cantidad', '0')} AS quantity,
+               {optional('unidad_medida', "''")} AS unit,
+               {optional('reference_unit', '0')} AS reference_unit,
+               {optional('reference_total', '0')} AS reference_total,
+               {optional('participation_unit', '0')} AS participation_unit,
+               {optional('participation_total', '0')} AS participation_total,
+               {optional('provider', "''")} AS provider,
+               {optional('binding_method', "''")} AS binding_method,
+               COALESCE(a.id, '') AS source_id,
+               COALESCE(a.fecha_adjudicacion, a.publicacion, a.fecha_actualizacion, '') AS sample_date
+        FROM intel_ficha_line_amounts l
+        LEFT JOIN actos_publicos a ON a.enlace = l.acto_url
+        WHERE COALESCE(l.requires_review, 1) = 0
+          AND trim(COALESCE(l.ficha, '')) <> ''
+          AND trim(COALESCE(l.acto_url, '')) <> ''
+    """
+    raw = pd.read_sql_query(query, source)
+    records: list[dict[str, Any]] = []
+    for row in raw.to_dict(orient="records"):
+        ficha = _normalize_ficha(row.get("ficha"))
+        acto_key = clean_text(row.get("acto_url"))
+        line_number = _line_identity(row.get("line_number"))
+        quantity = parse_number(row.get("quantity"))
+        reference_total = parse_number(row.get("reference_total"))
+        participation_total = parse_number(row.get("participation_total"))
+        reference_unit = parse_number(row.get("reference_unit"))
+        participation_unit = parse_number(row.get("participation_unit"))
+        if reference_unit <= 0 and reference_total > 0 and quantity > 0:
+            reference_unit = reference_total / quantity
+        if participation_unit <= 0 and participation_total > 0 and quantity > 0:
+            participation_unit = participation_total / quantity
+        if not ficha or not acto_key or not line_number or (
+            reference_unit <= 0 and participation_unit <= 0
+        ):
+            continue
+        provider = clean_text(row.get("provider"))
+        sample_key = _price_sample_key(
+            ficha,
+            acto_key,
+            line_number,
+            normalize_text(provider),
+            "estudio_profundo_renglon",
+        )
+        records.append(
+            {
+                "sample_key": sample_key,
+                "ficha": ficha,
+                "acto_key": acto_key,
+                "source_id": clean_text(row.get("source_id")),
+                "enlace": acto_key,
+                "line_number": line_number,
+                "line_description": clean_text(row.get("line_description")),
+                "quantity": quantity,
+                "unit": clean_text(row.get("unit")),
+                "unit_norm": normalize_unit(row.get("unit")),
+                "reference_unit": reference_unit,
+                "reference_total": reference_total,
+                "participation_unit": participation_unit,
+                "participation_total": participation_total,
+                "provider": provider,
+                "is_winner": 0,
+                "sample_date": parse_date(row.get("sample_date")),
+                "binding_method": clean_text(row.get("binding_method"))
+                or "estudio_profundo_renglon",
+                "sample_source": "estudio_profundo_renglon",
+            }
+        )
+    if not records:
+        return pd.DataFrame(columns=PRICE_SAMPLE_COLUMNS)
+    return pd.DataFrame(records, columns=PRICE_SAMPLE_COLUMNS).drop_duplicates(
+        subset=["sample_key"], keep="last"
+    )
+
+
 def build_local_analytics(
     source_db: Path,
     output_db: Path,
@@ -1234,6 +1822,16 @@ def build_local_analytics(
     processed = 0
     fact_count = 0
     proponent_count = 0
+    price_sample_count = 0
+    # La metadata se carga antes de resumir para que el universo regulatorio
+    # de precios sea exactamente el mismo que consume Streamlit.
+    metadata = load_metadata(
+        metadata_xlsx,
+        aliases_json,
+        classification_xlsx,
+        risk_class_xlsx,
+    )
+    catalog = load_catalog(catalog_xlsx)
     try:
         for chunk in source_rows(source):
             if limit and processed >= limit:
@@ -1242,6 +1840,7 @@ def build_local_analytics(
                 chunk = chunk.head(limit - processed)
             facts: list[dict[str, Any]] = []
             proponents: list[dict[str, Any]] = []
+            price_samples: list[dict[str, Any]] = []
             for row in chunk.to_dict(orient="records"):
                 row_facts, row_proponents = row_to_records(
                     row,
@@ -1249,6 +1848,15 @@ def build_local_analytics(
                 )
                 facts.extend(row_facts)
                 proponents.extend(row_proponents)
+                if row_facts:
+                    price_samples.extend(
+                        price_samples_for_row(
+                            row,
+                            [{"ficha": fact.get("ficha")} for fact in row_facts],
+                            row_proponents,
+                            str(row_facts[0]["acto_key"]),
+                        )
+                    )
             if facts:
                 pd.DataFrame(facts, columns=FACT_COLUMNS).to_sql(
                     "intel_actos_fichas",
@@ -1269,11 +1877,40 @@ def build_local_analytics(
                     method="multi",
                     chunksize=_sqlite_multi_chunksize(len(PROPONENT_COLUMNS)),
                 )
+            if price_samples:
+                pd.DataFrame(price_samples, columns=PRICE_SAMPLE_COLUMNS).drop_duplicates(
+                    subset=["sample_key"], keep="last"
+                ).to_sql(
+                    "intel_ficha_price_samples",
+                    target,
+                    if_exists="append",
+                    index=False,
+                    method="multi",
+                    chunksize=_sqlite_multi_chunksize(len(PRICE_SAMPLE_COLUMNS)),
+                )
             processed += len(chunk)
             fact_count += len(facts)
             proponent_count += len(proponents)
+            price_sample_count += len(price_samples)
             if processed % 25_000 < len(chunk):
                 _log("BUILD", f"{processed:,}/{min(source_count, limit or source_count):,} actos", started)
+
+        confirmed_price_samples = load_confirmed_price_samples(source)
+        if not confirmed_price_samples.empty:
+            confirmed_price_samples.to_sql(
+                "intel_ficha_price_samples",
+                target,
+                if_exists="append",
+                index=False,
+                method="multi",
+                chunksize=_sqlite_multi_chunksize(len(PRICE_SAMPLE_COLUMNS)),
+            )
+            price_sample_count += len(confirmed_price_samples)
+            _log(
+                "PRICES",
+                f"{len(confirmed_price_samples):,} muestras confirmadas por estudio profundo incorporadas",
+                started,
+            )
 
         # La unicidad cambia con el perfil seleccionado. Se materializan los
         # cuatro conteos una sola vez para que Streamlit no reagrupe toda la
@@ -1369,13 +2006,6 @@ def build_local_analytics(
         )
         monthly_count = int(target.execute("SELECT COUNT(*) FROM intel_metricas_ficha_mes").fetchone()[0])
 
-        metadata = load_metadata(
-            metadata_xlsx,
-            aliases_json,
-            classification_xlsx,
-            risk_class_xlsx,
-        )
-        catalog = load_catalog(catalog_xlsx)
         if not metadata.empty:
             metadata.to_sql(
                 "intel_ficha_metadata",
@@ -1395,6 +2025,36 @@ def build_local_analytics(
                 chunksize=_sqlite_multi_chunksize(len(CATALOG_COLUMNS)),
             )
 
+        eligible_fichas = pd.read_sql_query(
+            """
+            SELECT DISTINCT f.ficha, m.nombre_ficha
+            FROM intel_actos_fichas f
+            INNER JOIN intel_ficha_metadata m ON m.ficha = f.ficha
+            WHERE LOWER(TRIM(COALESCE(m.tiene_ct, ''))) = 'no'
+              AND LOWER(TRIM(COALESCE(m.registro_sanitario, ''))) = 'no'
+            ORDER BY CAST(f.ficha AS INTEGER), f.ficha
+            """,
+            target,
+        )
+        all_price_samples = pd.read_sql_query(
+            "SELECT * FROM intel_ficha_price_samples",
+            target,
+        )
+        price_benchmarks = build_price_benchmarks(
+            eligible_fichas,
+            all_price_samples,
+            updated_at=datetime.now(timezone.utc).isoformat(),
+        )
+        if not price_benchmarks.empty:
+            price_benchmarks.to_sql(
+                "intel_ficha_price_benchmarks",
+                target,
+                if_exists="append",
+                index=False,
+                method="multi",
+                chunksize=_sqlite_multi_chunksize(len(PRICE_BENCHMARK_COLUMNS)),
+            )
+
         build_values = {
             "schema_version": ANALYTICS_SCHEMA_VERSION,
             "built_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -1408,6 +2068,8 @@ def build_local_analytics(
             "classification_xlsx": str(classification_xlsx.resolve()) if classification_xlsx.exists() else "",
             "catalog_rows": str(len(catalog)),
             "confirmed_line_amount_relations": str(len(confirmed_line_amounts)),
+            "price_sample_rows": str(price_sample_count),
+            "price_benchmark_rows": str(len(price_benchmarks)),
         }
         target.executemany(
             "INSERT OR REPLACE INTO intel_build_metadata(key, value) VALUES (?, ?)", build_values.items()
@@ -1428,7 +2090,8 @@ def build_local_analytics(
     _log(
         "DONE",
         f"actos={processed:,} hechos={fact_count:,} proponentes={proponent_count:,} "
-        f"metadata={len(metadata):,} catalogo={len(catalog):,}",
+        f"metadata={len(metadata):,} catalogo={len(catalog):,} "
+        f"muestras_precio={price_sample_count:,} referencias_precio={len(price_benchmarks):,}",
         started,
     )
     return {
@@ -1439,6 +2102,8 @@ def build_local_analytics(
         "monthly_rows": monthly_count,
         "metadata_rows": len(metadata),
         "catalog_rows": len(catalog),
+        "price_sample_rows": price_sample_count,
+        "price_benchmark_rows": len(price_benchmarks),
         "output_db": str(output_db),
     }
 
@@ -1454,6 +2119,8 @@ POSTGRES_ANALYTICS_TABLES = (
     "intel_metricas_ficha_mes",
     "intel_ficha_metadata",
     "intel_ficha_catalogo",
+    "intel_ficha_price_samples",
+    "intel_ficha_price_benchmarks",
     "intel_build_metadata",
 )
 
@@ -1481,6 +2148,10 @@ POSTGRES_ANALYTICS_INDEXES = (
     ("ix_intel_ifmeta_ficha", "CREATE INDEX IF NOT EXISTS ix_intel_ifmeta_ficha ON intel_ficha_metadata(ficha)"),
     ("ix_intel_ifmeta_rs", "CREATE INDEX IF NOT EXISTS ix_intel_ifmeta_rs ON intel_ficha_metadata(registro_sanitario, ficha)"),
     ("ix_intel_ifmeta_risk", "CREATE INDEX IF NOT EXISTS ix_intel_ifmeta_risk ON intel_ficha_metadata(clase_riesgo, ficha)"),
+    ("ix_intel_ifps_ficha", "CREATE INDEX IF NOT EXISTS ix_intel_ifps_ficha ON intel_ficha_price_samples(ficha)"),
+    ("ix_intel_ifps_acto", "CREATE INDEX IF NOT EXISTS ix_intel_ifps_acto ON intel_ficha_price_samples(acto_key)"),
+    ("ix_intel_ifps_date", "CREATE INDEX IF NOT EXISTS ix_intel_ifps_date ON intel_ficha_price_samples(sample_date)"),
+    ("ix_intel_ifpb_confidence", "CREATE INDEX IF NOT EXISTS ix_intel_ifpb_confidence ON intel_ficha_price_benchmarks(nivel_confianza, ficha)"),
 )
 
 
@@ -1533,7 +2204,7 @@ def ensure_postgres_analytics_indexes(
                 text(
                     "SELECT indexname FROM pg_indexes "
                     "WHERE schemaname = current_schema() "
-                    "AND (indexname LIKE 'ix_intel_%' OR indexname = 'ux_intel_actos_fichas')"
+                    "AND (indexname LIKE 'ix_intel_%' OR indexname LIKE 'ux_intel_%')"
                 )
             ).fetchall()
         present = {str(row[0]) for row in rows}
@@ -1610,6 +2281,8 @@ def verify_analytics(local_db: Path) -> dict[str, Any]:
                 "intel_metricas_ficha_mes",
                 "intel_ficha_metadata",
                 "intel_ficha_catalogo",
+                "intel_ficha_price_samples",
+                "intel_ficha_price_benchmarks",
             )
         }
         duplicates = int(

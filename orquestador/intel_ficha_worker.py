@@ -1360,7 +1360,12 @@ def _persist_line_amount_rows(
                             line_key TEXT NOT NULL,
                             renglon_id TEXT,
                             renglon_numero TEXT,
+                            line_description TEXT,
+                            cantidad REAL NOT NULL DEFAULT 0,
+                            unidad_medida TEXT,
+                            reference_unit REAL NOT NULL DEFAULT 0,
                             reference_total REAL NOT NULL DEFAULT 0,
+                            participation_unit REAL NOT NULL DEFAULT 0,
                             participation_total REAL NOT NULL DEFAULT 0,
                             provider TEXT,
                             match_score REAL NOT NULL DEFAULT 0,
@@ -1371,6 +1376,24 @@ def _persist_line_amount_rows(
                         )
                         """
                     )
+                    existing_columns = {
+                        str(column[1])
+                        for column in connection.execute(
+                            "PRAGMA table_info(intel_ficha_line_amounts)"
+                        )
+                    }
+                    for column_name, column_type in (
+                        ("cantidad", "REAL NOT NULL DEFAULT 0"),
+                        ("line_description", "TEXT"),
+                        ("unidad_medida", "TEXT"),
+                        ("reference_unit", "REAL NOT NULL DEFAULT 0"),
+                        ("participation_unit", "REAL NOT NULL DEFAULT 0"),
+                    ):
+                        if column_name not in existing_columns:
+                            connection.execute(
+                                f"ALTER TABLE intel_ficha_line_amounts "
+                                f"ADD COLUMN {column_name} {column_type}"
+                            )
                     connection.execute(
                         "DELETE FROM intel_ficha_line_amounts WHERE ficha = ?",
                         (ficha,),
@@ -1395,7 +1418,12 @@ def _persist_line_amount_rows(
                                 line_key,
                                 _clean(row.get("renglon_id")),
                                 _clean(row.get("renglon_numero")),
+                                _clean(row.get("descripcion_renglon")),
+                                _num(row.get("cantidad")),
+                                _clean(row.get("unidad_medida")),
+                                _num(row.get("precio_referencia_unitario")),
                                 _num(row.get("precio_referencia_total")),
+                                _num(row.get("precio_participacion_unitario")),
                                 _num(row.get("precio_participacion_total")),
                                 _clean(row.get("proveedor")),
                                 _num(row.get("match_score")),
@@ -1409,10 +1437,11 @@ def _persist_line_amount_rows(
                             """
                             INSERT OR REPLACE INTO intel_ficha_line_amounts (
                                 ficha, acto_url, acto_id, line_key, renglon_id,
-                                renglon_numero, reference_total, participation_total,
+                                renglon_numero, line_description, cantidad, unidad_medida, reference_unit,
+                                reference_total, participation_unit, participation_total,
                                 provider, match_score, requires_review, binding_method,
                                 updated_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             values,
                         )
