@@ -30,6 +30,11 @@ def test_windows_console_logs_do_not_use_unicode_move_arrow() -> None:
         assert " → " not in source
 
 
+def test_migration_batch_stops_before_writes_on_any_dry_run_failure() -> None:
+    source = (ROOT / "tools/actualizar_ley_419.bat").read_text(encoding="utf-8")
+    assert "if errorlevel 1 exit /b %errorlevel%" in source
+
+
 def test_law_419_rule_precedes_legacy_no_requirements_routing() -> None:
     for relative_path in SCRAPERS:
         source = (ROOT / relative_path).read_text(encoding="utf-8")
