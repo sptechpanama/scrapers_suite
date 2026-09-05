@@ -24,6 +24,12 @@ def test_all_scrapers_extract_route_and_publish_process_law() -> None:
         assert "Ley419SinFicha=" in source
 
 
+def test_windows_console_logs_do_not_use_unicode_move_arrow() -> None:
+    for relative_path in SCRAPERS:
+        source = (ROOT / relative_path).read_text(encoding="utf-8")
+        assert " → " not in source
+
+
 def test_law_419_rule_precedes_legacy_no_requirements_routing() -> None:
     for relative_path in SCRAPERS:
         source = (ROOT / relative_path).read_text(encoding="utf-8")

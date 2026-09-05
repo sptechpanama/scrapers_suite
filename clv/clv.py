@@ -839,7 +839,7 @@ def move_rows_by_checkbox(sources, target, col_chk):
         gs_append(target, to_app)
         delete_rows(src, to_del)
         total += len(to_app)
-        LOG("MOVE", f"{src} → {target}: {len(to_app)}")
+        LOG("MOVE", f"{src} -> {target}: {len(to_app)}")
     LOG("MOVE", f"Total movidas a {target}: {total}")
 
 
