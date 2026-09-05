@@ -72,6 +72,11 @@ from purchase_unit_details import (
     PURCHASE_UNIT_COLUMN,
     extract_purchase_unit_details,
 )
+from process_law import (
+    PROCESS_LAW_COLUMN,
+    extract_process_law,
+    is_law_419_without_ficha,
+)
 
 # =========================
 # CONFIGURACIÓN (CFG)
@@ -89,10 +94,11 @@ CFG = {
     # ---- Google Sheets ----
     "svc_key": str(CREDENTIALS_FILE),
     "spreadsheet_id": "17hOfP-vMdJ4D7xym1cUp7vAcd8XJPErpY3V-9Ui2tCo",
-    "sheets_data": ["cl_prog_sin_ficha", "cl_prog_sin_requisitos", "cl_prog_con_ct", "cl_prioritarios"],
+    "sheets_data": ["cl_prog_sin_ficha", "cl_prog_sin_requisitos", "cl_prog_con_ct", "cl_prog_419_sfd", "cl_prioritarios"],
     "sheet_desc": "cl_descartes",
     "sheet_prio": "cl_prioritarios",
     "sheet_ct_rir": "cl_prog_ct_rir",
+    "sheet_419_sfd": "cl_prog_419_sfd",
     "sheet_ct_rir_fichas": "ct_rir_fichas",
     "sheet_rs_sp_keywords": "pc_palabras_clave",
 
@@ -724,7 +730,7 @@ def purge_by_fecha(sheet):
     LOG("PURGE", f"{sheet}: actos={len(vals)-1} | ok={ok} | fail={fail} | borrados={len(dels)}")
 
 def purge_all():
-    for s in ["cl_prog_sin_ficha","cl_prog_sin_requisitos","cl_prog_con_ct",CFG["sheet_ct_rir"],"cl_prioritarios","cl_descartes"]:
+    for s in ["cl_prog_sin_ficha","cl_prog_sin_requisitos","cl_prog_con_ct",CFG["sheet_419_sfd"],CFG["sheet_ct_rir"],"cl_prioritarios","cl_descartes"]:
         purge_by_fecha(s)
 
 
@@ -986,6 +992,7 @@ def scrape(page: PageTools, link: str, adjudication_type: str = ""):
     precio  = _first_text_by_xpaths(page.d, xp["precio"])
     fecha   = _first_text_by_xpaths(page.d, xp["fecha"])
     purchase_details = extract_purchase_unit_details(page.d)
+    process_law = extract_process_law(page.d)
     entidad = purchase_details.get("entidad") or _first_text_by_xpaths(page.d, xp["entidad"])
     termino = _first_text_by_xpaths(page.d, xp["termino"])
     unidad  = purchase_details.get(PURCHASE_UNIT_COLUMN) or _first_text_by_xpaths(page.d, xp.get("unidad", []), default="")
@@ -1052,25 +1059,30 @@ def scrape(page: PageTools, link: str, adjudication_type: str = ""):
         "descripcion": desc,           # <-- descripción general (va tras checkboxes)
         "items": items,                # <-- lista de ítems
         "mix": mix,
-    "has_ct": bool(fd_ct),
-    "has_sr": bool(fd_sr),
-    "has_rs": bool(fd_rs),
-    "ficha_detectada": ", ".join(ficha_tokens) if ficha_tokens else "No Detectada",
-    "fichas_base": fichas_base,
-    NO_REQUIREMENTS_FICHAS_COLUMN: display_ficha_codes(
-        no_requirements.no_requirements_fichas
-    ),
-    REQUIREMENTS_FICHAS_COLUMN: no_requirements.requirements_label or "Ninguna",
-    UNCLASSIFIED_FICHAS_COLUMN: display_ficha_codes(
-        no_requirements.unclassified_fichas
-    ),
-    ADJUDICATION_TYPE_COLUMN: no_requirements.adjudication_type,
-    NO_REQUIREMENTS_SCOPE_COLUMN: no_requirements.scope,
-    "_eligible_sin_requisitos": no_requirements.eligible,
-    "_no_requirements_reason": no_requirements.reason,
+        "has_ct": bool(fd_ct),
+        "has_sr": bool(fd_sr),
+        "has_rs": bool(fd_rs),
+        "ficha_detectada": ", ".join(ficha_tokens) if ficha_tokens else "No Detectada",
+        "fichas_base": fichas_base,
+        NO_REQUIREMENTS_FICHAS_COLUMN: display_ficha_codes(
+            no_requirements.no_requirements_fichas
+        ),
+        REQUIREMENTS_FICHAS_COLUMN: no_requirements.requirements_label or "Ninguna",
+        UNCLASSIFIED_FICHAS_COLUMN: display_ficha_codes(
+            no_requirements.unclassified_fichas
+        ),
+        ADJUDICATION_TYPE_COLUMN: no_requirements.adjudication_type,
+        PROCESS_LAW_COLUMN: process_law,
+        NO_REQUIREMENTS_SCOPE_COLUMN: no_requirements.scope,
+        "_eligible_sin_requisitos": no_requirements.eligible,
+        "_no_requirements_reason": no_requirements.reason,
     }
 
 def clasifica(info):
+    if is_law_419_without_ficha(
+        info.get(PROCESS_LAW_COLUMN), info.get("fichas_base") or ()
+    ):
+        return "419_sfd"
     if info.get("_eligible_sin_requisitos"):
         return "sr"
     return "rs" if info["has_rs"] else ("ct" if info["has_ct"] else "sf")
@@ -1081,6 +1093,7 @@ def clasifica(info):
 def main():
     global FICHAS_CT_RIR_DYNAMIC
     ensure_sheet_exists(CFG["sheet_ct_rir"])
+    ensure_sheet_exists(CFG["sheet_419_sfd"])
     FICHAS_CT_RIR_DYNAMIC = load_ct_rir_fichas()
     rs_sp_keywords = load_rs_sp_keywords()
     purge_all()
@@ -1191,9 +1204,9 @@ def main():
     LOG("DONE", f"nuevos={len(nuevos)} | existentes={len(existentes_norm)} | descartes={len(descartados_norm)}")
 
     if not nuevos:
-        move_rows_by_checkbox(['cl_prog_sin_ficha','cl_prog_sin_requisitos','cl_prog_con_ct',CFG["sheet_ct_rir"]], CFG["sheet_prio"], "Prioritario")
-        move_rows_by_checkbox(['cl_prog_sin_ficha','cl_prog_sin_requisitos','cl_prog_con_ct',CFG["sheet_ct_rir"]], CFG["sheet_desc"], "Descartar")
-        for sh in ['cl_prog_sin_ficha','cl_prog_sin_requisitos','cl_prog_con_ct',CFG["sheet_ct_rir"]]:
+        move_rows_by_checkbox(['cl_prog_sin_ficha','cl_prog_sin_requisitos','cl_prog_con_ct',CFG["sheet_419_sfd"],CFG["sheet_ct_rir"]], CFG["sheet_prio"], "Prioritario")
+        move_rows_by_checkbox(['cl_prog_sin_ficha','cl_prog_sin_requisitos','cl_prog_con_ct',CFG["sheet_419_sfd"],CFG["sheet_ct_rir"]], CFG["sheet_desc"], "Descartar")
+        for sh in ['cl_prog_sin_ficha','cl_prog_sin_requisitos','cl_prog_con_ct',CFG["sheet_419_sfd"],CFG["sheet_ct_rir"]]:
             reset_checkboxes(sh)
             update_fechas_sheet(sh)
         LOG("DONE", "sin nuevos; mantenimiento completo")
@@ -1203,7 +1216,7 @@ def main():
     # === SCRAPE DETALLE (sólo para nuevos) ===
     driver = start_browser()
     PT = PageTools(driver)
-    datos_ct, datos_sr, datos_sf, datos_rs, datos_ct_rir = [], [], [], [], []
+    datos_ct, datos_sr, datos_sf, datos_rs, datos_ct_rir, datos_419_sfd = [], [], [], [], [], []
     for key in nuevos:
         link = map_key_raw[key]
         LOG("SCRAPE", link)
@@ -1257,6 +1270,7 @@ def main():
         categoria = clasifica(info)
         if categoria == "ct": datos_ct.append(info)
         elif categoria == "sr": datos_sr.append(info)
+        elif categoria == "419_sfd": datos_419_sfd.append(info)
         else: datos_sf.append(info)
         if FICHAS_CT_RIR_DYNAMIC:
             fichas_base = info.get("fichas_base") or []
@@ -1305,6 +1319,7 @@ def main():
             'termino_entrega', 'ficha_detectada',
             NO_REQUIREMENTS_FICHAS_COLUMN, REQUIREMENTS_FICHAS_COLUMN,
             UNCLASSIFIED_FICHAS_COLUMN, ADJUDICATION_TYPE_COLUMN,
+            PROCESS_LAW_COLUMN,
         ]
         if "sin_requisitos" in str(sheet).lower():
             base.append(NO_REQUIREMENTS_SCOPE_COLUMN)
@@ -1342,16 +1357,17 @@ def main():
     prog_ct_rows, prog_ct_cols = append_df('cl_prog_con_ct', df_prepare(datos_ct))
     prog_sr_rows, prog_sr_cols = append_df('cl_prog_sin_requisitos', df_prepare(datos_sr))
     prog_sf_rows, prog_sf_cols = append_df('cl_prog_sin_ficha', df_prepare(datos_sf))
+    prog_419_rows, prog_419_cols = append_df(CFG["sheet_419_sfd"], df_prepare(datos_419_sfd))
     ct_rir_rows, ct_rir_cols = append_df(CFG["sheet_ct_rir"], df_prepare(datos_ct_rir))
 
     # Movimientos por checkboxes y limpieza final
-    move_rows_by_checkbox(['cl_prog_sin_ficha','cl_prog_sin_requisitos','cl_prog_con_ct',CFG["sheet_ct_rir"]], CFG["sheet_prio"], "Prioritario")
-    move_rows_by_checkbox(['cl_prog_sin_ficha','cl_prog_sin_requisitos','cl_prog_con_ct',CFG["sheet_ct_rir"]], CFG["sheet_desc"], "Descartar")
+    move_rows_by_checkbox(['cl_prog_sin_ficha','cl_prog_sin_requisitos','cl_prog_con_ct',CFG["sheet_419_sfd"],CFG["sheet_ct_rir"]], CFG["sheet_prio"], "Prioritario")
+    move_rows_by_checkbox(['cl_prog_sin_ficha','cl_prog_sin_requisitos','cl_prog_con_ct',CFG["sheet_419_sfd"],CFG["sheet_ct_rir"]], CFG["sheet_desc"], "Descartar")
 
 
-    for sh in ['cl_prog_sin_ficha','cl_prog_sin_requisitos','cl_prog_con_ct',CFG["sheet_ct_rir"],'cl_prioritarios','cl_descartes']:
+    for sh in ['cl_prog_sin_ficha','cl_prog_sin_requisitos','cl_prog_con_ct',CFG["sheet_419_sfd"],CFG["sheet_ct_rir"],'cl_prioritarios','cl_descartes']:
         purge_by_fecha(sh)
-    for sh in ['cl_prog_sin_ficha','cl_prog_sin_requisitos','cl_prog_con_ct',CFG["sheet_ct_rir"]]:
+    for sh in ['cl_prog_sin_ficha','cl_prog_sin_requisitos','cl_prog_con_ct',CFG["sheet_419_sfd"],CFG["sheet_ct_rir"]]:
         reset_checkboxes(sh)
         update_fechas_sheet(sh)
 
@@ -1385,6 +1401,7 @@ def main():
         ("cl_prog_con_ct", prog_ct_rows, prog_ct_cols),
         ("cl_prog_sin_requisitos", prog_sr_rows, prog_sr_cols),
         ("cl_prog_sin_ficha", prog_sf_rows, prog_sf_cols),
+        (CFG["sheet_419_sfd"], prog_419_rows, prog_419_cols),
     ]:
         summary = summarize_keyword_rows(
             rows=rows_out,
@@ -1417,7 +1434,7 @@ def main():
         print("RS_SP_SUMMARY_JSON=" + json.dumps(payload, ensure_ascii=False), flush=True)
 
 
-    LOG("DONE", f"CT={len(datos_ct)} | SinReq={len(datos_sr)} | SinFicha={len(datos_sf)} | CT_RIR={len(datos_ct_rir)} | Ignorados_RS={len(datos_rs)}")
+    LOG("DONE", f"CT={len(datos_ct)} | SinReq={len(datos_sr)} | SinFicha={len(datos_sf)} | Ley419SinFicha={len(datos_419_sfd)} | CT_RIR={len(datos_ct_rir)} | Ignorados_RS={len(datos_rs)}")
 
 if __name__ == "__main__":
     main()     

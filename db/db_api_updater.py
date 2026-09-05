@@ -45,6 +45,11 @@ from ficha_utils import (  # noqa: E402 - depende de REPO_ROOT
     get_catalog,
     legacy_tokens,
 )
+from process_law import (  # noqa: E402 - depende de REPO_ROOT
+    PROCESS_LAW_UNKNOWN,
+    process_law_from_components,
+    process_law_from_mapping,
+)
 
 DATA_DIR = REPO_ROOT / "data"
 DB_PATH = DATA_DIR / "db" / "panamacompra.db"
@@ -78,6 +83,7 @@ BASE_COLUMNS = {
     "entidad": "TEXT",
     "unidad_solic": "TEXT",
     "termino_entrega": "TEXT",
+    "ley_proceso": "TEXT",
     "ficha_detectada": "TEXT",
     "fichas_detectadas_json": "TEXT",
     "ficha_detector_version": "TEXT",
@@ -229,6 +235,7 @@ def init_db() -> None:
                 entidad TEXT,
                 unidad_solic TEXT,
                 termino_entrega TEXT,
+                ley_proceso TEXT,
                 ficha_detectada TEXT,
                 fichas_detectadas_json TEXT,
                 ficha_detector_version TEXT,
@@ -649,6 +656,7 @@ def fallback_row(record: dict[str, Any], state_name: str, run_stamp: str, matche
         "entidad": str(record.get("nombreEntidad") or "").strip(),
         "unidad_solic": str(record.get("nombreUnidadCompra") or "").strip(),
         "termino_entrega": "",
+        "ley_proceso": process_law_from_mapping(record),
         "estado": state_name,
         "descripcion": description,
         "items_json": "[]",
@@ -1061,6 +1069,9 @@ def parse_detail(
     detail = request_json("GET", url).get("result") or {}
     components = detail.get("pageComponentes") or []
     labels = _component_labels(components)
+    process_law = process_law_from_components(components)
+    if process_law == PROCESS_LAW_UNKNOWN:
+        process_law = process_law_from_mapping(record)
 
     items: list[dict[str, Any]] = []
     actas: list[dict[str, Any]] = []
@@ -1174,6 +1185,7 @@ def parse_detail(
         "entidad": _label(labels, "Entidad") or str(record.get("nombreEntidad") or "").strip(),
         "unidad_solic": _label(labels, "Unidad de Compra") or str(record.get("nombreUnidadCompra") or "").strip(),
         "termino_entrega": _label(labels, "Término de entrega"),
+        "ley_proceso": process_law,
         "estado": state_name,
         "descripcion": description,
         "items_json": json.dumps(item_details, ensure_ascii=False, separators=(",", ":")),

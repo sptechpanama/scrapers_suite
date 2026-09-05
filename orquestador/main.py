@@ -198,12 +198,15 @@ PANAMACOMPRA_RS_SP_SCAN_SHEETS = [
     "cl_abiertas",
     "cl_abiertas_rir_sin_requisitos",
     "cl_abiertas_rir_con_ct",
+    "cl_abiertas_419_sfd",
     "cl_prog_sin_ficha",
     "cl_prog_sin_requisitos",
     "cl_prog_con_ct",
+    "cl_prog_419_sfd",
     "ap_sin_ficha",
     "ap_sin_requisitos",
     "ap_con_ct",
+    "ap_419_sfd",
 ]
 PANAMACOMPRA_DEFAULT_RS_SP_KEYWORDS = ("chiller", "york", "daikin")
 
