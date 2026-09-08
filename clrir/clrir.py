@@ -1251,7 +1251,12 @@ def main():
                 f"no publicado como sin requisitos: {info.get('_no_requirements_reason', '')}",
             )
 
-        # Descarte por precio/RS/med
+        fichas_base = set(info.get("fichas_base") or [])
+        if FICHAS_CT_RIR_DYNAMIC.intersection(fichas_base):
+            datos_ct_rir.append(info)
+
+        # Descarte por precio/RS/med. CT_RIR se conserva aunque el acto tambien
+        # caiga en descartes generales: la lista vigilada tiene prioridad.
         desc, mot = want_descartar(info)
         if desc:
             if mot == "precio":
@@ -1272,10 +1277,6 @@ def main():
         elif categoria == "sr": datos_sr.append(info)
         elif categoria == "419_sfd": datos_419_sfd.append(info)
         else: datos_sf.append(info)
-        if FICHAS_CT_RIR_DYNAMIC:
-            fichas_base = info.get("fichas_base") or []
-            if any(code in FICHAS_CT_RIR_DYNAMIC for code in fichas_base):
-                datos_ct_rir.append(info)
 
     try: driver.quit()
     except: pass

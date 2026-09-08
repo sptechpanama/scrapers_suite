@@ -1594,7 +1594,15 @@ def main():
                 f"no publicado como sin requisitos: {info.get('_no_requirements_reason', '')}",
             )
 
-        # Descarte por precio/RS/med
+        fichas_base = set(info.get("fichas_base") or [])
+        is_ct_rir = bool(FICHAS_CT_RIR_DYNAMIC.intersection(fichas_base))
+        source_sheets = []
+        if is_ct_rir:
+            datos_ct_rir.append(info)
+            source_sheets.append(CFG["sheet_ct_rir"])
+
+        # Descarte por precio/RS/med. CT_RIR se conserva aunque el acto tambien
+        # caiga en descartes generales: la lista vigilada tiene prioridad.
         desc, mot = want_descartar(info)
         if desc:
             if mot == "precio":
@@ -1607,10 +1615,11 @@ def main():
             else:
                 LOG("SCRAPE", f"DESCARTADO ({mot})")
             gs_append(CFG["sheet_desc"], [[link, info.get("fecha","")]])
+            source_sheets.append(CFG["sheet_desc"])
             lifecycle_new_records.append(
                 cl_record_from_mapping(
                     info,
-                    source_sheets=[CFG["sheet_desc"]],
+                    source_sheets=source_sheets,
                     estado="abierta",
                 )
             )
@@ -1618,7 +1627,6 @@ def main():
             continue
 
         categoria = clasifica(info)
-        source_sheets = []
         if categoria == "ct":
             datos_ct.append(info)
             source_sheets.append("cl_abiertas_rir_con_ct")
@@ -1632,11 +1640,6 @@ def main():
             datos_sf.append(info)
             source_sheets.append("cl_abiertas")
 
-        if FICHAS_CT_RIR_DYNAMIC:
-            fichas_base = info.get("fichas_base") or []
-            if any(code in FICHAS_CT_RIR_DYNAMIC for code in fichas_base):
-                datos_ct_rir.append(info)
-                source_sheets.append(CFG["sheet_ct_rir"])
         lifecycle_new_records.append(
             cl_record_from_mapping(
                 info,

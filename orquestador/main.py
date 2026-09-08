@@ -18,6 +18,7 @@ import unicodedata
 from collections import deque
 from datetime import datetime
 from email.message import EmailMessage
+from functools import wraps
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -55,10 +56,11 @@ COMMON_DIR = REPO_ROOT / "common"
 if str(COMMON_DIR) not in sys.path:
     sys.path.insert(0, str(COMMON_DIR))
 
-from ficha_utils import detectar_fichas_detalladas  # noqa: E402
+from ficha_utils import detectar_fichas_detalladas, get_catalog  # noqa: E402
 
 CONFIG_PATH = BASE_DIR / "config.json"
 STATE_PATH = BASE_DIR / "state.json"
+STATE_TRANSACTION_LOCK = threading.RLock()
 DEFAULT_ORQUESTADOR_CREDENTIALS = BASE_DIR / "pure-beach-474203-p1-fdc9557f33d0.json"
 PID_PATH = BASE_DIR / "orquestador.pid"
 
@@ -74,6 +76,7 @@ except ValueError:
 
 CONFIG_WATCH_JOB_ID = "sheets-config-refresh"
 MANUAL_WATCH_JOB_ID = "sheets-manual-poll"
+CT_RIR_WATCH_JOB_ID = "ct-rir-notification-watchdog"
 
 try:
     MANUAL_POLL_INTERVAL_SECONDS = int(
@@ -81,6 +84,25 @@ try:
     )
 except ValueError:
     MANUAL_POLL_INTERVAL_SECONDS = 30
+
+try:
+    CT_RIR_WATCH_INTERVAL_SECONDS = max(
+        60,
+        int(os.environ.get("ORQUESTADOR_CT_RIR_WATCH_SECONDS", "300")),
+    )
+except ValueError:
+    CT_RIR_WATCH_INTERVAL_SECONDS = 300
+
+try:
+    CT_RIR_FULL_SCAN_INTERVAL_SECONDS = max(
+        CT_RIR_WATCH_INTERVAL_SECONDS,
+        int(os.environ.get("ORQUESTADOR_CT_RIR_FULL_SCAN_SECONDS", "3600")),
+    )
+except ValueError:
+    CT_RIR_FULL_SCAN_INTERVAL_SECONDS = 3600
+
+PANAMACOMPRA_READ_RETRY_DELAYS_SECONDS = (0.0, 1.5, 4.0)
+CT_RIR_EMAIL_RETRY_DELAYS_SECONDS = (0.0, 3.0, 10.0)
 
 try:
     PIPELINE_LOG_INTERVAL_SECONDS = int(
@@ -163,6 +185,7 @@ JOB_NAME_LABELS = {
 JOB_LABEL_TITLES = {
     CONFIG_WATCH_JOB_ID: "monitor de configuracion",
     MANUAL_WATCH_JOB_ID: "monitor de solicitudes manuales",
+    CT_RIR_WATCH_JOB_ID: "monitor independiente de alertas CT RIR",
 }
 
 CT_RIR_EMAIL_DEFAULT_FROM = "rjsp100493@gmail.com"
@@ -423,17 +446,38 @@ def load_config() -> OrchestratorConfig:
     return fallback_config
 
 
+def _state_transaction(func):
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        with STATE_TRANSACTION_LOCK:
+            return func(*args, **kwargs)
+
+    return wrapped
+
+
 def load_state() -> dict:
-    if not STATE_PATH.exists():
-        return {"last_run": {}}
-    with STATE_PATH.open("r", encoding="utf-8") as fp:
-        return json.load(fp)
+    with STATE_TRANSACTION_LOCK:
+        if not STATE_PATH.exists():
+            return {"last_run": {}}
+        with STATE_PATH.open("r", encoding="utf-8") as fp:
+            return json.load(fp)
 
 
 def save_state(state: dict) -> None:
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with STATE_PATH.open("w", encoding="utf-8") as fp:
-        json.dump(state, fp, indent=2, ensure_ascii=False)
+    with STATE_TRANSACTION_LOCK:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = STATE_PATH.with_name(
+            f".{STATE_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            with temp_path.open("w", encoding="utf-8") as fp:
+                json.dump(state, fp, indent=2, ensure_ascii=False)
+                fp.flush()
+                os.fsync(fp.fileno())
+            os.replace(temp_path, STATE_PATH)
+        finally:
+            if temp_path.exists():
+                temp_path.unlink()
 
 
 DEFAULT_COT_DRIVE_FOLDER_ID = os.environ.get(
@@ -697,17 +741,36 @@ def _get_panamacompra_service():
 
 
 def _read_panamacompra_sheet(sheet_name: str) -> list[list[str]]:
-    service = _get_panamacompra_service()
-    return (
-        service.spreadsheets()
-        .values()
-        .get(
-            spreadsheetId=PANAMACOMPRA_SPREADSHEET_ID,
-            range=f"'{sheet_name}'!A1:ZZ",
-        )
-        .execute()
-        .get("values", [])
-    )
+    last_error: Optional[Exception] = None
+    for attempt, delay_seconds in enumerate(
+        PANAMACOMPRA_READ_RETRY_DELAYS_SECONDS,
+        start=1,
+    ):
+        if delay_seconds:
+            time.sleep(delay_seconds)
+        try:
+            service = _get_panamacompra_service()
+            response = (
+                service.spreadsheets()
+                .values()
+                .get(
+                    spreadsheetId=PANAMACOMPRA_SPREADSHEET_ID,
+                    range=f"'{sheet_name}'!A1:ZZ",
+                )
+                .execute()
+            )
+            return response.get("values", [])
+        except Exception as exc:  # pylint: disable=broad-except
+            last_error = exc
+            logging.warning(
+                "Lectura de hoja %s fallo (intento %s/%s): %s",
+                sheet_name,
+                attempt,
+                len(PANAMACOMPRA_READ_RETRY_DELAYS_SECONDS),
+                exc,
+            )
+    assert last_error is not None
+    raise last_error
 
 
 def _column_index_map(headers: list[object]) -> dict[str, int]:
@@ -720,7 +783,7 @@ def _column_index_map(headers: list[object]) -> dict[str, int]:
 
 
 def _row_value(row: list[object], mapping: dict[str, int], key: str) -> str:
-    idx = mapping.get(key)
+    idx = mapping.get(_normalize_text(key))
     if idx is None or idx >= len(row):
         return ""
     return str(row[idx] or "").strip()
@@ -784,13 +847,59 @@ def _match_keywords_in_text(text: object, keywords: list[str]) -> list[str]:
     return matches
 
 
-def _scan_ct_rir_candidates() -> list[dict[str, object]]:
+def _ct_rir_semantic_anchor_tokens(fichas: set[str]) -> set[str]:
+    """Reduce el escaneo semantico a filas plausibles de las fichas vigiladas."""
+    catalog = get_catalog()
+    anchors: set[str] = set()
+    for anchor, entries in catalog.aliases_by_anchor.items():
+        if any(entry.code in fichas for entry in entries):
+            anchors.add(anchor)
+    return anchors
+
+
+def _row_may_contain_tracked_ficha(
+    semantic_fields: dict[str, str],
+    fichas: set[str],
+    anchor_tokens: set[str],
+) -> bool:
+    normalized = _normalize_text(" ".join(semantic_fields.values()))
+    if not normalized:
+        return False
+
+    # Un numero vigilado solo habilita la verificacion profunda; el detector
+    # conserva sus propias reglas contextuales para evitar falsos positivos.
+    if any(
+        re.search(rf"(?<!\d)0*{re.escape(code)}(?!\d)", normalized)
+        for code in fichas
+    ):
+        return True
+
+    for token in normalized.split():
+        variants = {token}
+        if len(token) >= 5 and token.endswith("s"):
+            variants.add(token[:-1])
+        if len(token) >= 6 and token.endswith("es"):
+            variants.add(token[:-2])
+        if len(token) >= 6 and token.endswith("ces"):
+            variants.add(token[:-3] + "z")
+        if variants.intersection(anchor_tokens):
+            return True
+    return False
+
+
+def _scan_ct_rir_candidates(*, direct_only: bool = False) -> list[dict[str, object]]:
     fichas = _load_ct_rir_fichas_for_notifications()
     if not fichas:
         return []
 
+    scan_sheets = (
+        sorted(PANAMACOMPRA_CT_RIR_DIRECT_SHEETS)
+        if direct_only
+        else PANAMACOMPRA_CT_RIR_SCAN_SHEETS
+    )
+    anchor_tokens = set() if direct_only else _ct_rir_semantic_anchor_tokens(fichas)
     candidates: dict[str, dict[str, object]] = {}
-    for sheet_name in PANAMACOMPRA_CT_RIR_SCAN_SHEETS:
+    for sheet_name in scan_sheets:
         values = _read_panamacompra_sheet(sheet_name)
         if not values:
             continue
@@ -822,28 +931,31 @@ def _scan_ct_rir_candidates() -> list[dict[str, object]]:
                     key: _row_value(row, mapping, key)
                     for key in semantic_keys
                 }
-                try:
-                    semantic_codes = {
-                        match.code
-                        for match in detectar_fichas_detalladas(semantic_fields)
-                    }
-                except (FileNotFoundError, OSError, ValueError) as exc:
-                    logging.warning(
-                        "CT_RIR: no se pudo reclasificar fila de %s: %s",
-                        sheet_name,
-                        exc,
-                    )
+                if _row_may_contain_tracked_ficha(
+                    semantic_fields,
+                    fichas,
+                    anchor_tokens,
+                ):
+                    try:
+                        semantic_codes = {
+                            match.code
+                            for match in detectar_fichas_detalladas(semantic_fields)
+                        }
+                    except (FileNotFoundError, OSError, ValueError) as exc:
+                        logging.warning(
+                            "CT_RIR: no se pudo reclasificar fila de %s: %s",
+                            sheet_name,
+                            exc,
+                        )
 
             matched_codes = sorted(
                 fichas.intersection(label_codes.union(semantic_codes)),
                 key=int,
             )
-            relevant = False
-            if sheet_name in PANAMACOMPRA_CT_RIR_DIRECT_SHEETS:
-                relevant = True
-            else:
-                relevant = bool(matched_codes)
-            if not relevant:
+            # Incluso las hojas dedicadas se contrastan con la lista vigente.
+            # Asi, quitar una ficha del registro detiene sus alertas de forma
+            # inmediata aunque una fila antigua permanezca hasta su purga.
+            if not matched_codes:
                 continue
 
             effective_label = ficha_label
@@ -935,6 +1047,7 @@ def _scan_rs_sp_candidates() -> list[dict[str, object]]:
     return list(candidates.values())
 
 
+@_state_transaction
 def _queue_ct_rir_notifications(job_name: str, stdout: str, finished_at: datetime) -> int:
     summary = _extract_ct_rir_summary(stdout)
     if not summary:
@@ -946,6 +1059,9 @@ def _queue_ct_rir_notifications(job_name: str, stdout: str, finished_at: datetim
     state = load_state()
     pending_entries = state.setdefault("ct_rir_email_pending", [])
     sent_keys = state.setdefault("ct_rir_email_sent_keys", {})
+    seen_keys = state.get("ct_rir_module_seen_keys")
+    if not isinstance(seen_keys, dict):
+        seen_keys = {}
     pending_keys = {
         str(item.get("unique_key") or "")
         for item in pending_entries
@@ -968,14 +1084,24 @@ def _queue_ct_rir_notifications(job_name: str, stdout: str, finished_at: datetim
             "enlace": str(raw_entry.get("enlace") or "").strip(),
             "queued_at": finished_at.isoformat(timespec="seconds"),
         }
+        act_key = _build_module_act_key(entry)
+        if act_key and act_key in seen_keys:
+            continue
         unique_key = _build_ct_rir_unique_key(entry)
         if not unique_key or unique_key in sent_keys or unique_key in pending_keys:
+            if act_key:
+                seen_keys[act_key] = finished_at.isoformat(timespec="seconds")
             continue
         entry["unique_key"] = unique_key
         pending_entries.append(entry)
         pending_keys.add(unique_key)
+        if act_key:
+            seen_keys[act_key] = finished_at.isoformat(timespec="seconds")
         queued += 1
 
+    if len(seen_keys) > 12000:
+        seen_keys = dict(list(seen_keys.items())[-8000:])
+    state["ct_rir_module_seen_keys"] = seen_keys
     if queued:
         state["ct_rir_email_pending"] = pending_entries[-500:]
         state["ct_rir_email_last_queue"] = {
@@ -983,10 +1109,11 @@ def _queue_ct_rir_notifications(job_name: str, stdout: str, finished_at: datetim
             "count": queued,
             "queued_at": finished_at.isoformat(timespec="seconds"),
         }
-        save_state(state)
+    save_state(state)
     return queued
 
 
+@_state_transaction
 def _send_pending_ct_rir_email() -> tuple[bool, str, int]:
     state = load_state()
     pending_entries = state.get("ct_rir_email_pending", [])
@@ -995,7 +1122,14 @@ def _send_pending_ct_rir_email() -> tuple[bool, str, int]:
 
     sender, password, recipients = _ct_rir_email_config()
     if not sender or not password or not recipients:
-        return False, "Configuracion incompleta de correo CT_RIR", 0
+        detail = "Configuracion incompleta de correo CT_RIR"
+        state["ct_rir_email_last_error"] = {
+            "failed_at": datetime.now().isoformat(timespec="seconds"),
+            "detail": detail,
+            "pending_count": len(pending_entries),
+        }
+        save_state(state)
+        return False, detail, 0
 
     ordered_entries = [item for item in pending_entries if isinstance(item, dict)]
     if not ordered_entries:
@@ -1031,10 +1165,48 @@ def _send_pending_ct_rir_email() -> tuple[bool, str, int]:
     msg.set_content(body)
 
     context = ssl.create_default_context()
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context, timeout=30) as server:
-        server.login(sender, password)
-        server.send_message(msg)
+    last_error: Optional[Exception] = None
+    for attempt, delay_seconds in enumerate(
+        CT_RIR_EMAIL_RETRY_DELAYS_SECONDS,
+        start=1,
+    ):
+        if delay_seconds:
+            time.sleep(delay_seconds)
+        try:
+            with smtplib.SMTP_SSL(
+                "smtp.gmail.com",
+                465,
+                context=context,
+                timeout=30,
+            ) as server:
+                server.login(sender, password)
+                server.send_message(msg)
+            last_error = None
+            break
+        except Exception as exc:  # pylint: disable=broad-except
+            last_error = exc
+            logging.warning(
+                "CT_RIR: fallo SMTP intento %s/%s: %s",
+                attempt,
+                len(CT_RIR_EMAIL_RETRY_DELAYS_SECONDS),
+                exc,
+            )
 
+    if last_error is not None:
+        detail = f"SMTP fallo tras {len(CT_RIR_EMAIL_RETRY_DELAYS_SECONDS)} intentos: {last_error}"
+        latest_state = load_state()
+        latest_pending = latest_state.get("ct_rir_email_pending", [])
+        latest_state["ct_rir_email_last_error"] = {
+            "failed_at": datetime.now().isoformat(timespec="seconds"),
+            "detail": detail,
+            "pending_count": len(latest_pending) if isinstance(latest_pending, list) else 0,
+        }
+        save_state(latest_state)
+        return False, detail, 0
+
+    # Recarga el estado despues del I/O de red. Asi no se pierden entradas que
+    # otro scraper haya agregado mientras el correo estaba saliendo.
+    state = load_state()
     sent_keys = state.setdefault("ct_rir_email_sent_keys", {})
     sent_at = datetime.now().isoformat(timespec="seconds")
     for entry in ordered_entries:
@@ -1045,13 +1217,25 @@ def _send_pending_ct_rir_email() -> tuple[bool, str, int]:
         kept_keys = sorted(sent_keys.keys())[-3000:]
         state["ct_rir_email_sent_keys"] = {key: sent_keys[key] for key in kept_keys}
 
-    state["ct_rir_email_pending"] = []
+    delivered_keys = {
+        str(entry.get("unique_key") or "").strip()
+        for entry in ordered_entries
+        if str(entry.get("unique_key") or "").strip()
+    }
+    current_pending = state.get("ct_rir_email_pending", [])
+    state["ct_rir_email_pending"] = [
+        entry
+        for entry in current_pending
+        if not isinstance(entry, dict)
+        or str(entry.get("unique_key") or "").strip() not in delivered_keys
+    ] if isinstance(current_pending, list) else []
     state["ct_rir_email_last_sent"] = {
         "count": len(ordered_entries),
         "sent_at": sent_at,
         "recipients": recipients,
         "subject": subject,
     }
+    state.pop("ct_rir_email_last_error", None)
     save_state(state)
     return True, "", len(ordered_entries)
 
@@ -1178,7 +1362,14 @@ def _send_pending_rs_sp_email() -> tuple[bool, str, int]:
     return True, "", len(ordered_entries)
 
 
-def _queue_scan_based_notifications(job_name: str, module_name: str, finished_at: datetime) -> int:
+@_state_transaction
+def _queue_scan_based_notifications(
+    job_name: str,
+    module_name: str,
+    finished_at: datetime,
+    *,
+    direct_only: bool = False,
+) -> int:
     scanner = _scan_ct_rir_candidates if module_name == "ct_rir" else _scan_rs_sp_candidates
     unique_builder = _build_ct_rir_unique_key if module_name == "ct_rir" else _build_rs_sp_unique_key
     pending_key_name = f"{module_name}_email_pending"
@@ -1186,7 +1377,7 @@ def _queue_scan_based_notifications(job_name: str, module_name: str, finished_at
     seen_key_name = f"{module_name}_module_seen_keys"
     baseline_key_name = f"{module_name}_module_baseline"
 
-    candidates = scanner()
+    candidates = scanner(direct_only=direct_only) if module_name == "ct_rir" else scanner()
     state = load_state()
     seen_keys = state.get(seen_key_name)
     if not isinstance(seen_keys, dict):
@@ -1254,6 +1445,75 @@ def _queue_scan_based_notifications(job_name: str, module_name: str, finished_at
     state[seen_key_name] = seen_updated
     save_state(state)
     return queued
+
+
+def _ct_rir_full_scan_is_due(now: datetime, state: dict) -> bool:
+    raw_value = state.get("ct_rir_watchdog_last_full_scan_at")
+    last_scan = _parse_iso_datetime(raw_value)
+    if last_scan is None:
+        return True
+    return (now - last_scan).total_seconds() >= CT_RIR_FULL_SCAN_INTERVAL_SECONDS
+
+
+@_state_transaction
+def _run_ct_rir_notification_watchdog() -> dict[str, object]:
+    """Escanea hojas y reintenta pendientes sin depender del fin de un scraper."""
+    started = datetime.now()
+    state = load_state()
+    full_scan = _ct_rir_full_scan_is_due(started, state)
+    scan_mode = "full_semantic" if full_scan else "direct_sheets"
+    queued = 0
+    scan_error = ""
+
+    try:
+        queued = _queue_scan_based_notifications(
+            "ct_rir_watchdog",
+            "ct_rir",
+            started,
+            direct_only=not full_scan,
+        )
+        if full_scan:
+            latest_state = load_state()
+            latest_state["ct_rir_watchdog_last_full_scan_at"] = started.isoformat(
+                timespec="seconds"
+            )
+            save_state(latest_state)
+    except Exception as exc:  # pylint: disable=broad-except
+        scan_error = str(exc)
+        logging.exception("CT_RIR watchdog: fallo el escaneo %s", scan_mode)
+
+    ok, delivery_detail, sent_count = _send_pending_ct_rir_email()
+    finished = datetime.now()
+    status = "success" if not scan_error and ok else "error"
+    detail_parts = [part for part in (scan_error, delivery_detail) if part]
+    latest_state = load_state()
+    latest_state["ct_rir_watchdog"] = {
+        "status": status,
+        "scan_mode": scan_mode,
+        "started_at": started.isoformat(timespec="seconds"),
+        "finished_at": finished.isoformat(timespec="seconds"),
+        "duration_seconds": round((finished - started).total_seconds(), 3),
+        "queued": queued,
+        "sent": sent_count,
+        "pending": len(latest_state.get("ct_rir_email_pending", []))
+        if isinstance(latest_state.get("ct_rir_email_pending"), list)
+        else 0,
+        "detail": " | ".join(detail_parts),
+    }
+    save_state(latest_state)
+
+    if ok and sent_count:
+        logging.info(
+            "CT_RIR watchdog: %s correo(s) entregados; %s novedad(es) agregadas",
+            sent_count,
+            queued,
+        )
+    elif not ok:
+        logging.warning(
+            "CT_RIR watchdog: quedan alertas pendientes: %s",
+            delivery_detail or "sin detalle",
+        )
+    return dict(latest_state["ct_rir_watchdog"])
 
 
 def _extract_generated_excel_name(stdout: str) -> str:
@@ -2727,6 +2987,25 @@ def main() -> None:
         logging.info(
             "Monitor de solicitudes manuales agendado (cada %s segundos)",
             MANUAL_POLL_INTERVAL_SECONDS,
+        )
+
+    if CT_RIR_WATCH_INTERVAL_SECONDS > 0:
+        scheduler.add_job(
+            _run_ct_rir_notification_watchdog,
+            "interval",
+            seconds=CT_RIR_WATCH_INTERVAL_SECONDS,
+            id=CT_RIR_WATCH_JOB_ID,
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=max(60, CT_RIR_WATCH_INTERVAL_SECONDS),
+            next_run_time=datetime.now(),
+        )
+        protected_job_ids.add(CT_RIR_WATCH_JOB_ID)
+        logging.info(
+            "Monitor CT_RIR independiente agendado (cada %s segundos; escaneo semantico cada %s segundos)",
+            CT_RIR_WATCH_INTERVAL_SECONDS,
+            CT_RIR_FULL_SCAN_INTERVAL_SECONDS,
         )
 
     worker_thread = threading.Thread(target=worker_loop, name="job-runner", daemon=True)
