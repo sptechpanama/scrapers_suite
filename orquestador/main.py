@@ -57,6 +57,9 @@ if str(REPO_ROOT) not in sys.path:
 from common.keyword_watch import (  # noqa: E402
     DEFAULT_RS_SP_NEGATIVE_KEYWORDS as SHARED_RS_SP_DEFAULT_NEGATIVE_KEYWORDS,
     DEFAULT_RS_SP_KEYWORDS as SHARED_RS_SP_DEFAULT_KEYWORDS,
+    RS_SP_CONTEXT_RULES_VERSION,
+    is_rs_sp_contextual_keyword as shared_is_rs_sp_contextual_keyword,
+    match_keyword_fields as shared_match_keyword_fields,
     match_keywords_in_text as shared_match_keywords_in_text,
     negative_keywords_in_matching_context as shared_negative_keywords_in_matching_context,
     normalize_keyword_term as shared_normalize_keyword_term,
@@ -938,36 +941,40 @@ def _scan_rs_sp_candidates() -> list[dict[str, object]]:
             entidad = _row_value(row, mapping, "entidad")
             fecha = _row_value(row, mapping, "fecha")
             precio = _row_value(row, mapping, "precio_referencia")
+            adjudication_type = next(
+                (
+                    value
+                    for key in (
+                        "tipo de adjudicacion",
+                        "modalidad de adjudicacion",
+                        "forma de adjudicacion",
+                        "modalidad",
+                    )
+                    if (value := _row_value(row, mapping, key))
+                ),
+                "",
+            )
             if not titulo and not enlace:
                 continue
 
-            matched: list[str] = []
-            matched_field_values: list[str] = []
-            for key in text_keys:
-                field_value = _row_value(row, mapping, key)
-                field_matches = _match_keywords_in_text(
-                    field_value,
-                    keywords,
-                    reference_amount=precio,
-                )
-                if not field_matches:
-                    continue
-                matched_field_values.append(field_value)
-                for term in field_matches:
-                    if term not in matched:
-                        matched.append(term)
-            if not matched:
+            field_match = shared_match_keyword_fields(
+                [(key, _row_value(row, mapping, key)) for key in text_keys],
+                keywords,
+                reference_amount=precio,
+                adjudication_type=adjudication_type,
+            )
+            if not field_match.terms:
                 continue
             if shared_negative_keywords_in_matching_context(
                 title=titulo,
-                matched_field_values=matched_field_values,
+                matched_field_values=field_match.field_values,
                 negative_keywords=negative_keywords,
             ):
                 continue
 
             entry = {
                 "hoja_origen": sheet_name,
-                "palabras_clave": ", ".join(matched),
+                "palabras_clave": ", ".join(field_match.terms),
                 "titulo": titulo,
                 "entidad": entidad,
                 "fecha": fecha,
@@ -982,13 +989,24 @@ def _scan_rs_sp_candidates() -> list[dict[str, object]]:
                 merged = sorted(
                     {
                         *[token.strip() for token in str(previous.get("palabras_clave") or "").split(",") if token.strip()],
-                        *matched,
+                        *field_match.terms,
                     }
                 )
                 previous["palabras_clave"] = ", ".join(merged)
             else:
                 candidates[act_key] = entry
     return list(candidates.values())
+
+
+def _rs_sp_entry_uses_only_contextual_keywords(entry: dict[str, object]) -> bool:
+    terms = [
+        token.strip()
+        for token in str(entry.get("palabras_clave") or "").split(",")
+        if token.strip()
+    ]
+    return bool(terms) and all(
+        shared_is_rs_sp_contextual_keyword(term) for term in terms
+    )
 
 
 def _queue_ct_rir_notifications(job_name: str, stdout: str, finished_at: datetime) -> int:
@@ -1466,6 +1484,8 @@ def _queue_scan_based_notifications(job_name: str, module_name: str, finished_at
             "count": len(candidate_by_act),
             "job": job_name,
         }
+        if module_name == "rs_sp":
+            state["rs_sp_context_rules_baseline_version"] = RS_SP_CONTEXT_RULES_VERSION
         save_state(state)
         logging.info(
             "Notificaciones %s: baseline inicial creado con %s acto(s)",
@@ -1473,6 +1493,37 @@ def _queue_scan_based_notifications(job_name: str, module_name: str, finished_at
             len(candidate_by_act),
         )
         return 0
+
+    if module_name == "rs_sp":
+        try:
+            baseline_version = int(
+                state.get("rs_sp_context_rules_baseline_version", 0) or 0
+            )
+        except (TypeError, ValueError):
+            baseline_version = 0
+        if baseline_version < RS_SP_CONTEXT_RULES_VERSION:
+            baseline_stamp = finished_at.isoformat(timespec="seconds")
+            contextual_keys = {
+                act_key
+                for act_key, entry in candidate_by_act.items()
+                if act_key not in seen_keys
+                and _rs_sp_entry_uses_only_contextual_keywords(entry)
+            }
+            seen_keys = dict(seen_keys)
+            seen_keys.update({key: baseline_stamp for key in contextual_keys})
+            state[seen_key_name] = seen_keys
+            state["rs_sp_context_rules_baseline_version"] = RS_SP_CONTEXT_RULES_VERSION
+            state["rs_sp_context_rules_baseline"] = {
+                "initialized_at": baseline_stamp,
+                "count": len(contextual_keys),
+                "job": job_name,
+            }
+            save_state(state)
+            logging.info(
+                "Notificaciones RS_SP: baseline silencioso v%s creado con %s acto(s)",
+                RS_SP_CONTEXT_RULES_VERSION,
+                len(contextual_keys),
+            )
 
     queued = 0
     seen_updated = dict(seen_keys)

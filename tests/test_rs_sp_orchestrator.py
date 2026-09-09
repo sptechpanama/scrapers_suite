@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime
 from pathlib import Path
 
 
@@ -77,3 +78,67 @@ def test_negative_loader_respects_an_existing_header_only_sheet(monkeypatch):
         lambda _sheet: [["Palabra clave", "Actualizado por", "Actualizado"]],
     )
     assert orchestrator._load_rs_sp_negative_keywords_for_notifications() == []
+
+
+def test_rs_sp_scanner_suppresses_contextual_item_in_global_mixed_act(monkeypatch):
+    monkeypatch.setattr(orchestrator, "PANAMACOMPRA_RS_SP_SCAN_SHEETS", ["prueba"])
+    monkeypatch.setattr(
+        orchestrator,
+        "_load_rs_sp_keywords_for_notifications",
+        lambda: ["generador electric*"],
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_load_rs_sp_negative_keywords_for_notifications",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_read_panamacompra_sheet",
+        lambda _sheet: [
+            ["titulo", "item_1", "item_2", "Tipo de adjudicacion", "enlace"],
+            ["Compra mixta", "Aceite para generador electrico", "Alimentos", "Global", "noise"],
+            ["Compra mixta", "Aceite para generador electrico", "Alimentos", "Por renglon", "valid"],
+        ],
+    )
+
+    rows = orchestrator._scan_rs_sp_candidates()
+
+    assert [row["enlace"] for row in rows] == ["valid"]
+
+
+def test_contextual_rules_get_one_silent_baseline_without_hiding_old_rules(monkeypatch):
+    contextual = {
+        "palabras_clave": "planta electric*",
+        "titulo": "Planta electrica",
+        "enlace": "https://example.test/contextual",
+    }
+    existing_rule = {
+        "palabras_clave": "chiller",
+        "titulo": "Chiller",
+        "enlace": "https://example.test/existing",
+    }
+    state = {"rs_sp_module_seen_keys": {"already-seen": "2026-09-01T00:00:00"}}
+    saved: list[dict] = []
+    monkeypatch.setattr(
+        orchestrator,
+        "_scan_rs_sp_candidates",
+        lambda: [contextual, existing_rule],
+    )
+    monkeypatch.setattr(orchestrator, "load_state", lambda: state)
+    monkeypatch.setattr(orchestrator, "save_state", lambda value: saved.append(dict(value)))
+
+    queued = orchestrator._queue_scan_based_notifications(
+        "clv",
+        "rs_sp",
+        datetime(2026, 9, 8, 8, 0, 0),
+    )
+
+    contextual_key = orchestrator._build_module_act_key(contextual)
+    assert queued == 1
+    assert contextual_key in state["rs_sp_module_seen_keys"]
+    assert state["rs_sp_context_rules_baseline_version"] == orchestrator.RS_SP_CONTEXT_RULES_VERSION
+    assert [item["enlace"] for item in state["rs_sp_email_pending"]] == [
+        "https://example.test/existing"
+    ]
+    assert saved

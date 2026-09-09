@@ -5,7 +5,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Iterable
+from typing import Iterable, Sequence
 
 HVAC_OVER_15K_KEYWORDS = (
     "aire acondicion*>15k",
@@ -46,12 +46,49 @@ HVAC_OVER_15K_KEYWORDS = (
     "bomba de calor>15k",
     "climatizacion*>15k",
 )
-KEYWORD_RULES_VERSION = 3
+POWER_GENERATION_KEYWORDS = (
+    "planta electric*",
+    "plantas electric*",
+    "panta electric*",
+    "planta de emergencia*",
+    "plantas de emergencia*",
+    "grupo electrogen*",
+    "grupos electrogen*",
+    "generador electric*",
+    "generadores electric*",
+    "generador de emergencia*",
+    "generadores de emergencia*",
+    "tablero de transferencia automat*",
+    "tableros de transferencia automat*",
+    "sistema de transferencia automat*",
+    "sistemas de transferencia automat*",
+)
+ENGINEERING_PLAN_KEYWORDS = (
+    "confeccion de plano*",
+    "elaboracion de plano*",
+    "digitalizacion de plano*",
+    "actualizacion de plano*",
+    "diseno arquitectonic*",
+    "diseno electric*",
+    "diseno electromecanic*",
+    "diseno de instalaciones electric*",
+    "tramite de aprobacion de plano*",
+    "servicio de tramite de plano*",
+    "planos as built",
+    "plano como construido*",
+)
+RS_SP_CONTEXTUAL_KEYWORDS = (
+    *POWER_GENERATION_KEYWORDS,
+    *ENGINEERING_PLAN_KEYWORDS,
+)
+RS_SP_CONTEXT_RULES_VERSION = 1
+KEYWORD_RULES_VERSION = 4
 DEFAULT_RS_SP_KEYWORDS = (
     "chiller",
     "york",
     "daikin",
     *HVAC_OVER_15K_KEYWORDS,
+    *RS_SP_CONTEXTUAL_KEYWORDS,
 )
 DEFAULT_RS_SP_NEGATIVE_KEYWORDS = (
     "automotriz",
@@ -60,6 +97,7 @@ DEFAULT_RS_SP_NEGATIVE_KEYWORDS = (
     "protector solar",
     "oracle solaris",
     "correa del serpentin",
+    "techo de planta electric*",
 )
 _NEGATIVE_KEYWORD_ALIASES = {
     "habitacion de hotel": (
@@ -96,6 +134,15 @@ class KeywordRule:
         if self.minimum_amount is None:
             return self.term
         return f"{self.term}>{_format_rule_amount(self.minimum_amount)}"
+
+
+@dataclass(frozen=True)
+class KeywordFieldMatch:
+    terms: tuple[str, ...]
+    fields: tuple[str, ...]
+    field_values: tuple[str, ...]
+    suppressed_terms: tuple[str, ...] = ()
+    context_policy: str = ""
 
 
 def _normalize_text(value: object) -> str:
@@ -209,6 +256,17 @@ def normalize_keyword_term(value: object) -> str:
     return rule.canonical if rule else ""
 
 
+def _normalize_keyword_terms(values: Iterable[object]) -> list[str]:
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        term = normalize_keyword_term(value)
+        if term and term not in seen:
+            seen.add(term)
+            output.append(term)
+    return output
+
+
 def normalize_column_name(value: object) -> str:
     return _normalize_text(value)
 
@@ -318,6 +376,115 @@ def negative_keywords_in_matching_context(
     return matches
 
 
+@lru_cache(maxsize=1)
+def _rs_sp_contextual_term_bodies() -> frozenset[str]:
+    return frozenset(
+        rule.term
+        for raw in RS_SP_CONTEXTUAL_KEYWORDS
+        if (rule := parse_keyword_rule(raw)) is not None
+    )
+
+
+def is_rs_sp_contextual_keyword(value: object) -> bool:
+    rule = parse_keyword_rule(value)
+    return bool(rule and rule.term in _rs_sp_contextual_term_bodies())
+
+
+def _is_line_or_partial_adjudication(value: object) -> bool:
+    normalized = _normalize_text(value)
+    if not normalized:
+        return False
+    return any(
+        token in normalized.split()
+        for token in ("renglon", "renglones", "item", "items", "linea", "lineas")
+    ) or "parcial" in normalized
+
+
+def match_keyword_fields(
+    fields: Sequence[tuple[object, object]],
+    keywords: Iterable[object],
+    *,
+    reference_amount: object = None,
+    adjudication_type: object = "",
+) -> KeywordFieldMatch:
+    """Evalua una fila sin atribuir un item aislado a un paquete global."""
+
+    configured = _normalize_keyword_terms(keywords)
+    field_matches: list[tuple[str, str, list[str], bool]] = []
+    for raw_name, raw_value in fields:
+        name = str(raw_name or "").strip()
+        value = str(raw_value or "").strip()
+        matches = match_keywords_in_text(
+            value,
+            configured,
+            reference_amount=reference_amount,
+        )
+        field_matches.append(
+            (name, value, matches, normalize_column_name(name).startswith("item"))
+        )
+
+    contextual_in_primary = {
+        term
+        for _name, _value, matches, is_item in field_matches
+        if not is_item
+        for term in matches
+        if is_rs_sp_contextual_keyword(term)
+    }
+    contextual_in_items = {
+        term
+        for _name, _value, matches, is_item in field_matches
+        if is_item
+        for term in matches
+        if is_rs_sp_contextual_keyword(term)
+    }
+    contextual_allowed = bool(contextual_in_primary)
+    context_policy = "primary_context" if contextual_allowed else ""
+    if contextual_in_items and not contextual_allowed:
+        if _is_line_or_partial_adjudication(adjudication_type):
+            contextual_allowed = True
+            context_policy = "line_adjudication"
+        else:
+            item_rows = [item for item in field_matches if item[3] and item[1]]
+            contextual_allowed = bool(item_rows) and all(
+                any(is_rs_sp_contextual_keyword(term) for term in matches)
+                for _name, _value, matches, _is_item in item_rows
+            )
+            context_policy = "all_items_context" if contextual_allowed else "mixed_items_suppressed"
+
+    accepted_terms: list[str] = []
+    accepted_fields: list[str] = []
+    accepted_values: list[str] = []
+    suppressed_terms: list[str] = []
+    for name, value, matches, _is_item in field_matches:
+        accepted_here = [
+            term
+            for term in matches
+            if not is_rs_sp_contextual_keyword(term) or contextual_allowed
+        ]
+        rejected_here = [
+            term
+            for term in matches
+            if is_rs_sp_contextual_keyword(term) and not contextual_allowed
+        ]
+        for term in accepted_here:
+            if term not in accepted_terms:
+                accepted_terms.append(term)
+        for term in rejected_here:
+            if term not in suppressed_terms:
+                suppressed_terms.append(term)
+        if accepted_here:
+            accepted_fields.append(name)
+            accepted_values.append(value)
+
+    return KeywordFieldMatch(
+        terms=tuple(accepted_terms),
+        fields=tuple(accepted_fields),
+        field_values=tuple(accepted_values),
+        suppressed_terms=tuple(suppressed_terms),
+        context_policy=context_policy,
+    )
+
+
 def summarize_keyword_rows(
     *,
     rows: list[list[object]],
@@ -353,6 +520,19 @@ def summarize_keyword_rows(
         ),
         "",
     )
+    adjudication_column = next(
+        (
+            normalized_cols[key]
+            for key in (
+                "tipo de adjudicacion",
+                "modalidad de adjudicacion",
+                "forma de adjudicacion",
+                "modalidad",
+            )
+            if key in normalized_cols
+        ),
+        "",
+    )
 
     def row_text(row: list[object], normalized_name: str) -> str:
         column = normalized_cols.get(normalized_name, "")
@@ -362,33 +542,27 @@ def summarize_keyword_rows(
     preview_rows: list[dict[str, object]] = []
     match_count = 0
     for row in rows:
-        matched: list[str] = []
-        matched_field_values: list[str] = []
-        for col in text_columns:
-            idx = col_idx.get(col, -1)
-            if idx >= 0 and idx < len(row):
-                field_value = str(row[idx] or "")
-                field_matches = match_keywords_in_text(
-                    field_value,
-                    normalized_terms,
-                    reference_amount=(
-                        row[col_idx.get(price_column, -1)]
-                        if 0 <= col_idx.get(price_column, -1) < len(row)
-                        else None
-                    ),
-                )
-                if field_matches:
-                    matched_field_values.append(field_value)
-                    for term in field_matches:
-                        if term not in matched:
-                            matched.append(term)
         price_idx = col_idx.get(price_column, -1)
         reference_amount = row[price_idx] if 0 <= price_idx < len(row) else None
-        if not matched:
+        adjudication_idx = col_idx.get(adjudication_column, -1)
+        adjudication_type = (
+            row[adjudication_idx] if 0 <= adjudication_idx < len(row) else ""
+        )
+        field_match = match_keyword_fields(
+            [
+                (col, row[idx] if 0 <= idx < len(row) else "")
+                for col in text_columns
+                for idx in (col_idx.get(col, -1),)
+            ],
+            normalized_terms,
+            reference_amount=reference_amount,
+            adjudication_type=adjudication_type,
+        )
+        if not field_match.terms:
             continue
         if negative_keywords_in_matching_context(
             title=row_text(row, "titulo"),
-            matched_field_values=matched_field_values,
+            matched_field_values=field_match.field_values,
             negative_keywords=negative_terms,
         ):
             continue
@@ -397,7 +571,7 @@ def summarize_keyword_rows(
             continue
         preview_rows.append(
             {
-                "palabras_clave": ", ".join(matched),
+                "palabras_clave": ", ".join(field_match.terms),
                 "titulo": row_text(row, "titulo"),
                 "entidad": row_text(row, "entidad"),
                 "fecha": row_text(row, "fecha"),

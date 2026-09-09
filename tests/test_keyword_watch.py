@@ -3,6 +3,10 @@ from __future__ import annotations
 from common.keyword_watch import (
     DEFAULT_RS_SP_NEGATIVE_KEYWORDS,
     DEFAULT_RS_SP_KEYWORDS,
+    ENGINEERING_PLAN_KEYWORDS,
+    POWER_GENERATION_KEYWORDS,
+    RS_SP_CONTEXTUAL_KEYWORDS,
+    match_keyword_fields,
     match_keywords_in_text,
     match_negative_keywords_in_text,
     negative_keywords_in_matching_context,
@@ -93,6 +97,66 @@ def test_hvac_defaults_include_root_and_amount_rules():
     assert "climatizacion*>15k" in DEFAULT_RS_SP_KEYWORDS
 
 
+def test_new_defaults_are_precise_contextual_phrases():
+    assert set(RS_SP_CONTEXTUAL_KEYWORDS).issubset(DEFAULT_RS_SP_KEYWORDS)
+    assert set(POWER_GENERATION_KEYWORDS).issubset(DEFAULT_RS_SP_KEYWORDS)
+    assert set(ENGINEERING_PLAN_KEYWORDS).issubset(DEFAULT_RS_SP_KEYWORDS)
+    assert "mantenimiento" not in DEFAULT_RS_SP_KEYWORDS
+    assert "reparacion" not in DEFAULT_RS_SP_KEYWORDS
+    assert "planos" not in DEFAULT_RS_SP_KEYWORDS
+
+
+def test_contextual_item_guard_suppresses_mixed_global_packages():
+    result = match_keyword_fields(
+        [
+            ("titulo", "Compra de materiales diversos"),
+            ("item_1", "Aceite para generador electrico"),
+            ("item_2", "Alimentos secos"),
+        ],
+        POWER_GENERATION_KEYWORDS,
+        adjudication_type="Global",
+    )
+    assert result.terms == ()
+    assert result.suppressed_terms == ("generador electric*",)
+    assert result.context_policy == "mixed_items_suppressed"
+
+
+def test_contextual_item_guard_accepts_line_awards_and_single_item_acts():
+    by_line = match_keyword_fields(
+        [
+            ("titulo", "Compra de equipos"),
+            ("item_1", "Cargador para planta electrica"),
+            ("item_2", "Bomba de agua"),
+        ],
+        POWER_GENERATION_KEYWORDS,
+        adjudication_type="Parcial por renglon",
+    )
+    assert by_line.terms == ("planta electric*",)
+    assert by_line.context_policy == "line_adjudication"
+
+    single_item = match_keyword_fields(
+        [("titulo", "Compra"), ("item_1", "Digitalizacion de planos")],
+        ENGINEERING_PLAN_KEYWORDS,
+        adjudication_type="Global",
+    )
+    assert single_item.terms == ("digitalizacion de plano*",)
+    assert single_item.context_policy == "all_items_context"
+
+
+def test_contextual_guard_preserves_preexisting_keyword_behavior():
+    result = match_keyword_fields(
+        [
+            ("titulo", "Compra de equipos"),
+            ("item_1", "Chiller y generador electrico"),
+            ("item_2", "Mobiliario"),
+        ],
+        ["chiller", *POWER_GENERATION_KEYWORDS],
+        adjudication_type="Global",
+    )
+    assert result.terms == ("chiller",)
+    assert result.suppressed_terms == ("generador electric*",)
+
+
 def test_negative_context_aliases_are_precise():
     assert match_negative_keywords_in_text(
         "Alquiler de habitaciones (hotel)",
@@ -125,6 +189,48 @@ def test_summary_excludes_negative_only_in_the_positive_matching_context():
     assert result is not None
     assert result["count"] == 1
     assert result["rows"][0]["enlace"] == "building"
+
+
+def test_summary_applies_context_guard_before_building_email_payload():
+    columns = [
+        "titulo",
+        "descripcion",
+        "item_1",
+        "item_2",
+        "Tipo de adjudicacion",
+        "precio_referencia",
+        "enlace",
+    ]
+    rows = [
+        [
+            "Compra mixta",
+            "Varios insumos",
+            "Aceite para generador electrico",
+            "Alimentos",
+            "Global",
+            "20000",
+            "suppressed",
+        ],
+        [
+            "Compra mixta por renglon",
+            "Varios insumos",
+            "Aceite para generador electrico",
+            "Alimentos",
+            "Por renglon",
+            "20000",
+            "accepted",
+        ],
+    ]
+    result = summarize_keyword_rows(
+        rows=rows,
+        cols=columns,
+        keyword_terms=POWER_GENERATION_KEYWORDS,
+        source_sheet="cl_abiertas",
+        job_name="clv",
+    )
+    assert result is not None
+    assert result["count"] == 1
+    assert result["rows"][0]["enlace"] == "accepted"
 
 
 def test_negative_helper_ignores_unrelated_nonmatching_fields():

@@ -42,6 +42,7 @@ if str(COMMON_DIR) not in sys.path:
 
 from ficha_utils import detectar_fichas_tokens
 from keyword_watch import (
+    DEFAULT_RS_SP_NEGATIVE_KEYWORDS,
     DEFAULT_RS_SP_KEYWORDS,
     normalize_keyword_term,
     summarize_keyword_rows,
@@ -69,6 +70,7 @@ CFG = {
     "sheet_ct_rir": "cl_abiertas_ct_rir",
     "sheet_ct_rir_fichas": "ct_rir_fichas",
     "sheet_rs_sp_keywords": "pc_palabras_clave",
+    "sheet_rs_sp_negative_keywords": "pc_palabras_negativas",
 
     # ---- Web (listado y selectores) ----
     "url_list": "https://www.panamacompra.gob.pa/Inicio/#/cotizaciones-en-linea/cotizaciones-en-linea",
@@ -518,6 +520,28 @@ def load_rs_sp_keywords() -> list[str]:
         except Exception:
             out = list(defaults)
     LOG("RS_SP", f"palabras configuradas={len(out)}")
+    return out
+
+
+def load_rs_sp_negative_keywords() -> list[str]:
+    sheet_name = CFG.get("sheet_rs_sp_negative_keywords", "pc_palabras_negativas")
+    defaults = [
+        normalize_keyword_term(term)
+        for term in DEFAULT_RS_SP_NEGATIVE_KEYWORDS
+        if normalize_keyword_term(term)
+    ]
+    if not ensure_sheet_exists(sheet_name, rows=2000, cols=3):
+        return defaults
+    values = gs_get(f"{sheet_name}!A1:A")
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in values:
+        if not row:
+            continue
+        token = normalize_keyword_term(row[0])
+        if token and token != "palabra clave" and token not in seen:
+            out.append(token)
+            seen.add(token)
     return out
 
 def find_idx(headers, name):
@@ -1029,6 +1053,7 @@ def main():
     ensure_sheet_exists(CFG["sheet_ct_rir"])
     FICHAS_CT_RIR_DYNAMIC = load_ct_rir_fichas()
     rs_sp_keywords = load_rs_sp_keywords()
+    rs_sp_negative_keywords = load_rs_sp_negative_keywords()
     _flush_failed_appends()
     purge_all()
 
@@ -1302,6 +1327,7 @@ def main():
             rows=rows_out,
             cols=cols_out,
             keyword_terms=rs_sp_keywords,
+            negative_terms=rs_sp_negative_keywords,
             source_sheet=sheet_name,
             job_name="clv",
         )
