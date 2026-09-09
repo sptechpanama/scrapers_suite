@@ -16,7 +16,7 @@ import threading
 import time
 import unicodedata
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 from dataclasses import dataclass
@@ -129,7 +129,16 @@ JOB_TIMEOUT_SECONDS_DEFAULTS = {
 }
 
 JOB_STARTUP_CATCHUP_SECONDS_DEFAULTS = {
+    "clv": 86400,
+    "clrir": 86400,
+    "rir1": 86400,
+    "ctni": 86400,
+    "otras_fuentes": 86400,
+    "finance_recurring_autopay": 86400,
+    "database_daily": 86400,
+    "database_weekly_full": 86400,
     "sunday_db_minsa": 86400,
+    "minsa_weekly": 86400,
 }
 
 REQUIRED_FALLBACK_JOB_NAMES = {
@@ -139,6 +148,19 @@ REQUIRED_FALLBACK_JOB_NAMES = {
 }
 
 MAX_QUEUE_LOG_ITEMS = 12
+
+CRON_JOB_PRIORITIES = {
+    "finance_recurring_autopay": 20,
+    "clv": 30,
+    "clrir": 30,
+    "rir1": 30,
+    "ctni": 35,
+    "otras_fuentes": 40,
+    "database_daily": 70,
+    "database_weekly_full": 75,
+    "sunday_db_minsa": 75,
+    "minsa_weekly": 80,
+}
 
 DEFAULT_JOB_DATA = [
     {
@@ -1733,31 +1755,75 @@ def resolve_startup_catchup_seconds(job_name: str) -> int:
     return int(JOB_STARTUP_CATCHUP_SECONDS_DEFAULTS.get(job_name, CRON_STARTUP_CATCHUP_SECONDS))
 
 
-def _maybe_enqueue_recent_cron_catchup(
+def resolve_cron_job_priority(job_name: str) -> int:
+    return int(CRON_JOB_PRIORITIES.get(job_name, 50))
+
+
+def _latest_missed_cron_slot(
     job: JobConfig,
     *,
-    time_str: str,
+    now_ref: datetime,
+    catchup_seconds: int,
+) -> Optional[datetime]:
+    """Devuelve solo la franja perdida mas reciente dentro de la ventana.
+
+    Buscar una unica franja evita que, tras varias horas con el equipo apagado,
+    se encolen muchas ejecuciones obsoletas del mismo scraper.
+    """
+    if catchup_seconds <= 0 or not job.days_of_week or not job.times:
+        return None
+
+    allowed_days = set(job.days_of_week)
+    parsed_times: list[tuple[int, int]] = []
+    for time_str in job.times:
+        try:
+            hour, minute = map(int, time_str.split(":"))
+        except (TypeError, ValueError):
+            continue
+        parsed_times.append((hour, minute))
+
+    if not parsed_times:
+        return None
+
+    latest: Optional[datetime] = None
+    days_to_scan = max(1, catchup_seconds // 86400 + 2)
+    for days_ago in range(days_to_scan):
+        day_ref = now_ref - timedelta(days=days_ago)
+        weekday_token = day_ref.strftime("%a").lower()[:3]
+        if weekday_token not in allowed_days:
+            continue
+        for hour, minute in parsed_times:
+            scheduled_at = day_ref.replace(
+                hour=hour,
+                minute=minute,
+                second=0,
+                microsecond=0,
+            )
+            delta_seconds = (now_ref - scheduled_at).total_seconds()
+            if delta_seconds < 0 or delta_seconds > catchup_seconds:
+                continue
+            if latest is None or scheduled_at > latest:
+                latest = scheduled_at
+    return latest
+
+
+def _maybe_enqueue_latest_cron_catchup(
+    job: JobConfig,
+    *,
     enqueue_func,
+    now_ref: Optional[datetime] = None,
 ) -> None:
     catchup_seconds = resolve_startup_catchup_seconds(job.name)
-    if catchup_seconds <= 0:
+    current_ref = now_ref or datetime.now()
+    scheduled_at = _latest_missed_cron_slot(
+        job,
+        now_ref=current_ref,
+        catchup_seconds=catchup_seconds,
+    )
+    if scheduled_at is None:
         return
 
-    try:
-        hour, minute = map(int, time_str.split(":"))
-    except ValueError:
-        return
-
-    now_ref = datetime.now()
-    weekday_token = now_ref.strftime("%a").lower()[:3]
-    if weekday_token not in set(job.days_of_week):
-        return
-
-    scheduled_at = now_ref.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    delta_seconds = (now_ref - scheduled_at).total_seconds()
-    if delta_seconds < 0 or delta_seconds > catchup_seconds:
-        return
-
+    time_str = scheduled_at.strftime("%H:%M")
     if _job_already_ran_for_slot(job.name, scheduled_at):
         logging.info(
             "Job %s %s ya habia corrido para esta franja; no se hace catch-up.",
@@ -1775,11 +1841,12 @@ def _maybe_enqueue_recent_cron_catchup(
         return
 
     _mark_cron_slot_caught_up(job.name, scheduled_at)
-    logging.info(
-        "Job %s perdio la hora %s por %ss al cargar/reprogramar; se encola ejecucion inmediata (ventana catch-up %ss).",
+    delta_seconds = max(0, int((current_ref - scheduled_at).total_seconds()))
+    logging.warning(
+        "Job %s perdio su ultima hora programada (%s) por %ss; se encola una sola ejecucion de recuperacion (ventana %ss).",
         job.name,
-        time_str,
-        int(delta_seconds),
+        scheduled_at.isoformat(timespec="minutes"),
+        delta_seconds,
         catchup_seconds,
     )
     enqueue_func(job, "cron")
@@ -2570,12 +2637,11 @@ def schedule_jobs(
                 days,
                 next_run,
             )
-            _maybe_enqueue_recent_cron_catchup(
-                job,
-                time_str=time_str,
-                enqueue_func=enqueue_func,
-            )
             scheduled_count += 1
+        _maybe_enqueue_latest_cron_catchup(
+            job,
+            enqueue_func=enqueue_func,
+        )
     if scheduled_count == 0:
         logging.warning(
             "No se agendo ningun job por cron. Revisa pc_config (dias/horas) y la hoja activa."
@@ -2635,6 +2701,8 @@ def main() -> None:
 
     job_queue: "queue.PriorityQueue[tuple[int, int, ExecutionRequest]]" = queue.PriorityQueue()
     queue_counter = itertools.count()
+    cron_pending_lock = threading.Lock()
+    cron_pending_jobs: set[str] = set()
     running_lock = threading.Lock()
     running_execution: Optional[ExecutionRequest] = None
     running_process: Optional[subprocess.Popen] = None
@@ -2732,6 +2800,18 @@ def main() -> None:
         priority_override: Optional[int] = None,
     ) -> None:
         priority = 50
+        cron_slot_claimed = False
+        if source == "cron":
+            with cron_pending_lock:
+                if job.name in cron_pending_jobs:
+                    logging.info(
+                        "Job %s ya tiene una ejecucion automatica pendiente; se combina la nueva franja.",
+                        job.name,
+                    )
+                    return
+                cron_pending_jobs.add(job.name)
+                cron_slot_claimed = True
+            priority = resolve_cron_job_priority(job.name)
         if source == "manual":
             # Prioridad alta para cotización Panamá Compra:
             # termina el scraper en curso y luego se ejecuta antes que el resto de cola.
@@ -2791,7 +2871,13 @@ def main() -> None:
                 job=job,
                 source=source,
             )
-        job_queue.put((priority, next(queue_counter), execution))
+        try:
+            job_queue.put((priority, next(queue_counter), execution))
+        except Exception:
+            if cron_slot_claimed:
+                with cron_pending_lock:
+                    cron_pending_jobs.discard(job.name)
+            raise
         logging.info(
             "Job %s agregado a la cola (origen: %s, prioridad: %s)",
             job.name,
@@ -2840,6 +2926,10 @@ def main() -> None:
                 _, _, execution = job_queue.get(timeout=1)
             except queue.Empty:
                 continue
+
+            if execution.source == "cron":
+                with cron_pending_lock:
+                    cron_pending_jobs.discard(execution.job.name)
 
             try:
                 log_pipeline_state("dequeue")
@@ -3054,9 +3144,8 @@ def main() -> None:
         )
 
     worker_thread = threading.Thread(target=worker_loop, name="job-runner", daemon=True)
-    worker_thread.start()
-
     scheduler.start()
+    worker_thread.start()
     active_jobs = [job for job in scheduler.get_jobs() if job.id not in protected_job_ids]
     logging.info("Scheduler iniciado con %d jobs activos", len(active_jobs))
     log_pipeline_state("startup")
