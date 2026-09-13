@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import ctypes
 import json
 import itertools
@@ -54,10 +55,13 @@ REPO_ROOT = BASE_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from common.process_refresh import process_code as refresh_process_code, route_payload as refresh_route_payload
+
 from common.keyword_watch import (  # noqa: E402
     DEFAULT_RS_SP_NEGATIVE_KEYWORDS as SHARED_RS_SP_DEFAULT_NEGATIVE_KEYWORDS,
     DEFAULT_RS_SP_KEYWORDS as SHARED_RS_SP_DEFAULT_KEYWORDS,
     RS_SP_CONTEXT_RULES_VERSION,
+    parse_reference_amount as shared_parse_reference_amount,
     is_rs_sp_contextual_keyword as shared_is_rs_sp_contextual_keyword,
     match_keyword_fields as shared_match_keyword_fields,
     match_keywords_in_text as shared_match_keywords_in_text,
@@ -680,7 +684,31 @@ def _build_ct_rir_unique_key(entry: Dict[str, object]) -> str:
     return f"{sheet}|{titulo}|{entidad}|{fecha}|{ficha}"
 
 
+def _rs_sp_revision_key(entry):
+    amount = shared_parse_reference_amount(entry.get("precio_referencia"))
+    price = f"{amount:.2f}" if amount is not None else str(entry.get("precio_referencia") or "").strip()
+    data = [re.sub(r"\s+", " ", str(entry.get("fecha") or "").strip()).casefold(), price]
+    return hashlib.sha256(json.dumps(data, ensure_ascii=False).encode("utf-8")).hexdigest()[:20]
+
+
+def _rs_sp_recent_date_changes():
+    changes = {}
+    for name in ("clv", "clrir", "rir1"):
+        try:
+            checkpoint = json.loads((REPO_ROOT / "data" / "process_refresh" / f"{name}.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for change in checkpoint.get("changes", []):
+            dates = change.get("changes", {}).get("fecha")
+            if dates:
+                changes[str(change.get("code"))] = dates
+    return changes
+
+
 def _build_rs_sp_unique_key(entry: Dict[str, object]) -> str:
+    code = refresh_process_code(entry.get("enlace"))
+    if code:
+        return f"rs-sp|{code}|{_rs_sp_revision_key(entry)}"
     sheet = str(entry.get("hoja_origen") or entry.get("sheet") or "").strip().lower()
     enlace = str(entry.get("enlace") or "").strip().lower()
     if sheet and enlace:
@@ -1218,7 +1246,7 @@ def _send_pending_rs_sp_email() -> tuple[bool, str, int]:
         return True, "", 0
 
     lines: list[str] = []
-    lines.append("Se detectaron nuevos actos en Actos RS/SP.")
+    lines.append("Novedades en Actos RS/SP: actos nuevos y actualizaciones verificadas.")
     lines.append("")
     grouped: dict[str, list[dict]] = {}
     for entry in ordered_entries:
@@ -1233,14 +1261,17 @@ def _send_pending_rs_sp_email() -> tuple[bool, str, int]:
             )
             lines.append(f"   Titulo: {entry.get('titulo', '')}")
             lines.append(f"   Entidad: {entry.get('entidad', '')}")
-            lines.append(f"   Fecha: {entry.get('fecha', '')}")
+            if entry.get("tipo_evento") == "Actualizado":
+                lines.append("   ACTUALIZADO: revisar fecha y monto vigentes")
+                lines.append(f"   Fecha anterior: {entry.get('fecha_anterior', '')}")
+            lines.append(f"   Fecha vigente: {entry.get('fecha', '')}")
             lines.append(f"   Precio: {entry.get('precio_referencia', '')}")
             lines.append(f"   Enlace: {entry.get('enlace', '')}")
             lines.append("")
 
     body = "\n".join(lines).strip() + "\n"
     now_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    subject = f"Actos RS/SP: {len(ordered_entries)} acto(s) nuevo(s) detectado(s) - {now_local}"
+    subject = f"Actos RS/SP: {len(ordered_entries)} novedad(es) detectada(s) - {now_local}"
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -1493,8 +1524,21 @@ def _queue_scan_based_notifications(job_name: str, module_name: str, finished_at
     }
 
     candidate_by_act: dict[str, dict[str, object]] = {}
+    newest_by_code = {}
     for entry in candidates:
         act_key = _build_module_act_key(entry)
+        code = refresh_process_code(entry.get("enlace")) if module_name == "rs_sp" else ""
+        if code:
+            try:
+                version = refresh_route_payload(entry.get("enlace"))[0]
+            except (ValueError, KeyError, UnicodeError):
+                version = 0
+            previous = newest_by_code.get(code)
+            if previous and version <= previous[0]:
+                continue
+            if previous:
+                candidate_by_act.pop(previous[1], None)
+            newest_by_code[code] = (version, act_key)
         if act_key:
             candidate_by_act[act_key] = entry
 
@@ -1549,10 +1593,26 @@ def _queue_scan_based_notifications(job_name: str, module_name: str, finished_at
 
     queued = 0
     seen_updated = dict(seen_keys)
+    revisions = state.setdefault("rs_sp_module_revisions", {}) if module_name == "rs_sp" else {}
+    known_codes = {refresh_process_code(key) for key in seen_keys} if module_name == "rs_sp" else set()
+    date_changes = _rs_sp_recent_date_changes() if module_name == "rs_sp" else {}
     for act_key, entry in candidate_by_act.items():
-        if act_key in seen_updated:
+        code = refresh_process_code(entry.get("enlace")) if module_name == "rs_sp" else ""
+        revision_id = code or act_key
+        prior = revisions.get(revision_id, {})
+        fingerprint = _rs_sp_revision_key(entry) if module_name == "rs_sp" else ""
+        known = act_key in seen_updated or bool(code and code in known_codes)
+        dates = date_changes.get(code, {})
+        recovered_date_change = bool(dates and str(dates.get("after")) == str(entry.get("fecha")) and dates.get("before") != dates.get("after"))
+        changed = module_name == "rs_sp" and ((bool(prior) and prior.get("fingerprint") != fingerprint) or (not prior and known and recovered_date_change))
+        if module_name == "rs_sp":
+            revisions[revision_id] = {"fingerprint": fingerprint, "fecha": entry.get("fecha", ""), "precio_referencia": entry.get("precio_referencia", "")}
+        if known and not changed:
             continue
         payload = dict(entry)
+        if changed:
+            payload["tipo_evento"] = "Actualizado"
+            payload["fecha_anterior"] = prior.get("fecha") or dates.get("before", "")
         payload["job"] = job_name
         payload["queued_at"] = finished_at.isoformat(timespec="seconds")
         unique_key = unique_builder(payload)

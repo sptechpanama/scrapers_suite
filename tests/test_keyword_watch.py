@@ -1,5 +1,20 @@
 from __future__ import annotations
 
+
+def test_8k_threshold_and_new_hvac_families_without_broad_noise():
+    from common.keyword_watch import HVAC_TECHNICAL_KEYWORDS, match_keywords_in_text, DEFAULT_RS_SP_KEYWORDS
+    rules = ["aires acondicion*>8k"]
+    assert not match_keywords_in_text("Aires acondicionados", rules, reference_amount=8000)
+    assert match_keywords_in_text("Aires acondicionados", rules, reference_amount=8000.01) == rules
+    assert match_keywords_in_text("Aires acondicionados tipo piso-techo", rules, reference_amount=13755) == rules
+    assert match_keywords_in_text("FILTRO PLISADO MERV.13", HVAC_TECHNICAL_KEYWORDS) == ["filtro plisad*", "merv"]
+    assert match_keywords_in_text("BLOWERS CENTRIFUGOS 18 X 18", HVAC_TECHNICAL_KEYWORDS) == ["blowers centrifug*"]
+    assert match_keywords_in_text("REPUESTOS PARA EL SISTEMA HVAC", HVAC_TECHNICAL_KEYWORDS) == ["hvac"]
+    assert not match_keywords_in_text("BLOWER DE PISO Y DESBROZADORA", HVAC_TECHNICAL_KEYWORDS)
+    assert not match_keywords_in_text("CENTRIFUGA DE LABORATORIO", HVAC_TECHNICAL_KEYWORDS)
+    assert not match_keywords_in_text("FILTRO DE ACEITE PARA VEHICULO", HVAC_TECHNICAL_KEYWORDS)
+    assert not any(term.endswith(">15k") for term in DEFAULT_RS_SP_KEYWORDS)
+
 from common.keyword_watch import (
     DEFAULT_RS_SP_NEGATIVE_KEYWORDS,
     DEFAULT_RS_SP_KEYWORDS,
@@ -91,10 +106,10 @@ def test_summary_filters_low_amount_rows_before_email_payload():
 
 
 def test_hvac_defaults_include_root_and_amount_rules():
-    assert "aire acondicion*>15k" in DEFAULT_RS_SP_KEYWORDS
-    assert "aires acondicion*>15k" in DEFAULT_RS_SP_KEYWORDS
-    assert "vrf>15k" in DEFAULT_RS_SP_KEYWORDS
-    assert "climatizacion*>15k" in DEFAULT_RS_SP_KEYWORDS
+    assert "aire acondicion*>8k" in DEFAULT_RS_SP_KEYWORDS
+    assert "aires acondicion*>8k" in DEFAULT_RS_SP_KEYWORDS
+    assert "vrf>8k" in DEFAULT_RS_SP_KEYWORDS
+    assert "climatizacion*>8k" in DEFAULT_RS_SP_KEYWORDS
 
 
 def test_new_defaults_are_precise_contextual_phrases():

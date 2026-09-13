@@ -41,6 +41,10 @@ if str(COMMON_DIR) not in sys.path:
     sys.path.append(str(COMMON_DIR))
 
 from ficha_utils import detectar_fichas_tokens
+from process_refresh import process_code, refresh_google_sheets
+
+PURGE_PROTECTED_CODES = set()
+
 from keyword_watch import (
     DEFAULT_RS_SP_NEGATIVE_KEYWORDS,
     DEFAULT_RS_SP_KEYWORDS,
@@ -671,6 +675,9 @@ def purge_by_fecha(sheet):
             return base + pd.Timedelta(hours=hh, minutes=mm)
         return base + pd.Timedelta(hours=23, minutes=59)
     for r1, row in enumerate(vals[1:], start=2):
+        link_index = find_idx(hdr, "enlace")
+        if link_index is not None and link_index < len(row) and process_code(row[link_index]) in PURGE_PROTECTED_CODES:
+            continue
         if iF < len(row):
             dt = parse_fecha(row[iF])
             ok += int(pd.notna(dt)); fail += int(pd.isna(dt))
@@ -950,13 +957,36 @@ def clasifica(info):
 # =========================
 # MAIN (flujo completo)
 # =========================
+def refresh_known_processes(links):
+    global PURGE_PROTECTED_CODES
+    sheets = [*CFG["sheets_data"], CFG["sheet_ct_rir"]]
+    try:
+        result = refresh_google_sheets(
+            GSVC, SSID, sheets, links,
+            DATA_DIR / "process_refresh" / "clrir.json",
+        )
+        PURGE_PROTECTED_CODES = result["protected_codes"]
+        for change in result["changed"]:
+            LOG("ADENDA", json.dumps(change, ensure_ascii=False))
+        LOG("REFRESH", f"verificados={result['checked']} | filas actualizadas={len(result['changed'])} | pendientes={len(result['failed'])}")
+        for code, error in result["failed"].items():
+            LOG("REFRESH", f"{code}: {error}")
+    except Exception as exc:
+        # Do not expire a listed act whose new deadline could not be verified.
+        PURGE_PROTECTED_CODES = {process_code(url) for url in links}
+        LOG("REFRESH", f"verificacion pendiente; se conservan filas: {type(exc).__name__}: {exc}")
+    for name in ("SHEET_CACHE", "_GS_CACHE"):
+        cache = globals().get(name)
+        if isinstance(cache, dict):
+            cache.clear()
+
+
 def main():
     global FICHAS_CT_RIR_DYNAMIC
     ensure_sheet_exists(CFG["sheet_ct_rir"])
     FICHAS_CT_RIR_DYNAMIC = load_ct_rir_fichas()
     rs_sp_keywords = load_rs_sp_keywords()
     rs_sp_negative_keywords = load_rs_sp_negative_keywords()
-    purge_all()
 
     _, all_links = read_links_from_sheets(CFG["sheets_data"])
     desc_vals = gs_get(f"{CFG['sheet_desc']}!A1:ZZ")
@@ -1041,6 +1071,9 @@ def main():
             break
 
     LOG("DONE", f"enlaces extraídos={len(links)}")
+    refresh_known_processes(links)
+    purge_all()
+    _, all_links = read_links_from_sheets(CFG["sheets_data"])
     try: driver.quit()
     except: pass
 
@@ -1059,7 +1092,7 @@ def main():
         move_rows_by_checkbox(['cl_prog_sin_ficha','cl_prog_sin_requisitos','cl_prog_con_ct',CFG["sheet_ct_rir"]], CFG["sheet_desc"], "Descartar")
         for sh in ['cl_prog_sin_ficha','cl_prog_sin_requisitos','cl_prog_con_ct',CFG["sheet_ct_rir"]]:
             reset_checkboxes(sh)
-            update_fechas_sheet(sh)
+
         LOG("DONE", "sin nuevos; mantenimiento completo")
         return
 
@@ -1193,7 +1226,7 @@ def main():
         purge_by_fecha(sh)
     for sh in ['cl_prog_sin_ficha','cl_prog_sin_requisitos','cl_prog_con_ct',CFG["sheet_ct_rir"]]:
         reset_checkboxes(sh)
-        update_fechas_sheet(sh)
+
 
     if ct_rir_rows:
         col_idx = {col: idx for idx, col in enumerate(ct_rir_cols)}
