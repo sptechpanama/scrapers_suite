@@ -20,6 +20,7 @@ from .adapters import (
 )
 from .adapters.base import SourceAdapter
 from .classifier import classify_opportunity
+from .enrichment import DetailEnricher
 from .models import MonitorResult, SourceFetchResult, stable_hash, utc_now_iso
 from .storage import OpportunityStore, default_sqlite_path, postgres_dsn
 
@@ -75,10 +76,17 @@ def run_monitor(
     emit_events = os.environ.get("OTRAS_FUENTES_SILENT_RUN", "").strip().lower() not in {
         "1", "true", "yes", "si", "sí",
     }
+    enricher = DetailEnricher()
     for adapter_class in adapter_classes:
         source_started = utc_now_iso()
         LOGGER.info("Fuente %s: inicio", adapter_class.source)
         result = adapter_class().fetch()
+        for opportunity in result.opportunities:
+            classify_opportunity(opportunity)
+        try:
+            enricher.enrich(result.opportunities)
+        except Exception:
+            LOGGER.exception("Detalle de %s incompleto; se conservan los avisos", result.source)
         for opportunity in result.opportunities:
             classify_opportunity(opportunity)
         source_finished = utc_now_iso()
@@ -150,6 +158,7 @@ def run_monitor(
         except Exception:
             LOGGER.exception("No se pudo cerrar la corrida en Supabase")
     local.close()
+    enricher.close()
     if remote is not None:
         remote.close()
 

@@ -130,7 +130,8 @@ class UngmAdapter(SourceAdapter):
             procurement_method=method,
             submission_channel="UNGM",
             eligibility="Ver requisitos de elegibilidad del aviso oficial",
-            raw_payload={"cells": values, "notice_id": notice_id, "scope": scope},
+            raw_payload={"cells": values, "notice_id": notice_id, "scope": scope,
+                         "deadline_raw": clean_text(deadline_node.get_text(" ", strip=True)) if deadline_node else ""},
             parser_version=self.parser_version,
         )
 

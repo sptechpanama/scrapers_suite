@@ -155,6 +155,9 @@ class Opportunity:
             "registration_required": self.registration_required,
             "submission_channel": self.submission_channel,
             "eligibility": self.eligibility,
+            "deadline_raw": self.raw_payload.get('deadline_raw', ''),
+            "document_text": (self.raw_payload.get('document_analysis') or {}).get('text', '')
+                if self.source_url.lower().endswith('.pdf') else '',
             "documents": sorted(
                 (asdict(document.normalized()) for document in self.documents),
                 key=lambda item: (item["url"], item["document_type"], item["title"]),
@@ -184,6 +187,9 @@ class Opportunity:
         payload["is_active"] = 0 if normalized_text(self.status) in {
             "cerrada", "cancelada", "desierta", "adjudicada", "vencida"
         } else 1
+        if self.raw_payload.get('qualification'):
+            from .qualification import effective_bucket
+            payload['is_active'] = int(effective_bucket(self.raw_payload['qualification']) != 'historical')
         return payload
 
 

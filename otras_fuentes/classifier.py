@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
+from bs4 import BeautifulSoup
 from dataclasses import dataclass
 
 from common.keyword_watch import (
@@ -11,7 +13,8 @@ from common.keyword_watch import (
     normalize_keyword_term,
 )
 
-from .models import Opportunity, clean_text
+from .models import Opportunity, clean_text, normalized_text
+from .qualification import screen, effective_bucket
 
 
 RIR_DEFAULT_KEYWORDS = (
@@ -95,6 +98,10 @@ RS_DEFAULT_KEYWORDS = (
     "torre de resfriamento",
     "energia fotovoltaica",
     "sistema eletrico",
+    "aire acondicionado",
+    "aires acondicionados",
+    "generadores electricos",
+    "generadores sincronos",
 )
 
 
@@ -115,11 +122,11 @@ class Classification:
 
 
 def classify_opportunity(opportunity: Opportunity) -> Opportunity:
+    detail = opportunity.raw_payload.get("document_analysis") or {}
     fields = {
         "titulo": opportunity.title,
         "descripcion": opportunity.description,
-        "sector": opportunity.sector,
-        "comprador": opportunity.buyer,
+        "documento": str(detail.get("text") or ""),
     }
     rs_terms = _configured_terms("OTRAS_FUENTES_RS_KEYWORDS", RS_DEFAULT_KEYWORDS)
     rir_terms = _configured_terms("OTRAS_FUENTES_RIR_KEYWORDS", RIR_DEFAULT_KEYWORDS)
@@ -130,14 +137,29 @@ def classify_opportunity(opportunity: Opportunity) -> Opportunity:
     matches: dict[str, list[str]] = {"RS/SP": [], "RIR": []}
     matched_fields: list[str] = []
     field_weight = 0.0
+    ambiguous = False
     for field_name, value in fields.items():
+        value = BeautifulSoup(value, "html.parser").get_text(" ") if "<" in value else value
+        norm = normalized_text(value)
         rs_matches = match_keywords_in_text(
             value, rs_terms, reference_amount=opportunity.estimated_value
         )
         negatives = match_negative_keywords_in_text(value, rs_negative)
         if negatives:
+            ambiguous = ambiguous or bool(rs_matches)
             rs_matches = []
         rir_matches = match_keywords_in_text(value, rir_terms)
+        # Names such as New York and administrative diagnostics are not products.
+        hvac = bool(re.search(r'\b(?:hvac|chiller\w*|chiler\w*|refriger\w*|climat\w*|aire[s]? acondicionado[s]?|air conditioning|air conditioner\w*|agua helada|chilled water|manejador\w*)\b', norm))
+        medical = bool(re.search(r'\b(?:medic[oa]\w*|medical|patient\w*|paciente\w*|clinico\w*|clinical|quirurg\w*|surgical|biomedic\w*|anestesi\w*|anesthe\w*|anaesthe\w*|esteriliz\w*|steriliz\w*|sangre|blood|hospitalario\w*|hospital equipment)\b', norm))
+        safe_rs = [term for term in rs_matches if term not in {'york', 'coil', 'serpentin', 'serpentín'} or hvac]
+        rir_ambiguous = {'laboratorio', 'laboratory equipment', 'diagnostico', 'diagnostic*', 'reactivo*', 'reagent*', 'hospital*'}
+        safe_rir = [term for term in rir_matches if term not in rir_ambiguous or medical]
+        # A hospital mentioned as the location alone is insufficient (software, construction...).
+        if safe_rir == ['hospital*']:
+            safe_rir = []
+        ambiguous = ambiguous or len(safe_rs) < len(rs_matches) or len(safe_rir) < len(rir_matches)
+        rs_matches, rir_matches = safe_rs, safe_rir
         if rs_matches or rir_matches:
             matched_fields.append(field_name)
             field_weight += 18.0 if field_name == "titulo" else 9.0
@@ -168,8 +190,17 @@ def classify_opportunity(opportunity: Opportunity) -> Opportunity:
     opportunity.matched_fields = list(dict.fromkeys(matched_fields))
     opportunity.fit_score = round(score, 1)
     opportunity.priority = priority
+    # Sector/buyer metadata may prompt review, but cannot prove a product match.
+    if not companies:
+        context = opportunity.sector + ' ' + opportunity.buyer
+        ambiguous = ambiguous or bool(match_keywords_in_text(context, rir_terms) or match_keywords_in_text(context, rs_terms))
+    opportunity.raw_payload['qualification'] = screen(opportunity, strong=bool(companies), ambiguous=ambiguous)
     return opportunity
 
 
 def should_alert(opportunity: Opportunity) -> bool:
-    return bool(opportunity.matched_company) and opportunity.priority in {"Alta", "Media"}
+    quality = opportunity.raw_payload.get('qualification')
+    if quality is None:
+        classify_opportunity(opportunity)
+        quality = opportunity.raw_payload['qualification']
+    return bool(opportunity.matched_company) and effective_bucket(quality) == 'relevant'

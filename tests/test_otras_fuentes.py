@@ -271,6 +271,7 @@ def _relevant(title: str, *, external_id: str = "A-1") -> Opportunity:
             external_id=external_id,
             title=title,
             source_url=f"https://example.test/{external_id}",
+            deadline="2099-10-01",
         ).normalize()
     )
 

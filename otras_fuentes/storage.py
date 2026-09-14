@@ -285,7 +285,16 @@ class OpportunityStore:
 
                 if emit_events and baseline_completed and (is_new or is_changed) and should_alert(opportunity):
                     event_type = "new" if is_new else "updated"
-                    event_id = stable_hash(payload["id"], event_type, payload["content_hash"], length=32)
+                    # Identical UNGM notices can be returned by Panama/global/UNICEF.
+                    # The official URL and substantive fields identify one notification.
+                    event_id = stable_hash(payload['canonical_url'], opportunity.title,
+                                           opportunity.deadline, opportunity.status,
+                                           opportunity.estimated_value,
+                                           opportunity.raw_payload.get('deadline_raw', ''),
+                                           opportunity.description,
+                                           sorted(d.url for d in opportunity.documents),
+                                           stable_hash((opportunity.raw_payload.get('document_analysis') or {}).get('text', ''))
+                                           if opportunity.source_url.lower().endswith('.pdf') else '', length=32)
                     cursor.execute(
                         f"INSERT INTO external_alert_events (id,run_id,opportunity_id,source,event_type,title,matched_company,priority,fit_score,source_url,deadline,created_at) "
                         f"VALUES ({','.join([p] * 12)}) ON CONFLICT(id) DO NOTHING",
