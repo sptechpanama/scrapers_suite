@@ -52,12 +52,20 @@ def reclassify_store(store, *, enricher=None, apply=False) -> dict:
     if apply and updates:
         p = store.placeholder
         with store.transaction() as cursor:
-            cursor.executemany('UPDATE external_opportunities SET ' + ','.join(k+'='+p for k in keys) + ' WHERE id='+p, updates)
+            def batch(query, rows):
+                if store.dialect == 'postgres':
+                    from psycopg2.extras import execute_batch
+                    execute_batch(cursor, query, rows, page_size=200)
+                else:
+                    cursor.executemany(query, rows)
+            batch('UPDATE external_opportunities SET ' + ','.join(k+'='+p for k in keys) + ' WHERE id='+p, updates)
             from .models import stable_hash, utc_now_iso
+            documents = []
             for item in items:
                 for document in item.documents:
                     now = utc_now_iso()
-                    cursor.execute(f'INSERT INTO external_opportunity_documents (id,opportunity_id,title,url,document_type,first_seen_at,last_seen_at) VALUES ({",".join([p]*7)}) ON CONFLICT(id) DO NOTHING',
-                                   (stable_hash(item.id,document.url,length=32),item.id,document.title,document.url,document.document_type,now,now))
+                    documents.append((stable_hash(item.id,document.url,length=32),item.id,document.title,document.url,document.document_type,now,now))
+            if documents:
+                batch(f'INSERT INTO external_opportunity_documents (id,opportunity_id,title,url,document_type,first_seen_at,last_seen_at) VALUES ({",".join([p]*7)}) ON CONFLICT(id) DO NOTHING', documents)
     return {'records': len(records), 'changes': changes, 'views': dict(counts), 'applied': apply,
             'alerts_created': 0, 'historical_rows_deleted': 0}
