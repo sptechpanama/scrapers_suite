@@ -26,13 +26,13 @@ def from_record(row: dict) -> Opportunity:
     return item.normalize()
 
 
-def reclassify_store(store, *, enricher=None, apply=False) -> dict:
+def reclassify_store(store, *, enricher=None, apply=False, profiles=None) -> dict:
     cursor = store.connection.cursor()
     cursor.execute('SELECT * FROM external_opportunities ORDER BY source,id')
     names = [x[0] for x in cursor.description]
     records = [dict(zip(names, row)) for row in cursor.fetchall()]
     cursor.close()
-    items = [classify_opportunity(from_record(row)) for row in records]
+    items = [classify_opportunity(from_record(row), profiles) for row in records]
     if enricher:
         # Prioritize local portals and matched current notices when warming the cache.
         ordered = sorted(items, key=lambda x: (x.source not in {'ena','ensa','acp'},
@@ -42,7 +42,7 @@ def reclassify_store(store, *, enricher=None, apply=False) -> dict:
     changes = 0
     updates = []
     for row, item in zip(records, items):
-        classify_opportunity(item)
+        classify_opportunity(item, profiles)
         payload = item.as_storage_dict()
         quality = item.raw_payload['qualification']
         counts[effective_bucket(quality, last_seen=row.get('last_seen_at') or '')] += 1

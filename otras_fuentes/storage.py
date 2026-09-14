@@ -76,6 +76,8 @@ POSTGRES_SCHEMA = SQLITE_SCHEMA.replace("INTEGER NOT NULL DEFAULT 0", "INTEGER N
 
 
 SOURCE_NAMES = {
+    "acp_sli": "ACP · Licitaciones SLI",
+    "ifrc": "IFRC · Compras humanitarias",
     "acp": "Autoridad del Canal de Panamá",
     "ensa": "ENSA",
     "idaan": "IDAAN",
@@ -212,12 +214,13 @@ class OpportunityStore:
         with self.transaction() as cursor:
             row = self._fetchone(
                 cursor,
-                f"SELECT baseline_completed FROM external_sources WHERE source={p}",
+                f"SELECT baseline_completed,last_success_at FROM external_sources WHERE source={p}",
                 (result.source,),
             )
             baseline_completed = bool(self._row_value(row, 0, "baseline_completed"))
+            previous_success = self._row_value(row, 1, "last_success_at")
 
-            if result.status != "success":
+            if result.status == "error":
                 cursor.execute(
                     f"INSERT INTO external_sources (source,display_name,baseline_completed,last_error_at,last_error,last_run_id,updated_at) "
                     f"VALUES ({p},{p},{p},{p},{p},{p},{p}) ON CONFLICT(source) DO UPDATE SET "
@@ -233,6 +236,18 @@ class OpportunityStore:
 
             for opportunity in result.opportunities:
                 payload = opportunity.as_storage_dict()
+                if opportunity.source == 'ena' and opportunity.raw_payload.get('official_number'):
+                    # Old ENA extraction treated individual annexes as notices.
+                    # Preserve them as history, linked to the complete official card.
+                    links = list({payload['canonical_url'], *(d.url for d in opportunity.documents)})
+                    cursor.execute(f"SELECT id,raw_payload_json FROM external_opportunities WHERE source={p} AND id<>{p} AND canonical_url IN ({','.join([p] * len(links))})",
+                                   ('ena', payload['id'], *links))
+                    for alias in cursor.fetchall():
+                        alias_id = self._row_value(alias, 0, 'id')
+                        raw = json.loads(self._row_value(alias, 1, 'raw_payload_json') or '{}')
+                        raw['superseded_by'] = payload['id']
+                        cursor.execute(f'UPDATE external_opportunities SET raw_payload_json={p} WHERE id={p}',
+                                       (json.dumps(raw, ensure_ascii=False), alias_id))
                 existing = self._fetchone(
                     cursor,
                     f"SELECT content_hash,first_seen_at,first_run_id,last_changed_at FROM external_opportunities WHERE id={p}",
@@ -319,6 +334,14 @@ class OpportunityStore:
                  stats.new, stats.changed, stats.events, result.coverage, result.response_ms, result.error),
             )
             stats.baseline_created = not baseline_completed
+            if result.status == "partial":
+                # Persist rows already captured, but never claim a complete baseline
+                # or move the last fully successful capture timestamp on partial runs.
+                cursor.execute(
+                    f"UPDATE external_sources SET baseline_completed={p},last_success_at={p},last_error_at={p},last_error={p} WHERE source={p}",
+                    (int(baseline_completed), previous_success, now, result.error, result.source),
+                )
+                stats.baseline_created = False
         return stats
 
     def events_for_run(self, run_id: str) -> list[dict[str, Any]]:

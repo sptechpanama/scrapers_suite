@@ -7,6 +7,8 @@ from typing import Iterable, Type
 
 from .adapters import (
     AcpAdapter,
+    AcpSliAdapter,
+    IfrcAdapter,
     CiudadSaberAdapter,
     CruzRojaAdapter,
     EnaAdapter,
@@ -27,6 +29,7 @@ from .storage import OpportunityStore, default_sqlite_path, postgres_dsn
 
 LOGGER = logging.getLogger("otras_fuentes")
 DEFAULT_ADAPTERS: tuple[Type[SourceAdapter], ...] = (
+    AcpSliAdapter,
     AcpAdapter,
     EnsaAdapter,
     IdaanAdapter,
@@ -38,6 +41,7 @@ DEFAULT_ADAPTERS: tuple[Type[SourceAdapter], ...] = (
     UnicefAdapter,
     CruzRojaAdapter,
     CiudadSaberAdapter,
+    IfrcAdapter,
 )
 
 
@@ -72,27 +76,32 @@ def run_monitor(
         store.begin_run(run_id, started_at, len(adapter_classes))
 
     source_summaries: list[dict[str, object]] = []
-    totals = {"records": 0, "new": 0, "changed": 0, "events": 0, "success": 0, "error": 0}
+    totals = {"records": 0, "new": 0, "changed": 0, "events": 0, "success": 0, "error": 0, "partial": 0}
     emit_events = os.environ.get("OTRAS_FUENTES_SILENT_RUN", "").strip().lower() not in {
         "1", "true", "yes", "si", "sí",
     }
-    enricher = DetailEnricher()
+    from .profiles import load_profiles
+    profiles = load_profiles()
+    enricher = DetailEnricher(budget=int(os.getenv('OTRAS_FUENTES_DETAIL_BUDGET', '180')))
     for adapter_class in adapter_classes:
         source_started = utc_now_iso()
         LOGGER.info("Fuente %s: inicio", adapter_class.source)
         result = adapter_class().fetch()
         for opportunity in result.opportunities:
-            classify_opportunity(opportunity)
+            classify_opportunity(opportunity, profiles)
         try:
             enricher.enrich(result.opportunities)
         except Exception:
             LOGGER.exception("Detalle de %s incompleto; se conservan los avisos", result.source)
         for opportunity in result.opportunities:
-            classify_opportunity(opportunity)
+            classify_opportunity(opportunity, profiles)
         source_finished = utc_now_iso()
         if result.status == "error":
             errors[result.source] = result.error
             totals["error"] += 1
+        elif result.status == "partial":
+            errors[result.source] = result.error
+            totals["partial"] += 1
         else:
             totals["success"] += 1
 
@@ -124,6 +133,7 @@ def run_monitor(
                 "baseline_created": local_stats.baseline_created,
                 "coverage": result.coverage,
                 "response_ms": result.response_ms,
+                "pages_fetched": result.pages_fetched,
                 "error": result.error,
             }
         )
@@ -134,8 +144,8 @@ def run_monitor(
         )
 
     finished_at = utc_now_iso()
-    status = "success" if totals["error"] == 0 and not postgres_error else "partial"
-    if totals["success"] == 0:
+    status = "success" if totals["error"] == 0 and totals["partial"] == 0 and not postgres_error else "partial"
+    if totals["success"] == 0 and totals["partial"] == 0:
         status = "error"
     postgres_synced = remote is not None and not postgres_error
     events = local.events_for_run(run_id)

@@ -11,3 +11,4 @@ requests>=2.32.3
 PyMuPDF>=1.24,<2
 beautifulsoup4>=4.12.3
 psycopg2-binary>=2.9.9
+truststore>=0.10,<1

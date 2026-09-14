@@ -24,9 +24,33 @@ class CiudadSaberAdapter(SourceAdapter):
             "populate": "*",
             "sort[publishedAt]": "desc",
         }
-        payload = self.client.get(self.api_url, params=params).response.json()
         rows: list[Opportunity] = []
-        for item in payload.get("data", []):
+        items = []
+        page_signatures = set()
+        while params["pagination[page]"] <= 100:
+            try:
+                payload = self.client.get(self.api_url, params=params).response.json()
+                if not isinstance(payload.get("data"), list):
+                    raise RuntimeError("Respuesta de Ciudad del Saber sin listado data")
+                batch = payload["data"]
+                signature = tuple(str(row.get('id')) for row in batch)
+                if batch and signature in page_signatures:
+                    raise RuntimeError('El portal repitió una página; faltan resultados por verificar')
+                page_signatures.add(signature)
+                items.extend(batch)
+                self.pages_fetched += 1
+                page_count = (payload.get("meta", {}).get("pagination") or {}).get("pageCount")
+                if not batch or (page_count and params["pagination[page]"] >= int(page_count)) or (not page_count and len(batch) < page_size):
+                    break
+                params["pagination[page]"] += 1
+            except Exception as exc:
+                if not items:
+                    raise
+                self.incomplete(f"Ciudad del Saber, página {params['pagination[page]']}: {type(exc).__name__}")
+                break
+        else:
+            self.incomplete("Ciudad del Saber: límite de páginas alcanzado")
+        for item in items:
             attrs = item.get("attributes") or item
             general = attrs.get("generalInfo") or {}
             organization = attrs.get("organization") or {}

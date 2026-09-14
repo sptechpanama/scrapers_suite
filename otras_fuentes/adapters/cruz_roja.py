@@ -4,12 +4,13 @@ import re
 
 from ..models import Opportunity, SourceDocument, clean_text
 from .base import SourceAdapter, absolute_url, parse_date, soup_from_html
+from .public_pages import official_date, document_links
 
 
 class CruzRojaAdapter(SourceAdapter):
     source = "cruz_roja"
     source_name = "Cruz Roja Panameña"
-    parser_version = "1.0.0"
+    parser_version = "2.0.0"
     url = "https://cruzroja.org.pa/licitaciones-publicas/"
 
     def fetch_opportunities(self) -> list[Opportunity]:
@@ -17,7 +18,7 @@ class CruzRojaAdapter(SourceAdapter):
         soup = soup_from_html(response.text)
         table = soup.find("table")
         if table is None:
-            return []
+            raise RuntimeError("No se recibió la tabla pública de licitaciones")
         headers = [clean_text(cell.get_text(" ", strip=True)).lower() for cell in table.find_all("th")]
         rows: list[Opportunity] = []
         for tr in table.find_all("tr"):
@@ -36,7 +37,7 @@ class CruzRojaAdapter(SourceAdapter):
             modality = mapping.get("modalidad") or ""
             anchor = tr.find("a", href=True)
             link = absolute_url(self.url, anchor.get("href")) if anchor else self.url
-            documents = []
+            documents = document_links(tr, self.url)
             if anchor:
                 documents.append(SourceDocument(title="Aplicación", url=link, document_type="Aplicación"))
             rows.append(
@@ -47,7 +48,7 @@ class CruzRojaAdapter(SourceAdapter):
                     source_url=link,
                     source_type="Licitación humanitaria",
                     buyer=self.source_name,
-                    deadline=parse_date(deadline),
+                    deadline=official_date(deadline, local_time=True),
                     status=clean_text(status),
                     procurement_method=clean_text(modality),
                     sector=clean_text(category),

@@ -1,4 +1,6 @@
 from .acp import AcpAdapter
+from .acp_sli import AcpSliAdapter
+from .ifrc import IfrcAdapter
 from .ciudad_saber import CiudadSaberAdapter
 from .cruz_roja import CruzRojaAdapter
 from .ena import EnaAdapter
@@ -10,6 +12,8 @@ from .world_bank import WorldBankAdapter
 
 __all__ = [
     "AcpAdapter",
+    "AcpSliAdapter",
+    "IfrcAdapter",
     "CiudadSaberAdapter",
     "CruzRojaAdapter",
     "EnaAdapter",

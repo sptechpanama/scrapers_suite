@@ -11,6 +11,8 @@ MONTHS = {m: i for i, m in enumerate(
     ('enero febrero marzo abril mayo junio julio agosto septiembre octubre noviembre diciembre').split(), 1)}
 MONTHS.update({m: i for i, m in enumerate('jan feb mar apr may jun jul aug sep oct nov dec'.split(), 1)})
 MONTHS['setiembre'] = 9
+MONTHS.update({m: i for i, m in enumerate('january february march april may june july august september october november december'.split(), 1)})
+MONTHS.update({'ene': 1, 'abr': 4, 'ago': 8, 'dic': 12})
 CLOSED = {'cerrada', 'cerrado', 'closed', 'cancelada', 'cancelado', 'cancelled', 'canceled',
           'adjudicada', 'adjudicado', 'awarded', 'desierta', 'desierto', 'vencida', 'expired'}
 LAC = {'argentina', 'belize', 'belice', 'bolivia', 'brazil', 'brasil', 'chile', 'colombia',
@@ -25,7 +27,7 @@ def deadline_info(raw: object) -> tuple[str, str]:
     """A date without an explicit timezone stays date-only (no invented hour)."""
     value = str(raw or '').strip()
     date = None
-    iso = re.search(r'\b(20\d{2})-(\d{2})-(\d{2})\b', value)
+    iso = re.search(r'\b(20\d{2})-(\d{2})-(\d{2})(?!\d)', value)
     if iso:
         parts = tuple(map(int, iso.groups()))
     else:

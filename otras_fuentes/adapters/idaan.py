@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import re
 
-from ..models import Opportunity, clean_text
+from ..models import Opportunity, clean_text, normalized_text
+from .public_pages import document_links, official_date
 from .base import SourceAdapter, absolute_url, parse_date, soup_from_html
 
 
 class IdaanAdapter(SourceAdapter):
     source = "idaan"
     source_name = "IDAAN"
-    parser_version = "1.0.0"
+    parser_version = "2.0.0"
     url = "https://compras.idaan.gob.pa/home"
 
     @staticmethod
@@ -26,6 +27,8 @@ class IdaanAdapter(SourceAdapter):
     def fetch_opportunities(self) -> list[Opportunity]:
         response = self.client.get(self.url).response
         soup = soup_from_html(response.text)
+        if not soup.find('table'):
+            raise RuntimeError('IDAAN no entregó las tablas de compras')
         rows: list[Opportunity] = []
         for table in soup.find_all("table"):
             headers = [clean_text(cell.get_text(" ", strip=True)).lower() for cell in table.find_all("th")]
@@ -41,16 +44,18 @@ class IdaanAdapter(SourceAdapter):
                     (value for value in ("Adjudicada", "Desierta", "Cancelada", "Activa") if value.lower() in joined.lower()),
                     "Publicada",
                 )
-                description = ""
+                columns = dict(zip((normalized_text(h) for h in headers), cells))
+                description = columns.get('descripcion', '')
                 for cell in cells:
+                    if columns.get('descripcion'):
+                        break
                     if cell == number or cell.isdigit() or status.lower() == cell.lower():
                         continue
                     if len(cell) > len(description) and not cell.lower().startswith(("ver ", "ganador:")):
                         description = cell
                 link_node = tr.find("a", href=True)
                 link = absolute_url(self.url, link_node.get("href")) if link_node else self.url
-                dates = re.findall(r"\d{2}[/-]\d{2}[/-]20\d{2}", joined)
-                deadline = parse_date(dates[0]) if dates else ""
+                deadline = official_date(columns.get('fecha cierre', ''), local_time=True)
                 rows.append(
                     Opportunity(
                         source=self.source,
@@ -63,9 +68,11 @@ class IdaanAdapter(SourceAdapter):
                         deadline=deadline,
                         status=status,
                         procurement_method="Portal de Compras IDAAN",
-                        estimated_value=self._amount(joined),
+                        estimated_value=None,
+                        documents=document_links(tr, self.url),
                         submission_channel="Portal IDAAN",
-                        raw_payload={"headers": headers, "cells": cells},
+                        raw_payload={"headers": headers, "cells": cells, "deadline_raw": deadline,
+                                     "awarded_value": self._amount(columns.get('adjudicacion', joined))},
                         parser_version=self.parser_version,
                     )
                 )

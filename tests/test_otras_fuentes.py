@@ -39,7 +39,7 @@ class FakeClient:
 
 def test_monitor_registers_all_sources_once():
     sources = [adapter.source for adapter in DEFAULT_ADAPTERS]
-    assert len(sources) == len(set(sources)) == 11
+    assert len(sources) == len(set(sources)) == 13
     assert {"idb", "world_bank", "ungm", "ungm_international", "unicef"}.issubset(
         sources
     )
@@ -80,7 +80,8 @@ def test_monitor_registers_all_sources_once():
 )
 def test_html_adapters_extract_one_record(adapter, html, expected_id):
     result = adapter(client=FakeClient(text=html)).fetch()
-    assert result.status == "success"
+    # The RSS fallback is valid evidence, but cannot claim full-list coverage.
+    assert result.status == ("partial" if adapter is EnsaAdapter else "success")
     assert len(result.opportunities) == 1
     assert result.opportunities[0].external_id == expected_id
 

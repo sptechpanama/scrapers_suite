@@ -92,6 +92,11 @@ class SourceAdapter(ABC):
 
     def __init__(self, client: ResilientHttpClient | None = None) -> None:
         self.client = client or ResilientHttpClient()
+        self.coverage_notes: list[str] = []
+        self.pages_fetched = 0
+
+    def incomplete(self, message: str) -> None:
+        self.coverage_notes.append(clean_text(message))
 
     def fetch(self) -> SourceFetchResult:
         started = time.monotonic()
@@ -103,8 +108,10 @@ class SourceAdapter(ABC):
             return SourceFetchResult(
                 source=self.source,
                 opportunities=list(unique.values()),
-                status="success",
-                coverage="Completa",
+                status="partial" if self.coverage_notes else "success",
+                error="; ".join(self.coverage_notes),
+                coverage=("Parcial: " + "; ".join(self.coverage_notes)) if self.coverage_notes else "Listado consultado completo",
+                pages_fetched=max(1, self.pages_fetched),
                 response_ms=int((time.monotonic() - started) * 1000),
             )
         except Exception as exc:  # adapters are isolated by design
