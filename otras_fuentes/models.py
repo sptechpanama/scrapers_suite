@@ -15,7 +15,18 @@ def utc_now_iso() -> str:
 
 
 def clean_text(value: object) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip()
+    return re.sub(r"\s+", " ", str(value or "").replace('\x00', ' ')).strip()
+
+
+def safe_json_value(value):
+    """PDF control characters must never invalidate PostgreSQL JSON queries."""
+    if isinstance(value, str):
+        return value.replace('\x00', ' ').encode('utf8', errors='replace').decode('utf8')
+    if isinstance(value, dict):
+        return {safe_json_value(k): safe_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [safe_json_value(v) for v in value]
+    return value
 
 
 def normalized_text(value: object) -> str:
@@ -163,10 +174,10 @@ class Opportunity:
                 key=lambda item: (item["url"], item["document_type"], item["title"]),
             ),
         }
-        return stable_hash(json.dumps(payload, ensure_ascii=False, sort_keys=True), length=64)
+        return stable_hash(json.dumps(safe_json_value(payload), ensure_ascii=False, sort_keys=True), length=64)
 
     def as_storage_dict(self) -> dict[str, Any]:
-        payload = asdict(self)
+        payload = safe_json_value(asdict(self))
         payload["id"] = self.id
         payload["canonical_url"] = canonical_url(self.source_url)
         payload["cross_source_key"] = self.cross_source_key

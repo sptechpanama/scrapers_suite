@@ -183,3 +183,13 @@ def test_medical_clause_far_from_technical_term_does_not_make_civil_works_rir(ac
         raw_payload={'document_analysis':{'status':'ok','text':activity + ' especificaciones generales '*40 + 'Certificado medico de los empleados'}})
     classify_opportunity(item)
     assert 'RIR' not in item.matched_company
+
+
+def test_pdf_null_bytes_cannot_poison_postgres_json_and_literal_escape_is_preserved():
+    item=Opportunity('acp_sli','1','Bombas','https://test/1',
+        raw_payload={'document_analysis':{'text':'Bomba\x00industrial'},'literal':r'\u0000', 'nested':['x\x00y']})
+    record=item.as_storage_dict()
+    payload=json.loads(record['raw_payload_json'])
+    assert payload['document_analysis']['text']=='Bomba industrial'
+    assert payload['nested']==['x y']
+    assert payload['literal']==r'\u0000'
