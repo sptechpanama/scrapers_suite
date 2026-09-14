@@ -175,3 +175,11 @@ def test_acp_document_initializes_public_tender_context(monkeypatch):
     assert result['status']=='ok'
     assert [u for u,kw in calls]==[context,url]
     assert 'Referer' in calls[-1][1]['headers']
+
+
+@pytest.mark.parametrize('activity', ['laboratorio de calidad del concreto', 'diagnostico inicial de productores de cafe', 'diagnostico de fallas electricas'])
+def test_medical_clause_far_from_technical_term_does_not_make_civil_works_rir(activity):
+    item=Opportunity('ena','1','Reparación de cableado de iluminación vial','https://test/1',
+        raw_payload={'document_analysis':{'status':'ok','text':activity + ' especificaciones generales '*40 + 'Certificado medico de los empleados'}})
+    classify_opportunity(item)
+    assert 'RIR' not in item.matched_company

@@ -169,7 +169,14 @@ def classify_opportunity(opportunity: Opportunity, profiles: dict | None = None)
         medical = bool(re.search(r'\b(?:medic[oa]\w*|medical|patient\w*|paciente\w*|clinico\w*|clinical|quirurg\w*|surgical|biomedic\w*|anestesi\w*|anesthe\w*|anaesthe\w*|esteriliz\w*|steriliz\w*|sangre|blood|hospitalario\w*|hospital equipment)\b', norm))
         safe_rs = [term for term in rs_matches if term not in {'york', 'coil', 'serpentin', 'serpentín'} or hvac]
         rir_ambiguous = {'laboratorio', 'laboratory equipment', 'diagnostico', 'diagnostic*', 'reactivo*', 'reagent*', 'hospital*'}
-        safe_rir = [term for term in rir_matches if term not in rir_ambiguous or medical]
+        def nearby_medical(term):
+            # A safety/occupational-health clause elsewhere in a long civil
+            # works PDF must not turn a materials lab into medical procurement.
+            needle = normalized_text(term.rstrip('*'))
+            pattern = r'\b' + re.escape(needle) + (r'\w*' if term.endswith('*') else r'\b')
+            return any(re.search(r'\b(?:medic[oa]\w*|medical|patient\w*|paciente\w*|clinico\w*|clinical|quirurg\w*|surgical|biomedic\w*|anestesi\w*|anesthe\w*|esteriliz\w*|steriliz\w*|sangre|blood)\b',
+                                 norm[max(0, m.start()-140):m.end()+140]) for m in re.finditer(pattern, norm))
+        safe_rir = [term for term in rir_matches if term not in rir_ambiguous or (medical and nearby_medical(term))]
         # A hospital mentioned as the location alone is insufficient (software, construction...).
         if safe_rir == ['hospital*']:
             safe_rir = []
