@@ -11,7 +11,7 @@ consulta Supabase, con filtros y paginación en SQL.
 - **Histórico**: cierre explícito o fecha/hora de cierre pasada. Una ampliación
   oficial de plazo puede devolver el aviso a las vistas actuales.
 - **Sin encaje**: no se confirma relación comercial con RS/SP o RIR. Se conserva.
-- **Todos** permite recuperar cualquier registro. La agrupación por URL oficial
+- **Todos** permite recuperar cualquier registro. La agrupación por código y URL oficial
   es reversible y no fusiona convocatorias solo por tener títulos parecidos.
 
 La vigencia se calcula también al consultar, sin esperar la siguiente corrida.

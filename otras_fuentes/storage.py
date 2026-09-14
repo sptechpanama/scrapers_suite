@@ -287,7 +287,7 @@ class OpportunityStore:
                     event_type = "new" if is_new else "updated"
                     # Identical UNGM notices can be returned by Panama/global/UNICEF.
                     # The official URL and substantive fields identify one notification.
-                    event_id = stable_hash(payload['canonical_url'], opportunity.title,
+                    event_id = stable_hash(payload['canonical_url'], opportunity.external_id, opportunity.title,
                                            opportunity.deadline, opportunity.status,
                                            opportunity.estimated_value,
                                            opportunity.raw_payload.get('deadline_raw', ''),

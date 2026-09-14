@@ -156,4 +156,7 @@ def test_same_official_notice_has_one_alert_across_sources(tmp_path):
         store.ingest_source('new'+src,'2026-09-02','2026-09-02',SourceFetchResult(src,[item]))
     assert store.connection.execute('select count(*) from external_opportunities').fetchone()[0] == 2
     assert store.connection.execute('select count(*) from external_alert_events').fetchone()[0] == 1
+    another = replace(notice(), external_id='another-official-code')
+    store.ingest_source('another','2026-09-03','2026-09-03',SourceFetchResult('ungm',[another]))
+    assert store.connection.execute('select count(*) from external_alert_events').fetchone()[0] == 2
     store.close()
