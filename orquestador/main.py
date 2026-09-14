@@ -37,6 +37,11 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
+from google_transport import (
+    build_sheets_service, close_service, retry_google_call,
+    log_google_failure, google_failure_detail,
+)
+
 from sheets_bridge import (
     CONFIG_SHEET_NAME,
     SPREADSHEET_ID,
@@ -70,6 +75,7 @@ from common.keyword_watch import (  # noqa: E402
 )
 
 CONFIG_PATH = BASE_DIR / "config.json"
+CONFIG_CACHE_PATH = BASE_DIR / "config.last_good.json"
 STATE_PATH = BASE_DIR / "state.json"
 DEFAULT_ORQUESTADOR_CREDENTIALS = BASE_DIR / "pure-beach-474203-p1-fdc9557f33d0.json"
 PID_PATH = BASE_DIR / "orquestador.pid"
@@ -397,7 +403,32 @@ def _merge_required_jobs(
     return merged, injected
 
 
-def load_config() -> OrchestratorConfig:
+def _load_last_good_config():
+    try:
+        data = json.loads(CONFIG_CACHE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        if data.get("spreadsheet_id") != SPREADSHEET_ID or data.get("sheet") != CONFIG_SHEET_NAME:
+            return None
+        return OrchestratorConfig(**data["config"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _save_last_good_config(config):
+    data = {"spreadsheet_id": SPREADSHEET_ID, "sheet": CONFIG_SHEET_NAME,
+            "verified_at": datetime.now().isoformat(timespec="seconds"),
+            "config": config.model_dump(mode="json")}
+    temporary = CONFIG_CACHE_PATH.with_name(f".{CONFIG_CACHE_PATH.name}.{threading.get_ident()}.tmp")
+    try:
+        CONFIG_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(CONFIG_CACHE_PATH)
+    except OSError as exc:
+        logging.warning("No se pudo guardar respaldo de horarios vigentes: %s", exc)
+
+
+def load_config(*, require_remote: bool = False) -> OrchestratorConfig:
     sheet_jobs: List[JobConfig] = []
     sheet_had_rows = False
     try:
@@ -415,8 +446,16 @@ def load_config() -> OrchestratorConfig:
                 SPREADSHEET_ID,
                 CONFIG_SHEET_NAME,
             )
-    except Exception:  # pylint: disable=broad-except
-        logging.exception("Error al obtener la configuracion desde Google Sheets")
+        if require_remote and not sheet_jobs:
+            raise ValueError("Google Sheets no devolvio una configuracion valida; se conservan horarios vigentes")
+    except Exception as exc:  # pylint: disable=broad-except
+        if require_remote:
+            raise
+        log_google_failure("No se pudieron consultar horarios en Google Sheets", exc)
+        cached = _load_last_good_config()
+        if cached is not None:
+            logging.warning("Se conservan los ultimos horarios verificados de Google Sheets")
+            return cached
 
     fallback_config: OrchestratorConfig
     fallback_job_dicts: List[dict]
@@ -453,7 +492,9 @@ def load_config() -> OrchestratorConfig:
                 logging.exception(
                     "No se pudo reflejar en Google Sheets los jobs requeridos faltantes"
                 )
-        return OrchestratorConfig(jobs=merged_jobs)
+        verified_config = OrchestratorConfig(jobs=merged_jobs)
+        _save_last_good_config(verified_config)
+        return verified_config
 
     # if not sheet_had_rows and fallback_job_dicts:
     #     try:
@@ -781,13 +822,13 @@ def _truthy_cell(value: object) -> bool:
     return _normalize_text(value) in {"true", "1", "si", "sí", "x", "yes"}
 
 
-_PANAMACOMPRA_SHEETS_SERVICE = None
+_PANAMACOMPRA_SERVICE_LOCAL = threading.local()
 
 
 def _get_panamacompra_service():
-    global _PANAMACOMPRA_SHEETS_SERVICE
-    if _PANAMACOMPRA_SHEETS_SERVICE is not None:
-        return _PANAMACOMPRA_SHEETS_SERVICE
+    service = getattr(_PANAMACOMPRA_SERVICE_LOCAL, "service", None)
+    if service is not None:
+        return service
 
     candidate_paths = [
         os.environ.get("ORQUESTADOR_PANAMACOMPRA_SERVICE_ACCOUNT_FILE", "").strip(),
@@ -802,24 +843,26 @@ def _get_panamacompra_service():
         creds_path,
         scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
     )
-    _PANAMACOMPRA_SHEETS_SERVICE = build(
-        "sheets", "v4", credentials=creds, cache_discovery=False
-    )
-    return _PANAMACOMPRA_SHEETS_SERVICE
+    service = build_sheets_service(creds)
+    _PANAMACOMPRA_SERVICE_LOCAL.service = service
+    return service
+
+
+def _reset_panamacompra_service():
+    service = getattr(_PANAMACOMPRA_SERVICE_LOCAL, "service", None)
+    if service is not None:
+        close_service(service)
+        delattr(_PANAMACOMPRA_SERVICE_LOCAL, "service")
 
 
 def _read_panamacompra_sheet(sheet_name: str) -> list[list[str]]:
-    service = _get_panamacompra_service()
-    return (
-        service.spreadsheets()
-        .values()
-        .get(
-            spreadsheetId=PANAMACOMPRA_SPREADSHEET_ID,
-            range=f"'{sheet_name}'!A1:ZZ",
-        )
-        .execute()
-        .get("values", [])
+    response = retry_google_call(
+        lambda: _get_panamacompra_service().spreadsheets().values().get(
+            spreadsheetId=PANAMACOMPRA_SPREADSHEET_ID, range=f"'{sheet_name}'!A1:ZZ",
+        ).execute(),
+        reset=_reset_panamacompra_service, label=f"leer {sheet_name}",
     )
+    return response.get("values", [])
 
 
 def _column_index_map(headers: list[object]) -> dict[str, int]:
@@ -2835,7 +2878,11 @@ def main() -> None:
             logging.info("%s: inicio de ejecucion", label)
             return
         if event.code == EVENT_JOB_EXECUTED:
-            logging.info("%s: ejecucion exitosa", label)
+            result = getattr(event, "retval", None)
+            if isinstance(result, dict) and result.get("status") in {"error", "deferred"}:
+                logging.warning("%s: ejecucion pendiente/con error: %s", label, result.get("detail", ""))
+            else:
+                logging.info("%s: ejecucion exitosa", label)
             return
         if event.code == EVENT_JOB_ERROR:
             logging.error("%s: ejecucion con error: %s", label, event.exception)
@@ -3092,12 +3139,12 @@ def main() -> None:
                 job_queue.task_done()
                 log_pipeline_state("task_done")
 
-    def poll_manual_requests() -> None:
+    def poll_manual_requests():
         try:
             pending_requests = fetch_manual_requests()
-        except Exception:  # pylint: disable=broad-except
-            logging.exception("No se pudo obtener solicitudes manuales desde Google Sheets")
-            return
+        except Exception as exc:  # pylint: disable=broad-except
+            log_google_failure("Solicitudes manuales pendientes de consultar", exc)
+            return {"status": "error", "detail": google_failure_detail(exc)}
 
         if pending_requests:
             manual_log(f"Monitor manual: {len(pending_requests)} solicitudes detectadas")
@@ -3150,13 +3197,13 @@ def main() -> None:
 
     schedule_jobs(scheduler, current_config, enqueue_execution)
 
-    def refresh_config_from_sheet() -> None:
+    def refresh_config_from_sheet():
         nonlocal current_config, current_signature, job_lookup
         try:
-            new_config = load_config()
-        except Exception:  # pylint: disable=broad-except
-            logging.exception("No se pudo refrescar la configuración desde Google Sheets")
-            return
+            new_config = load_config(require_remote=True)
+        except Exception as exc:  # pylint: disable=broad-except
+            log_google_failure("Sin actualizar horarios; se conserva la configuracion vigente", exc)
+            return {"status": "error", "detail": google_failure_detail(exc)}
 
         new_signature = build_config_signature(new_config)
         if new_signature == current_signature:

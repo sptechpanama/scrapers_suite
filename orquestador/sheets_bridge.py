@@ -1,20 +1,14 @@
 import logging
 import os
-import random
 import re
-import socket
-import ssl
 import threading
 import time
 import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from google.auth.exceptions import TransportError
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from httplib2 import HttpLib2Error
+from google_transport import build_sheets_service, close_service, retry_google_call
 
 BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent
@@ -80,36 +74,38 @@ VALID_DAY_ABBRS = set(SPANISH_DAY_MAP.values())
 DAY_SPLIT_RE = re.compile(r"[\s,;/]+")
 TIME_SPLIT_RE = re.compile(r"[\s,;/]+")
 
-_credentials: Credentials | None = None
-_credentials_lock = threading.Lock()
 _service_local = threading.local()
-_service_build_lock = threading.Lock()
 _sheet_titles: set[str] | None = None
 _sheet_titles_lock = threading.Lock()
+_verified_headers = {}
+_headers_lock = threading.Lock()
+HEADERS_CACHE_SECONDS = 600
 
 
 def _get_credentials() -> Credentials:
-    global _credentials
-    if _credentials is not None:
-        return _credentials
-    with _credentials_lock:
-        if _credentials is None:
-            _credentials = Credentials.from_service_account_file(str(SERVICE_ACCOUNT_FILE))
-    return _credentials
+    credentials = getattr(_service_local, "credentials", None)
+    if credentials is None:
+        credentials = Credentials.from_service_account_file(
+            str(SERVICE_ACCOUNT_FILE), scopes=["https://www.googleapis.com/auth/spreadsheets"],
+        )
+        _service_local.credentials = credentials
+    return credentials
 
 
 def _reset_thread_service() -> None:
-    if hasattr(_service_local, "service"):
+    service = getattr(_service_local, "service", None)
+    if service is not None:
+        close_service(service)
         delattr(_service_local, "service")
 
 
 def _build_service() -> Any:
-    creds = _get_credentials()
-    with _service_build_lock:
-        return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return build_sheets_service(_get_credentials())
 
 
 def _get_service(force_refresh: bool = False) -> Any:
+    if force_refresh:
+        _reset_thread_service()
     service = getattr(_service_local, "service", None)
     if service is None or force_refresh:
         service = _build_service()
@@ -117,45 +113,9 @@ def _get_service(force_refresh: bool = False) -> Any:
     return service
 
 
-def _call_with_backoff(action, label: str, max_attempts: int = 5, base_delay: float = 1.5):
-    network_errors = (
-        TimeoutError,
-        socket.timeout,
-        ssl.SSLError,
-        TransportError,
-        HttpLib2Error,
-    )
-    for attempt in range(max_attempts):
-        try:
-            return action()
-        except HttpError as err:
-            status = getattr(err.resp, "status", None)
-            if status not in {429, 500, 503} or attempt == max_attempts - 1:
-                raise
-            wait = base_delay * (2**attempt) + random.uniform(0, 0.5)
-            logging.warning(
-                "Google Sheets %s respondio con status %s; reintento %s/%s en %.1fs",
-                label,
-                status,
-                attempt + 1,
-                max_attempts,
-                wait,
-            )
-            time.sleep(wait)
-        except network_errors as err:
-            _reset_thread_service()
-            if attempt == max_attempts - 1:
-                raise
-            wait = base_delay * (2**attempt) + random.uniform(0, 0.5)
-            logging.warning(
-                "Google Sheets %s arrojo %s; reintento %s/%s en %.1fs",
-                label,
-                type(err).__name__,
-                attempt + 1,
-                max_attempts,
-                wait,
-            )
-            time.sleep(wait)
+def _call_with_backoff(action, label: str, max_attempts: int = 3, base_delay: float = 1.5):
+    return retry_google_call(action, reset=_reset_thread_service, label=label,
+                             max_attempts=max_attempts, base_delay=base_delay)
 
 
 def _repair_mojibake(token: str) -> str:
@@ -190,9 +150,8 @@ def _column_letter(index: int) -> str:
 
 
 def _refresh_sheet_titles() -> set[str]:
-    service = _get_service()
     response = _call_with_backoff(
-        lambda: service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute(),
+        lambda: _get_service().spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute(),
         "spreadsheets.get",
     )
     titles = {sheet["properties"]["title"] for sheet in response.get("sheets", [])}
@@ -209,10 +168,9 @@ def _ensure_sheet_exists(title: str) -> None:
         cached_titles = _refresh_sheet_titles()
     if title in cached_titles:
         return
-    service = _get_service()
     body = {"requests": [{"addSheet": {"properties": {"title": title}}}]}
     _call_with_backoff(
-        lambda: service.spreadsheets()
+        lambda: _get_service().spreadsheets()
         .batchUpdate(spreadsheetId=SPREADSHEET_ID, body=body)
         .execute(),
         f"crear hoja {title}",
@@ -221,11 +179,15 @@ def _ensure_sheet_exists(title: str) -> None:
 
 
 def _ensure_headers(sheet: str, headers: List[str]) -> None:
+    cache_key = (SPREADSHEET_ID, sheet, tuple(headers))
+    with _headers_lock:
+        checked_at = _verified_headers.get(cache_key)
+    if checked_at is not None and time.monotonic() - checked_at < HEADERS_CACHE_SECONDS:
+        return
     _ensure_sheet_exists(sheet)
-    service = _get_service()
     header_range = f"{sheet}!A1:{_column_letter(len(headers))}1"
     existing = _call_with_backoff(
-        lambda: service.spreadsheets()
+        lambda: _get_service().spreadsheets()
         .values()
         .get(spreadsheetId=SPREADSHEET_ID, range=header_range)
         .execute(),
@@ -237,7 +199,7 @@ def _ensure_headers(sheet: str, headers: List[str]) -> None:
     expected = [h.lower() for h in headers]
     if normalized_existing != expected:
         _call_with_backoff(
-            lambda: service.spreadsheets()
+            lambda: _get_service().spreadsheets()
             .values()
             .update(
                 spreadsheetId=SPREADSHEET_ID,
@@ -248,13 +210,14 @@ def _ensure_headers(sheet: str, headers: List[str]) -> None:
             .execute(),
             f"actualizar encabezados {sheet}",
         )
+    with _headers_lock:
+        _verified_headers[cache_key] = time.monotonic()
 
 
 def _clear_data_rows(sheet: str, columns: int) -> None:
-    service = _get_service()
     data_range = f"{sheet}!A2:{_column_letter(columns)}"
     _call_with_backoff(
-        lambda: service.spreadsheets()
+        lambda: _get_service().spreadsheets()
         .values()
         .clear(spreadsheetId=SPREADSHEET_ID, range=data_range)
         .execute(),
@@ -263,9 +226,8 @@ def _clear_data_rows(sheet: str, columns: int) -> None:
 
 
 def _get_values(range_a1: str) -> List[List[str]]:
-    service = _get_service()
     response = _call_with_backoff(
-        lambda: service.spreadsheets()
+        lambda: _get_service().spreadsheets()
         .values()
         .get(spreadsheetId=SPREADSHEET_ID, range=range_a1)
         .execute(),
@@ -275,9 +237,8 @@ def _get_values(range_a1: str) -> List[List[str]]:
 
 
 def _update_values(range_a1: str, values: List[List[str]]) -> None:
-    service = _get_service()
     _call_with_backoff(
-        lambda: service.spreadsheets()
+        lambda: _get_service().spreadsheets()
         .values()
         .update(
             spreadsheetId=SPREADSHEET_ID,
@@ -400,8 +361,16 @@ def _parse_times(raw_value: str, row_index: int) -> List[str]:
     return times
 
 
+def _replace_table_rows(sheet, headers, rows):
+    """One idempotent write: a failed connection cannot leave a cleared table."""
+    _ensure_sheet_exists(sheet)
+    previous = _get_values(f"{sheet}!A1:{_column_letter(len(headers))}")
+    values = [headers, *rows]
+    values.extend([[""] * len(headers) for _ in range(max(0, len(previous) - len(values)))])
+    _update_values(f"{sheet}!A1:{_column_letter(len(headers))}{len(values)}", values)
+
+
 def push_state_to_sheet(state: Dict[str, Dict[str, dict]]) -> None:
-    _ensure_headers(STATE_SHEET_NAME, STATE_HEADERS)
     last_run = state.get("last_run", {}) if isinstance(state, dict) else {}
 
     rows: List[List[str]] = []
@@ -419,12 +388,7 @@ def push_state_to_sheet(state: Dict[str, Dict[str, dict]]) -> None:
             ]
         )
 
-    _clear_data_rows(STATE_SHEET_NAME, len(STATE_HEADERS))
-    header_range = f"{STATE_SHEET_NAME}!A1:{_column_letter(len(STATE_HEADERS))}1"
-    _update_values(header_range, [STATE_HEADERS])
-    if rows:
-        data_range = f"{STATE_SHEET_NAME}!A2"
-        _update_values(data_range, rows)
+    _replace_table_rows(STATE_SHEET_NAME, STATE_HEADERS, rows)
 
 
 def push_jobs_to_sheet(jobs: List[Dict[str, Any]]) -> None:
@@ -457,9 +421,7 @@ def push_jobs_to_sheet(jobs: List[Dict[str, Any]]) -> None:
             ]
         )
 
-    _clear_data_rows(CONFIG_SHEET_NAME, len(CONFIG_HEADERS))
-    data_range = f"{CONFIG_SHEET_NAME}!A2"
-    _update_values(data_range, rows)
+    _replace_table_rows(CONFIG_SHEET_NAME, CONFIG_HEADERS, rows)
     logging.info(
         "Configuracion base publicada en Google Sheets (%s / %s)",
         SPREADSHEET_ID,

@@ -10,3 +10,6 @@ credentials/*.json
 data/db/*.db
 data/ctni/*.db*
 data/otras_fuentes/*.db*
+
+orquestador/config.last_good.json
+orquestador/.config.last_good.json.*.tmp
