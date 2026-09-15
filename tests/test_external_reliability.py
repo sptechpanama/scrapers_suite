@@ -187,6 +187,7 @@ def test_amendment_without_remaining_budget_is_reported_as_pending(tmp_path):
 
 
 def test_idb_fallback_checks_csv_and_preserves_official_identity():
+    from datetime import date
     calls=[]
     def get(url,**kw):
         calls.append(url)
@@ -195,16 +196,42 @@ def test_idb_fallback_checks_csv_and_preserves_official_identity():
             return SimpleNamespace(response=SimpleNamespace(json=lambda:{'result':{'resources':[
                 {'id':IdbAdapter.resource_id,'format':'CSV','url':'https://data.iadb.org/files/download/notice'}]}}))
         return SimpleNamespace(response=SimpleNamespace(status_code=200,
-            iter_content=lambda n:iter([b'noticeid,noticetitle,publicationdate,deadline,type\n1,Chiller,2026-09-15,2099-01-01,SPECIFIC\n']),close=lambda:None))
+            iter_content=lambda n:iter([f'noticeid,noticetitle,publicationdate,deadline,type\n1,Chiller,{date.today().isoformat()},01/31/2099,SPECIFIC\n'.encode()]),close=lambda:None))
     result=IdbAdapter(SimpleNamespace(get=get)).fetch()
     assert result.status=='success' and result.opportunities[0].external_id=='1'
+    assert result.opportunities[0].deadline=='2099-01-31'
     assert len(calls)==3
+
+
+@pytest.mark.parametrize('value,expected',[('10/31/2022','2022-10-31'),('4/5/2026','2026-04-05'),('NULL',''),('bad','')])
+def test_idb_csv_dates_never_become_future_opportunities_by_string_comparison(value,expected):
+    assert IdbAdapter._official_date(value,csv_format=True)==expected
+
+
+def test_idb_stale_csv_cannot_replace_current_source_or_create_tenders():
+    def get(url,**kw):
+        if 'datastore_search' in url: raise requests.HTTPError('409')
+        if 'package_show' in url:
+            return SimpleNamespace(response=SimpleNamespace(json=lambda:{'result':{'resources':[
+                {'id':IdbAdapter.resource_id,'format':'CSV','url':'https://data.iadb.org/files/download/notice'}]}}))
+        return SimpleNamespace(response=SimpleNamespace(status_code=200,iter_content=lambda n:iter([
+            b'noticeid,noticetitle,publicationdate,deadline,type\n1,Chiller,2020-01-01,8/31/2020,SPECIFIC\n']),close=lambda:None))
+    result=IdbAdapter(SimpleNamespace(get=get)).fetch()
+    assert result.status=='error' and not result.opportunities and 'desactualizado' in result.error
 
 
 def test_idb_empty_broken_datastore_is_not_reported_as_success():
     client=SimpleNamespace(get=lambda *a,**kw:SimpleNamespace(response=SimpleNamespace(json=lambda:{
         'success':True,'result':{'records':[],'fields':[{'id':'_id'}],'total':0}})))
     assert IdbAdapter(client).fetch().status=='error'
+
+
+def test_idb_ancient_undated_general_notices_are_not_imported_as_active():
+    payload={'success':True,'result':{'records':[{'noticeid':'1','noticetitle':'Aviso antiguo',
+        'publicationdate':'2020-01-01','deadline':'NULL','type':'GENERAL'}]}}
+    client=SimpleNamespace(get=lambda *a,**kw:SimpleNamespace(response=SimpleNamespace(json=lambda:payload)))
+    result=IdbAdapter(client).fetch()
+    assert result.status=='success' and not result.opportunities
 
 
 def test_late_document_match_alerts_once_without_listing_change(tmp_path):

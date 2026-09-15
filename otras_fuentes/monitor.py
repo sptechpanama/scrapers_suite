@@ -92,6 +92,8 @@ def run_monitor(
         source_started = utc_now_iso()
         LOGGER.info("Fuente %s: inicio", adapter_class.source)
         result = adapter_class().fetch()
+        LOGGER.info('Fuente %s: listado %s, %s registros capturados; iniciando clasificación y documentos',
+                    result.source, result.status, len(result.opportunities))
         for opportunity in result.opportunities:
             classify_opportunity(opportunity, profiles)
         # Reserve a share for later sources: ACP/ENA used to exhaust the entire

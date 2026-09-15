@@ -23,6 +23,10 @@
 - BID pagina el recurso API y valida sus columnas; ante fallo consulta el CSV
   enlazado en el catálogo oficial. HTML, archivos vacíos y HTTP 202 no se aceptan
   como cero oportunidades. Si ambas vías fallan se conserva el historial.
+  El CSV se rechaza como respaldo actual si no contiene publicaciones de los
+  últimos 90 días. Sus fechas `mes/día/año` se interpretan expresamente en ese
+  formato; `NULL` no es una fecha futura. En la validación del 15/09/2026 el
+  archivo accesible llegaba a octubre de 2025 y no se publicó como fuente actual.
 - IFRC apunta a su dirección oficial actual. Un bloqueo 403 sigue siendo un fallo
   externo explícito; no se afirma que no existan licitaciones.
 - Naturgy y AES verifican sus páginas oficiales, con estado `access_required`.

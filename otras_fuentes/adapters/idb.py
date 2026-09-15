@@ -4,7 +4,8 @@ import os
 import csv
 import io
 import logging
-from datetime import date
+from datetime import date, datetime, timedelta
+import re
 from urllib.parse import urlsplit
 
 from ..models import Opportunity, SourceDocument, clean_text
@@ -19,6 +20,22 @@ class IdbAdapter(SourceAdapter):
     parser_version = "1.0.0"
     api_url = "https://data.iadb.org/api/action/datastore_search"
     resource_id = "856aabfd-2c6a-48fb-a8b8-19f3ff443618"
+
+    @staticmethod
+    def _official_date(value, *, csv_format=False):
+        raw = clean_text(value)
+        if not raw or raw.upper() in {'NULL', 'N/A', 'NONE'}:
+            return ''
+        try:
+            if re.match(r'^\d{4}-\d{2}-\d{2}', raw):
+                return date.fromisoformat(raw[:10]).isoformat()
+            if csv_format and re.fullmatch(r'\d{1,2}/\d{1,2}/\d{4}', raw):
+                # The official BID CSV uses US month/day/year, unlike PC.
+                return datetime.strptime(raw, '%m/%d/%Y').date().isoformat()
+            parsed = parse_date(raw)
+            return date.fromisoformat(parsed).isoformat()
+        except ValueError:
+            return ''
 
     def _records(self, limit):
         """The CKAN datastore can disappear while the official CSV still exists."""
@@ -68,7 +85,13 @@ class IdbAdapter(SourceAdapter):
             if not {'noticetitle', 'noticeid', 'publicationdate'}.issubset(reader.fieldnames or []):
                 raise RuntimeError('La descarga BID no entregó el CSV de avisos esperado')
             self.pages_fetched += 1
-            return list(reader)
+            records = list(reader)
+            latest = max((self._official_date(r.get('publicationdate')) for r in records), default='')
+            if not latest or latest < (date.today() - timedelta(days=90)).isoformat():
+                raise RuntimeError(f'CSV oficial desactualizado (última publicación: {latest or "sin fecha"}); no confirma oportunidades actuales')
+            for record in records:
+                record['deadline'] = self._official_date(record.get('deadline'), csv_format=True)
+            return records
         except Exception as exc:
             if rows:
                 self.incomplete(f'BID: se conservan {len(rows)} registros; API y CSV pendientes: {type(exc).__name__}')
@@ -88,8 +111,13 @@ class IdbAdapter(SourceAdapter):
             notice_type = clean_text(record.get("type")).upper()
             if "AWARD" in notice_type and not include_awards:
                 continue
-            deadline = parse_date(record.get("deadline"))
+            deadline = self._official_date(record.get("deadline"))
+            publication = self._official_date(record.get('publicationdate'))
             if deadline and deadline[:10] < today:
+                continue
+            if not deadline and publication and publication < (date.today() - timedelta(days=90)).isoformat():
+                # A general notice from years ago without a deadline is not a
+                # new actionable tender. Existing history is never deleted.
                 continue
             title = clean_text(record.get("noticetitle"))
             if not title:
@@ -126,7 +154,7 @@ class IdbAdapter(SourceAdapter):
                     source_type=f"Convocatoria BID - {notice_type.title() or 'Aviso'}",
                     buyer=self.source_name,
                     country=clean_text(record.get("countryname")) or "America Latina y el Caribe",
-                    publication_date=parse_date(record.get("publicationdate")),
+                    publication_date=publication,
                     deadline=deadline,
                     status="Activa" if deadline else "Publicada",
                     procurement_method=clean_text(
