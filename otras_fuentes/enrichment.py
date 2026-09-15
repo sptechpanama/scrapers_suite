@@ -13,7 +13,7 @@ from urllib.parse import urlsplit, urljoin
 from bs4 import BeautifulSoup
 from .http import ResilientHttpClient
 from .models import clean_text, normalized_text
-from .qualification import deadline_info
+from .qualification import deadline_info, effective_bucket
 
 MAX_BYTES = 10 * 1024 * 1024
 
@@ -134,7 +134,8 @@ class DetailEnricher:
                                        and cached[url].get('status') == 'unreadable' and cached[url].get('reader_version', 0) < 2)
                 revised = bool(self.revisions.get(url) and cached[url].get('source_revision') != self.revisions[url])
                 if now - row[2] < ttl and not needs_context_retry and not revised: continue
-            due_candidates.append((0 if row is None else 1, self.priorities.get(url, 1), row[2] if row else 0, url))
+            priority = self.priorities.get(url, 1)
+            due_candidates.append((int(priority >= 2), 0 if row is None else 1, priority, row[2] if row else 0, url))
         # Never-read documents precede expired cache entries, avoiding starvation.
         due = [entry[-1] for entry in sorted(due_candidates)[:min(self.budget, limit)]]
         self.budget -= len(due)
@@ -167,8 +168,12 @@ class DetailEnricher:
                     or (item.raw_payload.get('qualification') or {}).get('bucket') in {'relevant', 'review'}]
         self.revisions.update({item.source_url: '|'.join(str(item.raw_payload.get(k) or '') for k in ('official_updated_at','deadline_raw'))
                                for item in selected if item.raw_payload.get('official_updated_at') or item.raw_payload.get('deadline_raw')})
-        self.priorities.update({item.source_url: int(not bool(item.matched_company)) for item in selected})
-        cached = self._read_cached(item.source_url for item in selected)
+        self.priorities.update({item.source_url:
+            2 if effective_bucket(item.raw_payload.get('qualification') or {}) == 'historical'
+            else int(not bool(item.matched_company)) for item in selected})
+        # Reserve reads for actual annexes. A large newly discovered archive
+        # must not consume every read before live tender attachments are tried.
+        cached = self._read_cached((item.source_url for item in selected), limit=min(60, max(1, self.budget // 2)))
         now = time.time()
         for item in selected:
             previous = item.raw_payload.get('document_analysis') or {}
@@ -187,7 +192,7 @@ class DetailEnricher:
                     item.documents.append(SourceDocument(**link)); existing.add(link['url'])
         # All public attachments remain linked. Reads are budgeted and resume
         # from persistent cache, with never-read URLs first on subsequent runs.
-        candidates = [item for item in selected if (item.raw_payload.get('qualification') or {}).get('bucket') != 'historical']
+        candidates = [item for item in selected if effective_bucket(item.raw_payload.get('qualification') or {}) != 'historical']
         self.contexts.update({d.url: item.source_url for item in candidates for d in item.documents if d.url != item.source_url})
         self.revisions.update({d.url: self.revisions[item.source_url] for item in candidates for d in item.documents if item.source_url in self.revisions})
         self.priorities.update({d.url: int(not bool(item.matched_company)) for item in candidates for d in item.documents})

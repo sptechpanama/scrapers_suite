@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -74,11 +75,21 @@ CREATE TABLE IF NOT EXISTS external_alert_events (
     notified_at TEXT, UNIQUE(opportunity_id, event_type, id)
 );
 CREATE INDEX IF NOT EXISTS idx_external_alert_events_run ON external_alert_events(run_id, created_at);
+CREATE TABLE IF NOT EXISTS external_email_deliveries (
+    event_id TEXT NOT NULL, recipient_key TEXT NOT NULL, status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
+    last_error TEXT NOT NULL DEFAULT '', message_id TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY(event_id, recipient_key)
+);
+CREATE TABLE IF NOT EXISTS external_email_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_external_email_pending ON external_email_deliveries(recipient_key,status,updated_at);
 """
 
 
 POSTGRES_SCHEMA = SQLITE_SCHEMA.replace("INTEGER NOT NULL DEFAULT 0", "INTEGER NOT NULL DEFAULT 0")
 POSTGRES_SCHEMA += '\nALTER TABLE external_source_access ENABLE ROW LEVEL SECURITY;\n'
+POSTGRES_SCHEMA += '\nALTER TABLE external_email_deliveries ENABLE ROW LEVEL SECURITY;\n'
+POSTGRES_SCHEMA += '\nALTER TABLE external_email_state ENABLE ROW LEVEL SECURITY;\n'
 
 
 SOURCE_NAMES = {
@@ -134,7 +145,11 @@ class OpportunityStore:
 
         connection = psycopg2.connect(dsn, connect_timeout=20, application_name="otras_fuentes")
         store = cls(connection, "postgres")
-        store.ensure_schema()
+        try:
+            store.ensure_schema()
+        except Exception:
+            connection.close()
+            raise
         return store
 
     def close(self) -> None:
@@ -153,8 +168,33 @@ class OpportunityStore:
             cursor.close()
 
     def ensure_schema(self) -> None:
-        statements = [part.strip() for part in SQLITE_SCHEMA.split(";") if part.strip()]
+        schema = POSTGRES_SCHEMA if self.dialect == 'postgres' else SQLITE_SCHEMA
+        statements = [part.strip() for part in schema.split(";") if part.strip()]
         with self.transaction() as cursor:
+            if self.dialect == 'postgres':
+                # CREATE INDEX IF NOT EXISTS still takes locks on its table.
+                # Repeating all DDL while a capture writes several tables can
+                # deadlock with a receipt sync. Normal opens must be read-only.
+                objects = {re.search(r'CREATE (?:TABLE|INDEX) IF NOT EXISTS (\w+)', sql)[1]
+                           for sql in statements if sql.startswith('CREATE')}
+                protected = {'external_source_access', 'external_email_deliveries', 'external_email_state'}
+                def installed():
+                    cursor.execute('SELECT c.relname,c.relrowsecurity FROM pg_class c '
+                                   'JOIN pg_namespace n ON n.oid=c.relnamespace '
+                                   'WHERE n.nspname=current_schema() AND c.relname=ANY(%s)', (list(objects),))
+                    return dict(cursor.fetchall())
+                existing = installed()
+                if objects.issubset(existing) and all(existing.get(name) for name in protected):
+                    return
+                # Only installations/migrations serialize, never the capture.
+                cursor.execute('SELECT pg_advisory_xact_lock(720150601)')
+                existing = installed()
+                for sql in statements:
+                    create = re.search(r'CREATE (?:TABLE|INDEX) IF NOT EXISTS (\w+)', sql)
+                    alter = re.search(r'ALTER TABLE (\w+) ENABLE ROW LEVEL SECURITY', sql)
+                    if (create and create[1] not in existing) or (alter and not existing.get(alter[1])):
+                        cursor.execute(sql)
+                return
             for statement in statements:
                 cursor.execute(statement)
 
@@ -316,11 +356,12 @@ class OpportunityStore:
                 )
 
                 snapshot_id = stable_hash(payload["id"], payload["content_hash"], length=32)
-                cursor.execute(
-                    f"INSERT INTO external_opportunity_versions (id,opportunity_id,content_hash,captured_at,run_id,snapshot_json) "
-                    f"VALUES ({','.join([p] * 6)}) ON CONFLICT(id) DO NOTHING",
-                    (snapshot_id, payload["id"], payload["content_hash"], now, run_id, json.dumps(payload, ensure_ascii=False, default=str)),
-                )
+                if is_new or is_changed:
+                    cursor.execute(
+                        f"INSERT INTO external_opportunity_versions (id,opportunity_id,content_hash,captured_at,run_id,snapshot_json) "
+                        f"VALUES ({','.join([p] * 6)}) ON CONFLICT(id) DO NOTHING",
+                        (snapshot_id, payload["id"], payload["content_hash"], now, run_id, json.dumps(payload, ensure_ascii=False, default=str)),
+                    )
                 for document in opportunity.documents:
                     doc_id = stable_hash(payload["id"], document.url, length=32)
                     cursor.execute(

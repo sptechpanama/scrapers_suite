@@ -55,7 +55,7 @@ def html_page(client, url, **kwargs):
 def next_pages(soup, base: str) -> list[str]:
     host = urlsplit(base).netloc
     return list(dict.fromkeys(
-        urljoin(base, a["href"]) for a in soup.select('a[rel="next"][href], .pagination a[href], .page-numbers[href], a[aria-label*="Next"][href]')
+        urljoin(base, a["href"]) for a in soup.select('link[rel="next"][href], a[rel="next"][href], .pagination a[href], .page-numbers[href], a[aria-label*="Next"][href]')
         if urlsplit(urljoin(base, a["href"])).netloc == host
         and not a.find_parent(attrs={"aria-disabled": "true"})
     ))

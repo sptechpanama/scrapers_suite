@@ -17,7 +17,7 @@ class IdbAdapter(SourceAdapter):
 
     source = "idb"
     source_name = "Banco Interamericano de Desarrollo"
-    parser_version = "1.0.0"
+    parser_version = "1.1.0"
     api_url = "https://data.iadb.org/api/action/datastore_search"
     resource_id = "856aabfd-2c6a-48fb-a8b8-19f3ff443618"
 
@@ -53,6 +53,10 @@ class IdbAdapter(SourceAdapter):
                     raise RuntimeError('El recurso BID perdió sus columnas de avisos; no confirma cero oportunidades')
                 if batch and not any('noticetitle' in r for r in batch):
                     raise RuntimeError('El recurso BID cambió su estructura de avisos')
+                if offset == 0:
+                    latest = max((self._official_date(r.get('publicationdate')) for r in batch), default='')
+                    if not latest or latest < (date.today() - timedelta(days=90)).isoformat():
+                        raise RuntimeError(f'API oficial desactualizada (última publicación: {latest or "sin fecha"}); no confirma cero oportunidades actuales')
                 rows.extend(batch)
                 self.pages_fetched += 1
                 if len(batch) < limit or (result.get('total') is not None and len(rows) >= result['total']):
@@ -99,8 +103,19 @@ class IdbAdapter(SourceAdapter):
             raise RuntimeError(f'BID: API de avisos no disponible ({api_error}); respaldo CSV: {str(exc)[:200]}') from exc
 
     def fetch_opportunities(self) -> list[Opportunity]:
+        from .idb_current import IdbCurrentAdapter
+        current = IdbCurrentAdapter(self.client).fetch()
+        self.pages_fetched += current.pages_fetched
+        if current.status != 'error':
+            if current.status == 'partial':
+                self.incomplete(current.error)
+            return current.opportunities
+        logging.getLogger('otras_fuentes').warning('BID for the Americas no disponible; comprobando catálogo anterior y su vigencia')
         limit = max(100, min(int(os.environ.get("OTRAS_FUENTES_IDB_LIMIT", "1000")), 3000))
-        records = self._records(limit)
+        try:
+            records = self._records(limit)
+        except Exception as exc:
+            raise RuntimeError(f'Catálogo actual: {current.error[:200]}; respaldo: {str(exc)[:250]}') from exc
 
         today = date.today().isoformat()
         include_awards = os.environ.get("OTRAS_FUENTES_IDB_INCLUDE_AWARDS", "").strip().lower() in {
@@ -111,7 +126,8 @@ class IdbAdapter(SourceAdapter):
             notice_type = clean_text(record.get("type")).upper()
             if "AWARD" in notice_type and not include_awards:
                 continue
-            deadline = self._official_date(record.get("deadline"))
+            # Both CKAN and its CSV export use month/day/year for deadlines.
+            deadline = self._official_date(record.get("deadline"), csv_format=True)
             publication = self._official_date(record.get('publicationdate'))
             if deadline and deadline[:10] < today:
                 continue

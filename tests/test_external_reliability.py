@@ -15,6 +15,49 @@ from otras_fuentes.storage import OpportunityStore
 from otras_fuentes.enrichment import DetailEnricher
 
 
+def test_live_tenders_and_attachments_precede_new_archive_pages(tmp_path):
+    from otras_fuentes.models import SourceDocument
+    seen=[]
+    def read(url):
+        seen.append(url)
+        return {'status':'ok','text':'Texto oficial de especificaciones de chiller para evaluación comercial.'}
+    live=Opportunity('ensa','live','Chiller','https://test/live',documents=[SourceDocument('Pliego','https://test/spec.pdf')],
+        raw_payload={'qualification':{'bucket':'relevant'}},matched_company='RS/SP')
+    old=Opportunity('ensa','old','Archivado','https://test/old',raw_payload={'qualification':{'bucket':'relevant','deadline_date':'2020-01-01'}})
+    e=DetailEnricher(tmp_path/'priority.db',fetcher=read,budget=2)
+    try:
+        e.enrich([old,live])
+        assert seen==['https://test/live','https://test/spec.pdf']
+        assert live.raw_payload['document_analysis']['attachments_read']==1
+    finally:e.close()
+
+
+@pytest.mark.parametrize('failure', ['', 'rss', 'page2', 'repeated'])
+def test_ensa_follows_head_pagination_preserves_partial_and_primary_deadlines(failure):
+    calls=[]
+    def page(code,next_link=''):
+        return (f'<link rel="next" href="{next_link}">' if next_link else '') + f'''<main><article>
+          SC-0{code}-2026 <a href="/licitaciones/chiller-{code}">Suministro de chiller número {code}</a>
+          Fecha final para licitar: 20/09/2026 2:00 pm</article></main>'''
+    def get(url,**kw):
+        calls.append(url)
+        if url==EnsaAdapter.listing_url: body=page('1','/licitaciones/page/2/')
+        elif '/page/2/' in url:
+            if failure=='page2': raise requests.ReadTimeout('offline')
+            body=page('1' if failure=='repeated' else '2')
+        else:
+            if failure=='rss': raise requests.ReadTimeout('offline')
+            body='<rss><channel><item><title>Suministro de chiller número 1</title><link>https://ensa.com.pa/licitaciones/chiller-1</link><pubDate>Mon, 14 Sep 2026 10:00:00 -0500</pubDate></item></channel></rss>'
+        return SimpleNamespace(response=SimpleNamespace(text=body))
+    result=EnsaAdapter(SimpleNamespace(get=get)).fetch()
+    assert calls[0]==EnsaAdapter.listing_url
+    assert any('/page/2/' in u for u in calls)
+    assert result.status==('partial' if failure in {'page2','repeated'} else 'success')
+    assert len(result.opportunities)==(1 if failure in {'page2','repeated'} else 2)
+    assert result.opportunities[0].deadline=='2026-09-20'
+    assert result.opportunities[0].publication_date==('' if failure=='rss' else '2026-09-14')
+
+
 def listing(ids, total):
     return ''.join(f'''<div class="dataRow" data-noticeid="{i}">
         <div class="resultTitle"><span class="ungm-title">Suministro chiller {i}</span></div>
@@ -200,7 +243,7 @@ def test_idb_fallback_checks_csv_and_preserves_official_identity():
     result=IdbAdapter(SimpleNamespace(get=get)).fetch()
     assert result.status=='success' and result.opportunities[0].external_id=='1'
     assert result.opportunities[0].deadline=='2099-01-31'
-    assert len(calls)==3
+    assert len(calls)==4
 
 
 @pytest.mark.parametrize('value,expected',[('10/31/2022','2022-10-31'),('4/5/2026','2026-04-05'),('NULL',''),('bad','')])
@@ -231,7 +274,17 @@ def test_idb_ancient_undated_general_notices_are_not_imported_as_active():
         'publicationdate':'2020-01-01','deadline':'NULL','type':'GENERAL'}]}}
     client=SimpleNamespace(get=lambda *a,**kw:SimpleNamespace(response=SimpleNamespace(json=lambda:payload)))
     result=IdbAdapter(client).fetch()
-    assert result.status=='success' and not result.opportunities
+    assert result.status=='error' and not result.opportunities
+
+
+def test_idb_api_deadline_uses_official_us_format():
+    from datetime import date
+    payload={'success':True,'result':{'records':[{'noticeid':'2','noticetitle':'Equipo médico',
+        'publicationdate':date.today().isoformat(),'deadline':'01/09/2099','type':'SPECIFIC'}]}}
+    client=SimpleNamespace(get=lambda *a,**kw:SimpleNamespace(response=SimpleNamespace(json=lambda:payload)))
+    result=IdbAdapter(client).fetch()
+    assert result.status=='success'
+    assert result.opportunities[0].deadline=='2099-01-09'
 
 
 def test_late_document_match_alerts_once_without_listing_change(tmp_path):
