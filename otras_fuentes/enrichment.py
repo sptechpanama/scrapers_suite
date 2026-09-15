@@ -113,6 +113,8 @@ class DetailEnricher:
         self.connection.execute('CREATE TABLE IF NOT EXISTS detail_cache (url TEXT PRIMARY KEY, payload TEXT NOT NULL, checked REAL NOT NULL, attempted REAL NOT NULL)')
         self.fetcher, self.budget = fetcher, budget
         self.contexts = {}
+        self.revisions = {}
+        self.priorities = {}
 
     def close(self):
         self.connection.close()
@@ -127,13 +129,14 @@ class DetailEnricher:
             row = self.connection.execute('SELECT payload,checked,attempted FROM detail_cache WHERE url=?', (url,)).fetchone()
             if row:
                 cached[url] = json.loads(row[0])
-                ttl = 12 * 3600 if cached[url].get('status') == 'ok' else 3600
+                ttl = 4 * 3600 if cached[url].get('status') == 'ok' else 3600
                 needs_context_retry = (urlsplit(url).netloc == 'apps.pancanal.com' and url in self.contexts
                                        and cached[url].get('status') == 'unreadable' and cached[url].get('reader_version', 0) < 2)
-                if now - row[2] < ttl and not needs_context_retry: continue
-            due_candidates.append((row[2] if row else 0, url))
+                revised = bool(self.revisions.get(url) and cached[url].get('source_revision') != self.revisions[url])
+                if now - row[2] < ttl and not needs_context_retry and not revised: continue
+            due_candidates.append((0 if row is None else 1, self.priorities.get(url, 1), row[2] if row else 0, url))
         # Never-read documents precede expired cache entries, avoiding starvation.
-        due = [url for _, url in sorted(due_candidates)[:min(self.budget, limit)]]
+        due = [entry[-1] for entry in sorted(due_candidates)[:min(self.budget, limit)]]
         self.budget -= len(due)
         def read(url):
             try:
@@ -147,15 +150,24 @@ class DetailEnricher:
                     result = {**previous, 'status': 'partial', 'error': result.get('error', 'Lectura incompleta'), 'using_previous': True}
                 result['checked_at'] = now
                 result['reader_version'] = 2
+                if not result.get('using_previous') and self.revisions.get(url):
+                    result['source_revision'] = self.revisions[url]
                 cached[url] = result
                 self.connection.execute('INSERT INTO detail_cache VALUES (?,?,?,?) ON CONFLICT(url) DO UPDATE SET payload=excluded.payload,checked=excluded.checked,attempted=excluded.attempted',
                                         (url, json.dumps(result, ensure_ascii=False), now, now))
         self.connection.commit()
+        for url, result in list(cached.items()):
+            if self.revisions.get(url) and result.get('source_revision') != self.revisions[url]:
+                cached[url] = {**result, 'status': 'partial', 'using_previous': True,
+                               'error': 'Cambio oficial pendiente de releer; se conserva el texto anterior'}
         return cached
 
     def enrich(self, opportunities):
-        selected = [item for item in opportunities if item.source in {'ena', 'ensa', 'acp', 'acp_sli', 'cruz_roja'}
+        selected = [item for item in opportunities if item.source in {'ena', 'ensa', 'acp', 'acp_sli', 'cruz_roja', 'ungm', 'ungm_international', 'unicef'}
                     or (item.raw_payload.get('qualification') or {}).get('bucket') in {'relevant', 'review'}]
+        self.revisions.update({item.source_url: '|'.join(str(item.raw_payload.get(k) or '') for k in ('official_updated_at','deadline_raw'))
+                               for item in selected if item.raw_payload.get('official_updated_at') or item.raw_payload.get('deadline_raw')})
+        self.priorities.update({item.source_url: int(not bool(item.matched_company)) for item in selected})
         cached = self._read_cached(item.source_url for item in selected)
         now = time.time()
         for item in selected:
@@ -177,6 +189,8 @@ class DetailEnricher:
         # from persistent cache, with never-read URLs first on subsequent runs.
         candidates = [item for item in selected if (item.raw_payload.get('qualification') or {}).get('bucket') != 'historical']
         self.contexts.update({d.url: item.source_url for item in candidates for d in item.documents if d.url != item.source_url})
+        self.revisions.update({d.url: self.revisions[item.source_url] for item in candidates for d in item.documents if item.source_url in self.revisions})
+        self.priorities.update({d.url: int(not bool(item.matched_company)) for item in candidates for d in item.documents})
         attachment_cache = self._read_cached(d.url for item in candidates for d in item.documents if d.url != item.source_url)
         for item in candidates:
             result = item.raw_payload['document_analysis']

@@ -60,6 +60,7 @@ class EnsaAdapter(SourceAdapter):
             feed = {}
         pending = [self.listing_url]
         visited = set()
+        page_ids = set()
         while pending and len(visited) < 100:
             url = pending.pop(0)
             if url in visited:
@@ -69,6 +70,7 @@ class EnsaAdapter(SourceAdapter):
                 soup = html_page(self.client, url)
                 self.pages_fetched += 1
                 count = 0
+                current_ids = set()
                 for a in soup.select('a[href*="/licitaciones/"]'):
                     link = urljoin(url, a["href"])
                     path = urlsplit(link).path.rstrip("/")
@@ -97,9 +99,13 @@ class EnsaAdapter(SourceAdapter):
                         parser_version=self.parser_version,
                     )
                     rows[external_id] = item
+                    current_ids.add(external_id)
                     count += 1
                 if not count:
                     raise RuntimeError("El listado ENSA no contiene convocatorias interpretables")
+                if not current_ids - page_ids:
+                    raise RuntimeError('ENSA repitió una página; queda cobertura por confirmar')
+                page_ids.update(current_ids)
                 pending.extend(u for u in next_pages(soup, url) if u not in visited and u not in pending)
             except Exception as exc:
                 self.incomplete(f"ENSA: {type(exc).__name__}: {str(exc)[:180]}")

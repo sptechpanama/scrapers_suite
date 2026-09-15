@@ -9,6 +9,7 @@ from .idaan import IdaanAdapter
 from .idb import IdbAdapter
 from .ungm import UngmAdapter, UngmInternationalAdapter, UnicefAdapter
 from .world_bank import WorldBankAdapter
+from .supplier_portals import NaturgyAdapter, AesAdapter
 
 __all__ = [
     "AcpAdapter",
@@ -24,4 +25,6 @@ __all__ = [
     "UngmInternationalAdapter",
     "UnicefAdapter",
     "WorldBankAdapter",
+    "NaturgyAdapter",
+    "AesAdapter",
 ]

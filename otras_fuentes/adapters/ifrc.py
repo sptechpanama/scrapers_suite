@@ -10,7 +10,7 @@ class IfrcAdapter(SourceAdapter):
     source = "ifrc"
     source_name = "IFRC · Compras humanitarias"
     parser_version = "2.0.0"
-    url = "https://www.ifrc.org/es/nuestra-promesa/servicios-humanitarios-globales/oportunidades-negocio"
+    url = "https://www.ifrc.org/our-work/supply-chain-management/business-opportunities"
 
     def fetch_opportunities(self):
         soup = html_page(self.client, self.url)

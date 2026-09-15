@@ -38,8 +38,12 @@ def main() -> int:
         os.environ['OTRAS_FUENTES_SILENT_RUN'] = '1'
     result = run_monitor(selected, require_postgres=not args.local_only)
     summary = result.summary()
+    if result.status == 'partial':
+        logging.warning('Captura parcial: %s fuentes correctas, %s parciales, %s con error y %s pendientes de acceso. Consultar Fuentes y cobertura.',
+                        result.counts.get('success',0), result.counts.get('partial',0),
+                        result.counts.get('error',0), result.counts.get('access_required',0))
     print("OTRAS_FUENTES_SUMMARY_JSON=" + json.dumps(summary, ensure_ascii=False, default=str))
-    return 1 if result.status == "error" else 0
+    return 1 if result.status == "error" or (not args.local_only and not result.postgres_synced) else 0
 
 
 if __name__ == "__main__":

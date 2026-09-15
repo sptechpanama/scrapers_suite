@@ -19,6 +19,11 @@ CREATE TABLE IF NOT EXISTS external_sources (
     last_success_at TEXT, last_error_at TEXT, last_error TEXT, last_count INTEGER NOT NULL DEFAULT 0,
     last_run_id TEXT, updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS external_source_access (
+    source TEXT NOT NULL, company TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Pendiente',
+    notes TEXT NOT NULL DEFAULT '', updated_by TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL,
+    PRIMARY KEY(source, company)
+);
 CREATE TABLE IF NOT EXISTS external_monitor_runs (
     run_id TEXT PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL,
     source_count INTEGER NOT NULL DEFAULT 0, success_count INTEGER NOT NULL DEFAULT 0,
@@ -73,9 +78,12 @@ CREATE INDEX IF NOT EXISTS idx_external_alert_events_run ON external_alert_event
 
 
 POSTGRES_SCHEMA = SQLITE_SCHEMA.replace("INTEGER NOT NULL DEFAULT 0", "INTEGER NOT NULL DEFAULT 0")
+POSTGRES_SCHEMA += '\nALTER TABLE external_source_access ENABLE ROW LEVEL SECURITY;\n'
 
 
 SOURCE_NAMES = {
+    'naturgy': 'Naturgy Panamá · Acceso a proveedores',
+    'aes': 'AES Panamá · Acceso a proveedores',
     "acp_sli": "ACP · Licitaciones SLI",
     "ifrc": "IFRC · Compras humanitarias",
     "acp": "Autoridad del Canal de Panamá",
@@ -220,7 +228,7 @@ class OpportunityStore:
             baseline_completed = bool(self._row_value(row, 0, "baseline_completed"))
             previous_success = self._row_value(row, 1, "last_success_at")
 
-            if result.status == "error":
+            if result.status in {'error', 'access_required'}:
                 cursor.execute(
                     f"INSERT INTO external_sources (source,display_name,baseline_completed,last_error_at,last_error,last_run_id,updated_at) "
                     f"VALUES ({p},{p},{p},{p},{p},{p},{p}) ON CONFLICT(source) DO UPDATE SET "

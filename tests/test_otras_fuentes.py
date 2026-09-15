@@ -39,7 +39,8 @@ class FakeClient:
 
 def test_monitor_registers_all_sources_once():
     sources = [adapter.source for adapter in DEFAULT_ADAPTERS]
-    assert len(sources) == len(set(sources)) == 13
+    assert len(sources) == len(set(sources)) == 15
+    assert {'naturgy', 'aes'}.issubset(sources)
     assert {"idb", "world_bank", "ungm", "ungm_international", "unicef"}.issubset(
         sources
     )

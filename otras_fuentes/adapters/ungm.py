@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import logging
 
 from ..models import Opportunity, clean_text, normalized_text
 from .base import SourceAdapter, absolute_url, parse_date, soup_from_html
@@ -37,7 +38,7 @@ class UngmAdapter(SourceAdapter):
 
     source = "ungm"
     source_name = "UN Global Marketplace - Panamá"
-    parser_version = "2.0.0"
+    parser_version = "2.1.0"
     page_url = "https://www.ungm.org/Public/Notice"
     search_url = "https://www.ungm.org/Public/Notice/Search"
     panama_country_id = "2449"
@@ -147,33 +148,56 @@ class UngmAdapter(SourceAdapter):
         headers = {"X-Requested-With": "XMLHttpRequest", "Referer": self.page_url}
         max_pages = max(
             1,
-            min(int(os.environ.get("OTRAS_FUENTES_UNGM_PAGES", "20")), 40),
+            min(int(os.environ.get("OTRAS_FUENTES_UNGM_PAGES", "200")), 500),
         )
         opportunities: list[Opportunity] = []
+        seen: set[str] = set()
+        total = None
         for page_index in range(max_pages):
-            response = self.client.post(
-                self.search_url,
-                json=self._payload(
-                    page_index,
-                    countries=countries,
-                    agencies=agencies,
-                ),
-                headers=headers,
-            ).response
-            rows = soup_from_html(response.text).select(".dataRow[data-noticeid]")
-            if not rows:
+            try:
+                response = self.client.post(
+                    self.search_url,
+                    json=self._payload(page_index, countries=countries, agencies=agencies),
+                    headers=headers,
+                ).response
+                soup = soup_from_html(response.text)
+                rows = soup.select('.dataRow[data-noticeid]')
+                counter = re.search(r'var\s+noticeTotal\s*=\s*["\']([\d,]+)["\']', response.text)
+                if counter:
+                    current_total = int(counter[1].replace(',', ''))
+                    if total is not None and current_total != total:
+                        self.incomplete(f'UNGM {scope}: el total cambió durante la consulta ({total} → {current_total})')
+                    total = current_total
+                self.pages_fetched += 1
+                if not rows:
+                    if total == 0 or (total is not None and len(seen) >= total):
+                        break
+                    raise RuntimeError('Página sin filas ni total oficial que confirme el fin del listado')
+                ids = {clean_text(row.get('data-noticeid')) for row in rows}
+                if not ids - seen:
+                    raise RuntimeError('El portal repitió una página; no se confirmó el final del listado')
+                for row in rows:
+                    notice_id = clean_text(row.get('data-noticeid'))
+                    if notice_id in seen:
+                        continue
+                    opportunity = self._opportunity_from_row(row, scope=scope,
+                        country_fallback=country_fallback, exclude_unicef=exclude_unicef)
+                    seen.add(notice_id)
+                    if opportunity is not None:
+                        opportunities.append(opportunity)
+                if (page_index + 1) % 10 == 0:
+                    logging.getLogger('otras_fuentes').info('UNGM %s: %s/%s avisos del listado', scope, len(seen), total or '?')
+                if total is not None and len(seen) >= total:
+                    break
+                if len(rows) < self.page_size:
+                    if total is not None and len(seen) < total:
+                        raise RuntimeError(f'Listado corto: {len(seen)} de {total} avisos')
+                    break
+            except Exception as exc:
+                self.incomplete(f'UNGM {scope}: página {page_index + 1}, recuperados {len(seen)}/{total if total is not None else "?"}; {type(exc).__name__}: {str(exc)[:230]}')
                 break
-            for row in rows:
-                opportunity = self._opportunity_from_row(
-                    row,
-                    scope=scope,
-                    country_fallback=country_fallback,
-                    exclude_unicef=exclude_unicef,
-                )
-                if opportunity is not None:
-                    opportunities.append(opportunity)
-            if len(rows) < self.page_size:
-                break
+        else:
+            self.incomplete(f'UNGM {scope}: límite de {max_pages} páginas; leídos {len(seen)}/{total if total is not None else "?"}')
         return opportunities
 
     def fetch_opportunities(self) -> list[Opportunity]:

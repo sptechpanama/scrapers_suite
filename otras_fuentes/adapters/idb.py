@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import os
+import csv
+import io
+import logging
 from datetime import date
+from urllib.parse import urlsplit
 
 from ..models import Opportunity, SourceDocument, clean_text
 from .base import SourceAdapter, parse_date
@@ -16,25 +20,71 @@ class IdbAdapter(SourceAdapter):
     api_url = "https://data.iadb.org/api/action/datastore_search"
     resource_id = "856aabfd-2c6a-48fb-a8b8-19f3ff443618"
 
+    def _records(self, limit):
+        """The CKAN datastore can disappear while the official CSV still exists."""
+        rows = []
+        try:
+            for offset in range(0, 200000, limit):
+                payload = self.client.get(self.api_url, params={'resource_id': self.resource_id,
+                    'limit': limit, 'offset': offset, 'sort': 'publicationdate desc'}).response.json()
+                if not payload.get('success'):
+                    raise RuntimeError('API BID sin respuesta válida')
+                result = payload.get('result') or {}
+                batch = result.get('records', [])
+                fields = {f.get('id') for f in result.get('fields', [])}
+                if not batch and fields and 'noticetitle' not in fields:
+                    raise RuntimeError('El recurso BID perdió sus columnas de avisos; no confirma cero oportunidades')
+                if batch and not any('noticetitle' in r for r in batch):
+                    raise RuntimeError('El recurso BID cambió su estructura de avisos')
+                rows.extend(batch)
+                self.pages_fetched += 1
+                if len(batch) < limit or (result.get('total') is not None and len(rows) >= result['total']):
+                    return rows
+            self.incomplete('BID: se alcanzó el límite de lectura del historial')
+            return rows
+        except Exception as exc:
+            logging.getLogger('otras_fuentes').warning('BID: API no disponible; comprobando CSV oficial: %s', type(exc).__name__)
+            api_error = str(exc)[:180]
+        try:
+            metadata = self.client.get('https://data.iadb.org/api/action/package_show', params={
+                'id': 'project-procurement-bidding-notices-and-notification-of-contract-awards'}).response.json()
+            resources = (metadata.get('result') or {}).get('resources', [])
+            resource = next(r for r in resources if r.get('id') == self.resource_id and r.get('format', '').upper() == 'CSV')
+            url = resource.get('url', '')
+            if urlsplit(url).scheme != 'https' or urlsplit(url).hostname != 'data.iadb.org':
+                raise RuntimeError('Descarga BID no corresponde al dominio oficial esperado')
+            response = self.client.get(url, stream=True).response
+            try:
+                if response.status_code != 200:
+                    raise RuntimeError(f'Descarga oficial BID respondió HTTP {response.status_code}; sin archivo disponible')
+                data = bytearray()
+                for part in response.iter_content(65536):
+                    data.extend(part)
+                    if len(data) > 50 * 1024 * 1024:
+                        raise RuntimeError('CSV BID excede 50 MB; requiere revisión')
+            finally:
+                response.close()
+            reader = csv.DictReader(io.StringIO(data.decode('utf-8-sig')))
+            if not {'noticetitle', 'noticeid', 'publicationdate'}.issubset(reader.fieldnames or []):
+                raise RuntimeError('La descarga BID no entregó el CSV de avisos esperado')
+            self.pages_fetched += 1
+            return list(reader)
+        except Exception as exc:
+            if rows:
+                self.incomplete(f'BID: se conservan {len(rows)} registros; API y CSV pendientes: {type(exc).__name__}')
+                return rows
+            raise RuntimeError(f'BID: API de avisos no disponible ({api_error}); respaldo CSV: {str(exc)[:200]}') from exc
+
     def fetch_opportunities(self) -> list[Opportunity]:
         limit = max(100, min(int(os.environ.get("OTRAS_FUENTES_IDB_LIMIT", "1000")), 3000))
-        payload = self.client.get(
-            self.api_url,
-            params={
-                "resource_id": self.resource_id,
-                "limit": limit,
-                "sort": "publicationdate desc",
-            },
-        ).response.json()
-        if not payload.get("success"):
-            raise RuntimeError(f"La API del BID no devolvio exito: {payload!r}")
+        records = self._records(limit)
 
         today = date.today().isoformat()
         include_awards = os.environ.get("OTRAS_FUENTES_IDB_INCLUDE_AWARDS", "").strip().lower() in {
             "1", "true", "yes", "si", "sí",
         }
         rows: list[Opportunity] = []
-        for record in (payload.get("result") or {}).get("records", []):
+        for record in records:
             notice_type = clean_text(record.get("type")).upper()
             if "AWARD" in notice_type and not include_awards:
                 continue

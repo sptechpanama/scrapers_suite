@@ -72,6 +72,9 @@ class AcpSliAdapter(SourceAdapter):
 
     def fetch_opportunities(self):
         all_rows = []
+        def page_key(url):
+            parsed = urlsplit(url)
+            return parsed.path.rstrip('/').lower(), (parse_qs(parsed.query).get('pagina') or ['1'])[0]
         max_pages = max(1, min(int(os.getenv("OTRAS_FUENTES_ACP_MAX_PAGES", "100")), 500))
         for status in ("AN", "EN"):
             try:
@@ -89,9 +92,9 @@ class AcpSliAdapter(SourceAdapter):
                 state_ids = set()
                 while pending and len(visited) < max_pages:
                     page_url, content = pending.pop(0)
-                    if page_url in visited:
+                    if page_key(page_url) in visited:
                         continue
-                    visited.add(page_url)
+                    visited.add(page_key(page_url))
                     if content is None:
                         content = self.client.get(page_url).response.text
                     page = soup_from_html(content)
@@ -100,13 +103,15 @@ class AcpSliAdapter(SourceAdapter):
                     if not rows and not re.search(r"no (?:se )?(?:encontraron|existe(?:n)?|hay)|0\s+(?:resultados|licitaciones)", page_text, re.I):
                         raise RuntimeError("SLI no devolvió filas ni una confirmación de listado vacío")
                     self.pages_fetched += 1
+                    if rows and not {row.external_id for row in rows} - state_ids:
+                        raise RuntimeError('SLI repitió una página; se conservan los actos leídos y queda cobertura pendiente')
                     for row in rows:
                         if row.external_id not in state_ids:
                             all_rows.append(row)
                             state_ids.add(row.external_id)
                     for a in page.select('a[href*="BusquedaLicitacionesResultados?pagina="]'):
                         target = urljoin(self.url, a["href"])
-                        if target not in visited and all(u != target for u, _ in pending):
+                        if page_key(target) not in visited and all(page_key(u) != page_key(target) for u, _ in pending):
                             pending.append((target, None))
                 if pending:
                     self.incomplete(f"SLI {status}: límite de {max_pages} páginas; quedan páginas pendientes")
