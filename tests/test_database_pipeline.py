@@ -22,6 +22,7 @@ def test_incremental_command_requires_postgres_without_full_sync() -> None:
     assert "--require-postgres" in command
     assert "--force-reclassify" not in command
     assert "--postgres-full" not in command
+    assert "--skip-reclassify" in command
 
 
 def test_weekly_command_reclassifies_and_republishes_everything() -> None:
@@ -29,6 +30,7 @@ def test_weekly_command_reclassifies_and_republishes_everything() -> None:
     assert "--require-postgres" in command
     assert "--force-reclassify" in command
     assert "--postgres-full" in command
+    assert "--skip-reclassify" not in command
 
 
 def test_analytics_publication_is_mandatory() -> None:

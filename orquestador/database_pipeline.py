@@ -179,6 +179,11 @@ def updater_command(mode: str) -> list[str]:
                 ),
             ]
         )
+    else:
+        # New/changed acts are classified during ingestion. Reclassifying the
+        # entire archive belongs to the weekly job and must not delay daily
+        # publication whenever a catalog/detector version changes.
+        command.append("--skip-reclassify")
     return command
 
 
