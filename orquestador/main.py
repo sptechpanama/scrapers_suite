@@ -158,6 +158,9 @@ REQUIRED_FALLBACK_JOB_NAMES = {
     "otras_fuentes",
 }
 
+COMPONENT_STATE_PREFIX = "ORQUESTADOR_COMPONENT_STATE="
+COMPONENT_STATE_JOB_NAMES = {"db_local", "supabase_operational", "analytics"}
+
 MAX_QUEUE_LOG_ITEMS = 12
 
 CRON_JOB_PRIORITIES = {
@@ -1802,6 +1805,70 @@ def update_last_run(
         logging.exception("No se pudo sincronizar el estado con Google Sheets")
 
 
+def parse_component_states(output: str) -> List[dict]:
+    """Extrae el último estado estructurado emitido por cada componente."""
+    latest: Dict[str, dict] = {}
+    for raw_line in str(output or "").splitlines():
+        if COMPONENT_STATE_PREFIX not in raw_line:
+            continue
+        payload_text = raw_line.split(COMPONENT_STATE_PREFIX, 1)[1].strip()
+        try:
+            payload = json.loads(payload_text)
+        except (TypeError, ValueError):
+            logging.warning("Estado estructurado de componente inválido; se ignora.")
+            continue
+        if not isinstance(payload, dict):
+            continue
+        job_name = str(payload.get("job_name") or "").strip().lower()
+        if job_name not in COMPONENT_STATE_JOB_NAMES:
+            logging.warning("Componente no permitido en estado estructurado: %s", job_name)
+            continue
+        latest[job_name] = payload
+    return list(latest.values())
+
+
+def record_component_states(output: str) -> List[str]:
+    """Guarda juntos los estados internos para reducir llamadas a Google Sheets."""
+    payloads = parse_component_states(output)
+    if not payloads:
+        return []
+
+    state = load_state()
+    last_run = state.setdefault("last_run", {})
+    recorded: List[str] = []
+    now = datetime.now()
+    for payload in payloads:
+        job_name = str(payload.get("job_name") or "").strip().lower()
+        try:
+            started_at = datetime.fromisoformat(str(payload.get("started_at") or ""))
+        except ValueError:
+            started_at = now
+        try:
+            finished_at = datetime.fromisoformat(str(payload.get("finished_at") or ""))
+        except ValueError:
+            finished_at = now
+        duration_seconds = max(0.0, (finished_at - started_at).total_seconds())
+        last_run[job_name] = {
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "finished_at": finished_at.isoformat(timespec="seconds"),
+            "duration_seconds": round(duration_seconds, 3),
+            "duration_display": format_duration(duration_seconds),
+            "status": str(payload.get("status") or "error").strip().lower(),
+            "detail": str(payload.get("detail") or "")[:2000],
+        }
+        recorded.append(job_name)
+
+    save_state(state)
+    try:
+        push_state_to_sheet(state)
+    except Exception:  # pylint: disable=broad-except
+        logging.exception(
+            "No se pudieron sincronizar estados internos con Google Sheets"
+        )
+    logging.info("Estados internos registrados: %s", ", ".join(recorded))
+    return recorded
+
+
 def _parse_iso_datetime(value: object) -> Optional[datetime]:
     text = str(value or "").strip()
     if not text:
@@ -2016,6 +2083,7 @@ def run_job(job: JobConfig, execution: Optional[ExecutionRequest] = None) -> tup
             errors="replace",
         )
         end_time = datetime.now()
+        record_component_states(result.stdout or "")
         if result.returncode == 0:
             logging.info("Job %s finalizo correctamente", job.name)
             if result.stdout:
@@ -2301,6 +2369,10 @@ def run_job_interruptible(
                     terminate_process_tree(process)
                 except Exception:  # pylint: disable=broad-except
                     logging.exception("No se pudo interrumpir el proceso del job %s", job.name)
+                    if process.poll() is None:
+                        interrupted = False
+                        interrupt_event.clear()
+                        continue
                 break
             elapsed_seconds = (datetime.now() - start_time).total_seconds()
             if process.poll() is None and elapsed_seconds >= timeout_seconds:
@@ -2343,6 +2415,7 @@ def run_job_interruptible(
             stderr_thread.join(timeout=5)
 
         stdout = "".join(stdout_lines)
+        record_component_states(stdout)
         stderr = "".join(stderr_lines)
         end_time = datetime.now()
 

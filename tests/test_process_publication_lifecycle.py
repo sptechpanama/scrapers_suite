@@ -36,6 +36,19 @@ def test_already_finished_process_is_not_targeted(monkeypatch):
     command.assert_not_called()
 
 
+def test_manual_pipeline_records_component_results_without_email(monkeypatch):
+    import main
+    job = main.JobConfig(name="database_daily", python="python", script="worker.py", days_of_week=[], times=[])
+    completed = SimpleNamespace(returncode=0, stdout='ORQUESTADOR_COMPONENT_STATE={"job_name":"db_local","status":"success"}', stderr="")
+    monkeypatch.setattr(main.subprocess, "run", Mock(return_value=completed))
+    component = Mock()
+    monkeypatch.setattr(main, "record_component_states", component)
+    monkeypatch.setattr(main, "update_last_run", Mock())
+    status, _ = main.run_job(job)
+    assert status == "success"
+    component.assert_called_once_with(completed.stdout)
+
+
 def test_failed_tree_termination_is_not_silently_accepted(monkeypatch):
     import pytest
     monkeypatch.setattr(lifecycle, "os", SimpleNamespace(name="nt"))
