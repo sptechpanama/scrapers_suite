@@ -6,6 +6,7 @@ import ctypes
 import json
 import itertools
 import logging
+from process_lifecycle import can_preempt_job, terminate_process_tree
 import os
 import queue
 import re
@@ -2263,6 +2264,7 @@ def run_job_interruptible(
             text=True,
             env=env,
             bufsize=1,
+            start_new_session=os.name != "nt",
             encoding="utf-8",
             errors="replace",
         )
@@ -2291,17 +2293,12 @@ def run_job_interruptible(
                 interrupt_event is not None
                 and interrupt_event.is_set()
                 and execution is not None
-                and execution.job.name != "cotizacion_panama"
+                and can_preempt_job(execution.job.name)
                 and process.poll() is None
             ):
                 interrupted = True
                 try:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=5)
+                    terminate_process_tree(process)
                 except Exception:  # pylint: disable=broad-except
                     logging.exception("No se pudo interrumpir el proceso del job %s", job.name)
                 break
@@ -2317,12 +2314,7 @@ def run_job_interruptible(
                     timeout_seconds,
                 )
                 try:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=15)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=10)
+                    terminate_process_tree(process)
                 except Exception:  # pylint: disable=broad-except
                     logging.exception(
                         "No se pudo finalizar el job %s tras timeout", job.name
@@ -2341,8 +2333,7 @@ def run_job_interruptible(
                     job.name,
                 )
                 try:
-                    process.kill()
-                    process.wait(timeout=10)
+                    terminate_process_tree(process)
                 except Exception:  # pylint: disable=broad-except
                     logging.exception("No se pudo forzar cierre del job %s", job.name)
 
@@ -3003,7 +2994,7 @@ def main() -> None:
                     running_execution is not None
                     and running_process is not None
                     and running_process.poll() is None
-                    and running_execution.job.name != "cotizacion_panama"
+                    and can_preempt_job(running_execution.job.name)
                 )
                 running_name = running_execution.job.name if running_execution else ""
             if should_preempt:
