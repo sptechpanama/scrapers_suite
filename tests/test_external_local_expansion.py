@@ -85,12 +85,12 @@ def test_partial_source_is_persisted_without_claiming_completed_baseline(tmp_pat
     store.close()
 
 
-def test_profiles_preserve_explicit_zero_terms_and_match_only_explicit_fichas():
+def test_profiles_preserve_zero_terms_and_numbers_are_only_reference_metadata():
     profiles = {'rs':[], 'negative':[], 'fichas':['43358']}
     generic = classify_opportunity(Opportunity('acp_sli','1','Chiller UNSPSC 43358','https://test/1'), profiles)
     assert not generic.matched_company
     explicit = classify_opportunity(Opportunity('acp_sli','2','Ficha técnica Nº 43358 circuito de paciente','https://test/2'), profiles)
-    assert explicit.matched_company == 'RIR'
+    assert explicit.matched_company == ''
     assert explicit.raw_payload['watched_fichas'] == ['43358']
 
 

@@ -16,6 +16,7 @@ from common.keyword_watch import (
 
 from .models import Opportunity, clean_text, normalized_text
 from .qualification import screen, effective_bucket
+from .rir_products import match_products
 
 
 RIR_DEFAULT_KEYWORDS = (
@@ -138,12 +139,18 @@ def classify_opportunity(opportunity: Opportunity, profiles: dict | None = None)
         rs_terms = tuple(profiles.get('rs', rs_terms))
         rs_negative = tuple(profiles.get('negative', rs_negative))
         opportunity.raw_payload['company_profile'] = {k: profiles.get(k, '') for k in ('status', 'loaded_at')}
+        opportunity.raw_payload['company_profile'].update({
+            'rir_basis': 'product_words_v1',
+            'rir_products_count': len(profiles.get('rir_products', [])),
+            'rir_unresolved_fichas': profiles.get('rir_unresolved_fichas', []),
+        })
 
     matches: dict[str, list[str]] = {"RS/SP": [], "RIR": []}
     matched_fields: list[str] = []
     field_weight = 0.0
     ambiguous = False
     budget_pending = []
+    product_matches = []
     # Evaluate text without claiming any actual budget. Only the resulting
     # review flag is stored; this sentinel is never used as an opportunity amount.
     text_only_budget = max((rule.minimum_amount or 0 for term in rs_terms
@@ -181,6 +188,9 @@ def classify_opportunity(opportunity: Opportunity, profiles: dict | None = None)
         if safe_rir == ['hospital*']:
             safe_rir = []
         ambiguous = ambiguous or len(safe_rs) < len(rs_matches) or len(safe_rir) < len(rir_matches)
+        product_hits = match_products(value, (profiles or {}).get('rir_products', []), field_name)
+        product_matches.extend(product_hits)
+        safe_rir.extend(' + '.join(hit['terms']) for hit in product_hits)
         rs_matches, rir_matches = safe_rs, safe_rir
         if rs_matches or rir_matches:
             matched_fields.append(field_name)
@@ -195,7 +205,9 @@ def classify_opportunity(opportunity: Opportunity, profiles: dict | None = None)
     watched = sorted(set(explicit).intersection((profiles or {}).get('fichas', [])))
     opportunity.raw_payload['explicit_fichas'] = explicit
     opportunity.raw_payload['watched_fichas'] = watched
-    rir.extend('Ficha ' + code for code in watched)
+    opportunity.raw_payload['rir_product_matches'] = product_matches
+    # Numbers are reference metadata only. External portals do not normally
+    # mention MINSA codes; product words are the basis of RIR classification.
     # En los portales globales la palabra "hospital" aparece también en
     # consultorías, obras civiles o software. Se conserva la regla histórica
     # para las fuentes existentes, pero no basta por sí sola para clasificar
