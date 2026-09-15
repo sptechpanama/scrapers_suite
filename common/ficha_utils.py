@@ -15,6 +15,11 @@ from typing import Dict, Iterable, List, Set, Tuple
 
 import pandas as pd
 
+try:
+    from .ficha_name_context import catalog_name_context_allowed
+except ImportError:  # scrapers also import common modules directly
+    from ficha_name_context import catalog_name_context_allowed
+
 FICHAS_DEFAULT_PATH = Path(r"C:\Users\rodri\fichas\fichas-y-nombre.xlsx")
 
 
@@ -148,7 +153,7 @@ def detectar_fichas_tokens(
 
     if include_prefixed:
         for nombre, (patron, ficha) in patrones_nom.items():
-            if patron.search(texto_safe):
+            if patron.search(texto_safe) and catalog_name_context_allowed(nombre, texto_safe):
                 base = ficha.strip()
                 if base in bases_detectadas:
                     continue
