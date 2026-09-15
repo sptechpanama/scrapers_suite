@@ -258,9 +258,16 @@ class OpportunityStore:
                                        (json.dumps(raw, ensure_ascii=False), alias_id))
                 existing = self._fetchone(
                     cursor,
-                    f"SELECT content_hash,first_seen_at,first_run_id,last_changed_at,matched_company,raw_payload_json FROM external_opportunities WHERE id={p}",
+                    f"SELECT content_hash,first_seen_at,first_run_id,last_changed_at,matched_company,raw_payload_json,publication_date FROM external_opportunities WHERE id={p}",
                     (payload["id"],),
                 )
+                if opportunity.source == 'ensa' and not opportunity.publication_date:
+                    known_publication = self._row_value(existing, 6, 'publication_date')
+                    if known_publication:
+                        # ENSA's RSS is supplementary and may time out while the
+                        # main tender list works. Do not erase a known date.
+                        opportunity.publication_date = known_publication
+                        payload = opportunity.as_storage_dict()
                 previous_hash = self._row_value(existing, 0, "content_hash")
                 is_new = existing is None
                 is_changed = bool(existing is not None and previous_hash != payload["content_hash"])

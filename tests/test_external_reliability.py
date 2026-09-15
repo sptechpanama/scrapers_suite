@@ -252,3 +252,17 @@ def test_late_document_match_alerts_once_without_listing_change(tmp_path):
     item.matched_company='RS/SP';item.raw_payload['qualification']['bucket']='relevant'
     assert store.ingest_source('matched_again','start','end',SourceFetchResult('ungm',[item])).events==0
     store.close()
+
+
+def test_ensa_optional_rss_failure_keeps_known_publication_without_false_change(tmp_path):
+    store=OpportunityStore.sqlite(tmp_path/'ensa.db')
+    item=Opportunity('ensa','1','Chiller','https://test/1',publication_date='2026-09-15',deadline='2099-01-01')
+    store.ingest_source('first','start','end',SourceFetchResult('ensa',[item]))
+    item.publication_date=''
+    result=store.ingest_source('rss_down','start','end',SourceFetchResult('ensa',[item]))
+    assert result.changed==result.events==0
+    assert store.connection.execute('SELECT publication_date FROM external_opportunities').fetchone()[0]=='2026-09-15'
+    item.publication_date='2026-09-16'
+    store.ingest_source('updated_date','start','end',SourceFetchResult('ensa',[item]))
+    assert store.connection.execute('SELECT publication_date FROM external_opportunities').fetchone()[0]=='2026-09-16'
+    store.close()

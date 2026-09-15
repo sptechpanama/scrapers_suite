@@ -18,7 +18,7 @@ class EnsaAdapter(SourceAdapter):
     listing_url = "https://ensa.com.pa/licitaciones/"
 
     def _feed(self) -> list[Opportunity]:
-        response = self.client.get(self.url).response
+        response = self.client.get(self.url, timeout=10).response
         rows: list[Opportunity] = []
         root = ElementTree.fromstring(response.text)
         for item in root.findall(".//item"):
