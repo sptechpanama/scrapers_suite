@@ -205,3 +205,23 @@ def test_idb_empty_broken_datastore_is_not_reported_as_success():
     client=SimpleNamespace(get=lambda *a,**kw:SimpleNamespace(response=SimpleNamespace(json=lambda:{
         'success':True,'result':{'records':[],'fields':[{'id':'_id'}],'total':0}})))
     assert IdbAdapter(client).fetch().status=='error'
+
+
+def test_late_document_match_alerts_once_without_listing_change(tmp_path):
+    store=OpportunityStore.sqlite(tmp_path/'late.db')
+    item=Opportunity('ungm','1','Proceso de contratación','https://test/1',deadline='2099-01-01',
+                     raw_payload={'qualification':{'bucket':'review','deadline_date':'2099-01-01'}})
+    store.ingest_source('baseline','start','end',SourceFetchResult('ungm',[item]))
+    original_hash=item.content_hash
+    item.matched_company='RS/SP'
+    item.raw_payload['qualification']['bucket']='relevant'
+    item.raw_payload['document_analysis']={'status':'ok','text':'Suministro de chiller y agua helada'}
+    assert item.content_hash==original_hash
+    first=store.ingest_source('enriched','start','end',SourceFetchResult('ungm',[item]))
+    assert first.changed==0 and first.events==1
+    assert store.ingest_source('repeat','start','end',SourceFetchResult('ungm',[item])).events==0
+    item.matched_company='';item.raw_payload['qualification']['bucket']='review'
+    store.ingest_source('unmatched','start','end',SourceFetchResult('ungm',[item]))
+    item.matched_company='RS/SP';item.raw_payload['qualification']['bucket']='relevant'
+    assert store.ingest_source('matched_again','start','end',SourceFetchResult('ungm',[item])).events==0
+    store.close()

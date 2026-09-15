@@ -17,6 +17,9 @@
 - Los detalles se refrescan cada cuatro horas y se invalidan ante cambios de fecha
   o revisión oficial. Los errores conservan el texto anterior y se identifican
   como pendientes; no prueban la lectura de una enmienda nueva.
+- Cuando una lectura posterior vuelve relevante una oportunidad cuyo título
+  era genérico, se genera una única alerta aunque el listado oficial no haya
+  cambiado. La misma coincidencia no vuelve a notificarse en sucesivas corridas.
 - BID pagina el recurso API y valida sus columnas; ante fallo consulta el CSV
   enlazado en el catálogo oficial. HTML, archivos vacíos y HTTP 202 no se aceptan
   como cero oportunidades. Si ambas vías fallan se conserva el historial.

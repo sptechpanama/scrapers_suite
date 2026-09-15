@@ -258,12 +258,28 @@ class OpportunityStore:
                                        (json.dumps(raw, ensure_ascii=False), alias_id))
                 existing = self._fetchone(
                     cursor,
-                    f"SELECT content_hash,first_seen_at,first_run_id,last_changed_at FROM external_opportunities WHERE id={p}",
+                    f"SELECT content_hash,first_seen_at,first_run_id,last_changed_at,matched_company,raw_payload_json FROM external_opportunities WHERE id={p}",
                     (payload["id"],),
                 )
                 previous_hash = self._row_value(existing, 0, "content_hash")
                 is_new = existing is None
                 is_changed = bool(existing is not None and previous_hash != payload["content_hash"])
+                # A generic title can become relevant only when a later run
+                # reads its specifications. That transition also deserves one
+                # notification, even when the official listing did not change.
+                became_relevant = False
+                if existing is not None and emit_events and should_alert(opportunity):
+                    from .qualification import effective_bucket
+                    previous_company = self._row_value(existing, 4, 'matched_company')
+                    previous_raw = {}
+                    try:
+                        previous_raw = json.loads(self._row_value(existing, 5, 'raw_payload_json') or '{}')
+                        previously_relevant = bool(previous_company) and effective_bucket(previous_raw.get('qualification') or {}) == 'relevant'
+                    except (TypeError, ValueError):
+                        previously_relevant = bool(previous_company)
+                    old_text = (previous_raw.get('document_analysis') or {}).get('text', '')
+                    new_text = (opportunity.raw_payload.get('document_analysis') or {}).get('text', '')
+                    became_relevant = not previously_relevant and bool(new_text) and new_text != old_text
                 if is_new:
                     stats.new += 1
                 elif is_changed:
@@ -306,7 +322,7 @@ class OpportunityStore:
                         (doc_id, payload["id"], document.title, document.url, document.document_type, now, now),
                     )
 
-                if emit_events and baseline_completed and (is_new or is_changed) and should_alert(opportunity):
+                if emit_events and baseline_completed and (is_new or is_changed or became_relevant) and should_alert(opportunity):
                     event_type = "new" if is_new else "updated"
                     # Identical UNGM notices can be returned by Panama/global/UNICEF.
                     # The official URL and substantive fields identify one notification.
