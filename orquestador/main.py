@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+from ficha_deadline_reminders import PANAMA as REMINDER_PANAMA, collect_reminders as collect_43358_reminders, message_body as ficha_reminder_message_body
 from notification_stages import cl_stage, process_number as cl_process_number, queue_cl_events
 import hashlib
 import ctypes
@@ -1757,6 +1758,63 @@ def _queue_scan_based_notifications(job_name: str, module_name: str, finished_at
     return queued + cl_queued
 
 
+def _run_43358_deadline_watchdog():
+    now = datetime.now(REMINDER_PANAMA)
+    if now.hour < 7:
+        return {"status": "waiting", "sent": 0}
+    state = load_state()
+    sent_keys = state.get("ct_rir_43358_reminder_sent_keys", {})
+    errors, sent_count = [], 0
+    try:
+        candidates = _scan_ct_rir_candidates()
+        entries, errors = collect_43358_reminders(candidates, sent_keys, now)
+    except Exception as exc:
+        entries = []
+        errors.append({"error": str(exc)})
+    if entries:
+        sender, password, recipients = _ct_rir_email_config()
+        try:
+            if not sender or not password or not recipients:
+                raise ValueError("Configuracion incompleta de correo CT RIR")
+            # A late API response must not send a reminder past a known deadline.
+            current = datetime.now(REMINDER_PANAMA)
+            entries = [entry for entry in entries if
+                       datetime.fromisoformat(entry["deadline_iso"]) > current and
+                       datetime.fromisoformat(entry["deadline_iso"]).date() == current.date()]
+            if entries:
+                msg = EmailMessage()
+                msg["Subject"] = f"RIR 43358: ultimo dia para participar - {current.date()} ({len(entries)} acto(s))"
+                msg["From"] = sender
+                msg["To"] = ", ".join(recipients)
+                msg.set_content(ficha_reminder_message_body(entries))
+                with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=30) as server:
+                    server.login(sender, password)
+                    refused = server.send_message(msg)
+                    if refused:
+                        raise RuntimeError("SMTP rechazo uno o mas destinatarios")
+                latest = load_state()
+                sent = latest.setdefault("ct_rir_43358_reminder_sent_keys", {})
+                stamp = datetime.now(REMINDER_PANAMA).isoformat(timespec="seconds")
+                for entry in entries:
+                    sent[entry["reminder_key"]] = stamp
+                latest["ct_rir_43358_reminder_last_sent"] = {
+                    "sent_at": stamp, "count": len(entries), "subject": str(msg["Subject"]),
+                    "actos": [entry["numero_proceso"] for entry in entries],
+                }
+                save_state(latest)
+                sent_count = len(entries)
+                logging.info("Recordatorio ultimo dia 43358 aceptado por SMTP: %s acto(s)", sent_count)
+        except Exception as exc:
+            errors.append({"error": str(exc)})
+            logging.warning("Recordatorio 43358 pendiente; se reintentara: %s", exc)
+    latest = load_state()
+    report = {"checked_at": now.isoformat(timespec="seconds"),
+              "status": "error" if errors else "success", "sent": sent_count, "errors": errors}
+    latest["ct_rir_43358_reminder_watchdog"] = report
+    save_state(latest)
+    return report
+
+
 def _extract_generated_excel_name(stdout: str) -> str:
     if not stdout:
         return ""
@@ -3381,6 +3439,15 @@ def main() -> None:
             "Monitor de solicitudes manuales agendado (cada %s segundos)",
             MANUAL_POLL_INTERVAL_SECONDS,
         )
+
+    scheduler.add_job(
+        _run_43358_deadline_watchdog, "interval", seconds=300,
+        id="ficha-43358-deadline-reminder", replace_existing=True,
+        coalesce=True, max_instances=1, misfire_grace_time=120,
+        next_run_time=datetime.now(),
+    )
+    protected_job_ids.add("ficha-43358-deadline-reminder")
+    logging.info("Recordatorio 43358: ultimo dia desde las 07:00 de Panama; revision cada 5 minutos")
 
     worker_thread = threading.Thread(target=worker_loop, name="job-runner", daemon=True)
     scheduler.start()
