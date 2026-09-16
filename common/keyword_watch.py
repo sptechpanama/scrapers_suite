@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Iterable, Sequence
 
+if __package__:
+    from .notification_entity import notification_location_from_row
+else:
+    from notification_entity import notification_location_from_row
+
 HVAC_OVER_15K_KEYWORDS = (
     "aire acondicion*>15k",
     "aires acondicion*>15k",
@@ -585,6 +590,7 @@ def summarize_keyword_rows(
                 "palabras_clave": ", ".join(field_match.terms),
                 "titulo": row_text(row, "titulo"),
                 "entidad": row_text(row, "entidad"),
+                **notification_location_from_row(cols, row),
                 "fecha": row_text(row, "fecha"),
                 "precio_referencia": (
                     str(reference_amount or "").strip()

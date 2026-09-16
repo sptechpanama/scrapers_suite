@@ -11,6 +11,13 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+import sys
+from pathlib import Path
+_COMMON = str(Path(__file__).resolve().parents[1] / "common")
+if _COMMON not in sys.path:
+    sys.path.insert(0, _COMMON)
+from notification_entity import notification_location, notification_location_lines
+
 PANAMA = ZoneInfo("America/Panama")
 API = "https://apisv3.panamacompra.gob.pa"
 FICHA = "43358"
@@ -107,7 +114,9 @@ def verify_public_entry(entry):
         raise ValueError("No verifiable presentation deadline")
     route = "solicitud-de-cotizacion" if is_cl else "pliego-de-cargos"
     token = base64.b64encode(json.dumps({"i": flow, "tp": kind}, separators=(",", ":")).encode()).decode().rstrip("=")[::-1]
-    return {**entry, "fecha": date_text, "estado_oficial": row.get("nombreRealizado", ""),
+    location = notification_location(row)
+    location.update(notification_location(labels))
+    return {**entry, **location, "fecha": date_text, "estado_oficial": row.get("nombreRealizado", ""),
             "enlace": f"https://www.panamacompra.gob.pa/Inicio/#/{route}/{code}/{token}"}
 
 
@@ -146,7 +155,7 @@ def message_body(entries):
              "Este recordatorio es adicional al aviso de apertura.", ""]
     for entry in entries:
         lines += [f"Acto: {entry['numero_proceso']}", f"Producto: {entry.get('titulo', '')}",
-                  f"Entidad: {entry.get('entidad', '')}", f"Presentacion oficial: {entry['fecha']}",
+                  *notification_location_lines(entry), f"Presentacion oficial: {entry['fecha']}",
                   f"Estado verificado: {entry.get('estado_oficial', '')}",
                   f"Precio de referencia: {entry.get('precio_referencia', '')}", f"Enlace: {entry['enlace']}"]
         if not entry["deadline_exact"]:

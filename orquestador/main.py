@@ -65,6 +65,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from common.process_refresh import process_code as refresh_process_code, route_payload as refresh_route_payload
 
+from common.notification_entity import notification_location, notification_location_from_row, notification_location_lines
+
 from common.keyword_watch import (  # noqa: E402
     DEFAULT_RS_SP_NEGATIVE_KEYWORDS as SHARED_RS_SP_DEFAULT_NEGATIVE_KEYWORDS,
     DEFAULT_RS_SP_KEYWORDS as SHARED_RS_SP_DEFAULT_KEYWORDS,
@@ -1005,6 +1007,7 @@ def _scan_ct_rir_candidates() -> list[dict[str, object]]:
                 "ficha_detectada": ficha_label or "No Detectada",
                 "titulo": titulo,
                 "entidad": entidad,
+                **notification_location_from_row(headers, row),
                 "fecha": fecha,
                 "precio_referencia": precio,
                 "enlace": enlace,
@@ -1084,6 +1087,7 @@ def _scan_rs_sp_candidates() -> list[dict[str, object]]:
                 "palabras_clave": ", ".join(field_match.terms),
                 "titulo": titulo,
                 "entidad": entidad,
+                **notification_location_from_row(headers, row),
                 "fecha": fecha,
                 "precio_referencia": precio,
                 "enlace": enlace,
@@ -1190,6 +1194,7 @@ def _queue_ct_rir_notifications(job_name: str, stdout: str, finished_at: datetim
             "ficha_detectada": str(raw_entry.get("ficha_detectada") or "").strip(),
             "titulo": str(raw_entry.get("titulo") or "").strip(),
             "entidad": str(raw_entry.get("entidad") or "").strip(),
+            **notification_location(raw_entry),
             "fecha": str(raw_entry.get("fecha") or "").strip(),
             "precio_referencia": str(raw_entry.get("precio_referencia") or "").strip(),
             "enlace": str(raw_entry.get("enlace") or "").strip(),
@@ -1243,7 +1248,7 @@ def _send_pending_ct_rir_email() -> tuple[bool, str, int]:
             if cl_stage(entry):
                 lines.append(f"   Etapa: CL {cl_stage(entry)}")
             lines.append(f"   Titulo: {entry.get('titulo', '')}")
-            lines.append(f"   Entidad: {entry.get('entidad', '')}")
+            lines.extend(notification_location_lines(entry, indent="   "))
             lines.append(f"   Fecha: {entry.get('fecha', '')}")
             lines.append(f"   Precio: {entry.get('precio_referencia', '')}")
             lines.append(f"   Enlace: {entry.get('enlace', '')}")
@@ -1319,6 +1324,7 @@ def _queue_rs_sp_notifications(job_name: str, stdout: str, finished_at: datetime
             "palabras_clave": str(raw_entry.get("palabras_clave") or "").strip(),
             "titulo": str(raw_entry.get("titulo") or "").strip(),
             "entidad": str(raw_entry.get("entidad") or "").strip(),
+            **notification_location(raw_entry),
             "fecha": str(raw_entry.get("fecha") or "").strip(),
             "precio_referencia": str(raw_entry.get("precio_referencia") or "").strip(),
             "enlace": str(raw_entry.get("enlace") or "").strip(),
@@ -1374,7 +1380,7 @@ def _send_pending_rs_sp_email() -> tuple[bool, str, int]:
             if cl_stage(entry):
                 lines.append(f"   Etapa: CL {cl_stage(entry)}")
             lines.append(f"   Titulo: {entry.get('titulo', '')}")
-            lines.append(f"   Entidad: {entry.get('entidad', '')}")
+            lines.extend(notification_location_lines(entry, indent="   "))
             if entry.get("tipo_evento") == "Actualizado":
                 lines.append("   ACTUALIZADO: revisar fecha y monto vigentes")
                 lines.append(f"   Fecha anterior: {entry.get('fecha_anterior', '')}")

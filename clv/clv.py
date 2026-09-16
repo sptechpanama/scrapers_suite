@@ -45,6 +45,8 @@ from process_refresh import process_code, refresh_google_sheets
 
 PURGE_PROTECTED_CODES = set()
 
+from notification_entity import notification_location_from_row
+
 from keyword_watch import (
     DEFAULT_RS_SP_NEGATIVE_KEYWORDS,
     DEFAULT_RS_SP_KEYWORDS,
@@ -1338,6 +1340,7 @@ def main():
                     "fecha": str(row[col_idx.get("fecha", -1)]).strip() if col_idx.get("fecha", -1) >= 0 else "",
                     "precio_referencia": str(row[col_idx.get("precio_referencia", -1)]).strip() if col_idx.get("precio_referencia", -1) >= 0 else "",
                     "enlace": str(row[col_idx.get("enlace", -1)]).strip() if col_idx.get("enlace", -1) >= 0 else "",
+                    **notification_location_from_row(ct_rir_cols, row),
                     "hoja_origen": CFG["sheet_ct_rir"],
                 }
             )
