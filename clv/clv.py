@@ -79,6 +79,7 @@ from process_law import (
 )
 from cl_lifecycle import (
     RETRY_STATES as CL_RETRY_STATES,
+    can_retire_active_cl,
     apply_observation as apply_cl_observation,
     cl_key_for as cl_lifecycle_key,
     inspect_closed_cl,
@@ -964,8 +965,10 @@ def process_closed_cl_lifecycle(driver, *, active_listing_links=None):
         updated, observation_row = apply_cl_observation(record, observation)
         finalized_records.append(updated)
         observations.append(observation_row)
-        if key in expired_keys:
+        if key in expired_keys and can_retire_active_cl(record, observation):
             verified_sheet_keys.add(key)
+        elif key in expired_keys:
+            LOG("CL-LIFE", f"{numero}: se conserva visible; cierre no confirmado")
 
         if observation.status == "cerrada_sin_propuestas":
             counters["cerrada_sin_propuestas"] += 1

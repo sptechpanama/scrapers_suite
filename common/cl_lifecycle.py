@@ -247,6 +247,13 @@ def is_closed(fecha_texto: object, *, reference: datetime | None = None) -> bool
     return deadline <= current.astimezone(PANAMA_TZ)
 
 
+def can_retire_active_cl(record, observation, *, reference=None) -> bool:
+    """Missing from a list requests inspection; it does not prove closure."""
+    if observation.status in FINAL_STATES:
+        return True
+    return is_closed(record.get("fecha_presentacion_texto", ""), reference=reference)
+
+
 def should_inspect_cl(
     fecha_texto: object,
     enlace: object,
@@ -273,6 +280,9 @@ def should_inspect_cl(
     if active_listing_links is None or deadline.date() != current.date():
         return False
     active = {normalize_url(item) for item in active_listing_links if clean_text(item)}
+    number = extract_cl_number(enlace)
+    if number and any(extract_cl_number(url) == number for url in active):
+        return False
     return normalize_url(enlace) not in active
 
 
@@ -780,7 +790,10 @@ def apply_observation(
             "evidence_type": observation.evidence_type,
             "evidence_url": observation.evidence_url,
             "confidence": observation.confidence,
-            "closed_at": clean_text(record.get("closed_at")) or timestamp,
+            "closed_at": (clean_text(record.get("closed_at")) or timestamp)
+            if observation.status in FINAL_STATES or
+            (observation.status != "abierta" and is_closed(record.get("fecha_presentacion_texto", "")))
+            else "",
             "last_check_at": timestamp,
             "next_check_at": retry_at,
             "check_attempts": attempts,
