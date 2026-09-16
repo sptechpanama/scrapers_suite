@@ -1782,9 +1782,23 @@ def postgres_reconciliation_required(
     remote_count: int,
     *,
     requested_full: bool = False,
+    expected_new_rows: int = 0,
 ) -> bool:
-    """Indica si Supabase necesita recibir y reconciliar la tabla completa."""
-    return bool(requested_full or int(local_count) != int(remote_count))
+    """Reconcile unexplained differences; normal daily growth stays incremental."""
+    return bool(requested_full or int(local_count) != int(remote_count) + int(expected_new_rows))
+
+
+def count_new_postgres_links(cursor, rows) -> int:
+    """Count current-run links that are genuinely absent from PostgreSQL."""
+    links = sorted({str(row["enlace"]) for row in rows if row["enlace"]})
+    existing = 0
+    for offset in range(0, len(links), 1000):
+        cursor.execute(
+            "SELECT COUNT(*) FROM actos_publicos WHERE enlace = ANY(%s)",
+            (links[offset : offset + 1000],),
+        )
+        existing += int(cursor.fetchone()[0])
+    return len(links) - existing
 
 
 def sync_postgres(run_stamp: str, *, full: bool = False) -> bool:
@@ -1840,10 +1854,12 @@ def sync_postgres(run_stamp: str, *, full: bool = False) -> bool:
             )
             cursor.execute("SELECT COUNT(*) FROM actos_publicos")
             remote_count_before = int(cursor.fetchone()[0])
+            expected_new_rows = count_new_postgres_links(cursor, rows) if not full else 0
             reconcile_full = postgres_reconciliation_required(
                 local_count,
                 remote_count_before,
                 requested_full=full,
+                expected_new_rows=expected_new_rows,
             )
             if reconcile_full and not full:
                 log(
