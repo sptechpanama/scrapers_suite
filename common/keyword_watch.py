@@ -5,6 +5,11 @@ import unicodedata
 from functools import lru_cache
 from typing import Iterable
 
+if __package__:
+    from .notification_entity import notification_location_from_row
+else:
+    from notification_entity import notification_location_from_row
+
 DEFAULT_RS_SP_KEYWORDS = ("chiller", "york", "daikin")
 
 
@@ -113,6 +118,7 @@ def summarize_keyword_rows(
                 "fecha": str(row[col_idx.get("fecha", -1)]).strip() if col_idx.get("fecha", -1) >= 0 else "",
                 "precio_referencia": str(row[col_idx.get("precio_referencia", -1)]).strip() if col_idx.get("precio_referencia", -1) >= 0 else "",
                 "enlace": str(row[col_idx.get("enlace", -1)]).strip() if col_idx.get("enlace", -1) >= 0 else "",
+                **notification_location_from_row(cols, row),
                 "hoja_origen": source_sheet,
             }
         )
