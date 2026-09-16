@@ -16,6 +16,12 @@ def test_missing_cuadro_on_last_day_does_not_remove_050508():
         assert can_retire_active_cl(record, observation, reference=datetime(2026, 9, 17, 0, 0, tzinfo=PANAMA_TZ))
 
 
+def test_start_time_does_not_become_unpublished_closing_time():
+    record = {'fecha_presentacion_texto': '11-09-2026 08:00 AM a 16-09-2026'}
+    observation = ProposalObservation('test', URL, 'cerrada_pendiente_publicacion', None)
+    assert not can_retire_active_cl(record, observation, reference=datetime(2026, 9, 16, 12, 8, tzinfo=PANAMA_TZ))
+
+
 def test_explicit_deadline_and_confirmed_final_result_can_retire():
     observation = ProposalObservation('test', URL, 'error_verificacion', None)
     record = {'fecha_presentacion_texto': '16-09-2026 - 08:00 AM a 11:00 AM'}

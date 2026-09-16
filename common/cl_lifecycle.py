@@ -195,7 +195,8 @@ def parse_cl_deadline(value: object) -> datetime | None:
     if not text:
         return None
 
-    date_tokens = re.findall(r"\b(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b", text)
+    date_matches = list(re.finditer(r"\b(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b", text))
+    date_tokens = [match.group(1) for match in date_matches]
     if not date_tokens:
         return None
     token = date_tokens[-1]
@@ -212,7 +213,7 @@ def parse_cl_deadline(value: object) -> datetime | None:
     time_tokens = list(
         re.finditer(
             r"\b(\d{1,2}):(\d{2})(?:\s*([AaPp])\.?\s*[Mm]\.?)?\b",
-            text,
+            text[date_matches[-1].end():],
         )
     )
     if time_tokens:
