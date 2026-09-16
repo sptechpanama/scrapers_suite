@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+from notification_stages import cl_stage, process_number as cl_process_number, queue_cl_events
 import hashlib
 import ctypes
 import json
@@ -718,6 +719,9 @@ def _ctni_email_config() -> tuple[str, str, list[str]]:
 
 
 def _build_ct_rir_unique_key(entry: Dict[str, object]) -> str:
+    if cl_stage(entry):
+        identity = cl_process_number(entry.get("enlace")) or _build_module_act_key(entry)
+        return f"cl-v1|{identity}|{cl_stage(entry)}"
     sheet = str(entry.get("hoja_origen") or entry.get("sheet") or "").strip().lower()
     enlace = str(entry.get("enlace") or "").strip().lower()
     if sheet and enlace:
@@ -751,6 +755,9 @@ def _rs_sp_recent_date_changes():
 
 
 def _build_rs_sp_unique_key(entry: Dict[str, object]) -> str:
+    if cl_stage(entry):
+        identity = cl_process_number(entry.get("enlace")) or _build_module_act_key(entry)
+        return f"cl-v1|{identity}|{cl_stage(entry)}|{_rs_sp_revision_key(entry)}"
     code = refresh_process_code(entry.get("enlace"))
     if code:
         return f"rs-sp|{code}|{_rs_sp_revision_key(entry)}"
@@ -1002,6 +1009,8 @@ def _scan_ct_rir_candidates() -> list[dict[str, object]]:
                 "enlace": enlace,
             }
             act_key = _build_module_act_key(entry)
+            if cl_stage(entry):
+                act_key += "|stage:" + cl_stage(entry)
             if not act_key:
                 continue
             previous = candidates.get(act_key)
@@ -1079,6 +1088,8 @@ def _scan_rs_sp_candidates() -> list[dict[str, object]]:
                 "enlace": enlace,
             }
             act_key = _build_module_act_key(entry)
+            if cl_stage(entry):
+                act_key += "|stage:" + cl_stage(entry)
             if not act_key:
                 continue
             previous = candidates.get(act_key)
@@ -1106,6 +1117,43 @@ def _rs_sp_entry_uses_only_contextual_keywords(entry: dict[str, object]) -> bool
     )
 
 
+def _queue_cl_stage_entries(module_name, rows, job_name, finished_at, *, sheet="", scan=False):
+    entries = {}
+    for raw in rows:
+        entry = dict(raw)
+        entry["job"] = job_name
+        entry["hoja_origen"] = entry.get("hoja_origen") or entry.get("sheet") or sheet
+        if not cl_stage(entry):
+            continue
+        identity = cl_process_number(entry.get("enlace")) or _build_module_act_key(entry)
+        entry["_cl_identity"] = identity
+        entry["_cl_revision"] = _rs_sp_revision_key(entry) if module_name == "rs_sp" else ""
+        builder = _build_rs_sp_unique_key if module_name == "rs_sp" else _build_ct_rir_unique_key
+        entry["unique_key"] = builder(entry)
+        try:
+            version = refresh_route_payload(entry.get("enlace"))[0]
+        except (ValueError, KeyError, UnicodeError, TypeError):
+            version = 0
+        key = (identity, cl_stage(entry))
+        if key not in entries or version > entries[key][0]:
+            entries[key] = (version, entry)
+    if not entries:
+        return 0
+    state = load_state()
+    if module_name == "rs_sp" and scan:
+        try:
+            rule_version = int(state.get("rs_sp_context_rules_baseline_version", 0) or 0)
+        except (TypeError, ValueError):
+            rule_version = 0
+        if rule_version < RS_SP_CONTEXT_RULES_VERSION:
+            for _, entry in entries.values():
+                entry["_cl_silent_baseline"] = _rs_sp_entry_uses_only_contextual_keywords(entry)
+    queued = queue_cl_events(state, module_name, [pair[1] for pair in entries.values()],
+                             finished_at.isoformat(timespec="seconds"), scan=scan)
+    save_state(state)
+    return queued
+
+
 def _queue_ct_rir_notifications(job_name: str, stdout: str, finished_at: datetime) -> int:
     summary = _extract_ct_rir_summary(stdout)
     if not summary:
@@ -1113,6 +1161,13 @@ def _queue_ct_rir_notifications(job_name: str, stdout: str, finished_at: datetim
     rows = summary.get("rows")
     if not isinstance(rows, list) or not rows:
         return 0
+
+    staged_rows = [dict(row, job=job_name, hoja_origen=row.get("hoja_origen") or row.get("sheet") or summary.get("sheet") or "")
+                   for row in rows if isinstance(row, dict)]
+    cl_queued = _queue_cl_stage_entries("ct_rir", staged_rows, job_name, finished_at)
+    rows = [row for row in staged_rows if not cl_stage(row)]
+    if not rows:
+        return cl_queued
 
     state = load_state()
     pending_entries = state.setdefault("ct_rir_email_pending", [])
@@ -1155,7 +1210,7 @@ def _queue_ct_rir_notifications(job_name: str, stdout: str, finished_at: datetim
             "queued_at": finished_at.isoformat(timespec="seconds"),
         }
         save_state(state)
-    return queued
+    return queued + cl_queued
 
 
 def _send_pending_ct_rir_email() -> tuple[bool, str, int]:
@@ -1184,6 +1239,8 @@ def _send_pending_ct_rir_email() -> tuple[bool, str, int]:
         lines.append(f"[{sheet_name}] {len(entries)} acto(s)")
         for idx, entry in enumerate(entries, start=1):
             lines.append(f"{idx}. Ficha: {entry.get('ficha_detectada', '') or 'No Detectada'}")
+            if cl_stage(entry):
+                lines.append(f"   Etapa: CL {cl_stage(entry)}")
             lines.append(f"   Titulo: {entry.get('titulo', '')}")
             lines.append(f"   Entidad: {entry.get('entidad', '')}")
             lines.append(f"   Fecha: {entry.get('fecha', '')}")
@@ -1235,6 +1292,13 @@ def _queue_rs_sp_notifications(job_name: str, stdout: str, finished_at: datetime
     if not isinstance(rows, list) or not rows:
         return 0
 
+    staged_rows = [dict(row, job=job_name, hoja_origen=row.get("hoja_origen") or row.get("sheet") or summary.get("sheet") or "")
+                   for row in rows if isinstance(row, dict)]
+    cl_queued = _queue_cl_stage_entries("rs_sp", staged_rows, job_name, finished_at)
+    rows = [row for row in staged_rows if not cl_stage(row)]
+    if not rows:
+        return cl_queued
+
     state = load_state()
     pending_entries = state.setdefault("rs_sp_email_pending", [])
     sent_keys = state.setdefault("rs_sp_email_sent_keys", {})
@@ -1275,7 +1339,7 @@ def _queue_rs_sp_notifications(job_name: str, stdout: str, finished_at: datetime
             "queued_at": finished_at.isoformat(timespec="seconds"),
         }
         save_state(state)
-    return queued
+    return queued + cl_queued
 
 
 def _send_pending_rs_sp_email() -> tuple[bool, str, int]:
@@ -1306,6 +1370,8 @@ def _send_pending_rs_sp_email() -> tuple[bool, str, int]:
             lines.append(
                 f"{idx}. Palabras clave: {entry.get('palabras_clave', '') or 'Sin coincidencia visible'}"
             )
+            if cl_stage(entry):
+                lines.append(f"   Etapa: CL {cl_stage(entry)}")
             lines.append(f"   Titulo: {entry.get('titulo', '')}")
             lines.append(f"   Entidad: {entry.get('entidad', '')}")
             if entry.get("tipo_evento") == "Actualizado":
@@ -1558,6 +1624,8 @@ def _queue_scan_based_notifications(job_name: str, module_name: str, finished_at
     baseline_key_name = f"{module_name}_module_baseline"
 
     candidates = scanner()
+    cl_queued = _queue_cl_stage_entries(module_name, candidates, job_name, finished_at, scan=True)
+    candidates = [entry for entry in candidates if not cl_stage(entry)]
     state = load_state()
     seen_keys = state.get(seen_key_name)
     if not isinstance(seen_keys, dict):
@@ -1605,7 +1673,7 @@ def _queue_scan_based_notifications(job_name: str, module_name: str, finished_at
             module_name.upper(),
             len(candidate_by_act),
         )
-        return 0
+        return cl_queued
 
     if module_name == "rs_sp":
         try:
@@ -1686,7 +1754,7 @@ def _queue_scan_based_notifications(job_name: str, module_name: str, finished_at
         }
     state[seen_key_name] = seen_updated
     save_state(state)
-    return queued
+    return queued + cl_queued
 
 
 def _extract_generated_excel_name(stdout: str) -> str:
@@ -2186,7 +2254,7 @@ def run_job(job: JobConfig, execution: Optional[ExecutionRequest] = None) -> tup
                     )
                 try:
                     queued = _queue_rs_sp_notifications(job.name, stdout, end_time)
-                    if queued:
+                    if queued or load_state().get("rs_sp_email_pending"):
                         ok, detail, sent_count = _send_pending_rs_sp_email()
                         if ok and sent_count:
                             logging.info(
@@ -2226,7 +2294,7 @@ def run_job(job: JobConfig, execution: Optional[ExecutionRequest] = None) -> tup
                     )
                 try:
                     queued = _queue_scan_based_notifications(job.name, "rs_sp", end_time)
-                    if queued:
+                    if queued or load_state().get("rs_sp_email_pending"):
                         ok, detail, sent_count = _send_pending_rs_sp_email()
                         if ok and sent_count:
                             logging.info(
@@ -2551,7 +2619,7 @@ def run_job_interruptible(
                     )
                 try:
                     queued = _queue_rs_sp_notifications(job.name, result.stdout, end_time)
-                    if queued:
+                    if queued or load_state().get("rs_sp_email_pending"):
                         ok, detail, sent_count = _send_pending_rs_sp_email()
                         if ok and sent_count:
                             logging.info(
@@ -2591,7 +2659,7 @@ def run_job_interruptible(
                     )
                 try:
                     queued = _queue_scan_based_notifications(job.name, "rs_sp", end_time)
-                    if queued:
+                    if queued or load_state().get("rs_sp_email_pending"):
                         ok, detail, sent_count = _send_pending_rs_sp_email()
                         if ok and sent_count:
                             logging.info(
