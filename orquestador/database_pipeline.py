@@ -14,6 +14,7 @@ actualizados.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import sqlite3
@@ -196,10 +197,39 @@ def analytics_command() -> list[str]:
     ]
 
 
+def pc_analytics_builder() -> Path:
+    configured = os.environ.get("GEAPP_ROOT", "").strip()
+    config_path = REPO_ROOT / "db" / "update_config.json"
+    if not configured and config_path.exists():
+        config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        configured = str(config.get("geapp_root") or "").strip()
+    return Path(configured).expanduser().resolve() / "scripts" / "build_inteligencia_pc.py" if configured else PC_ANALYTICS_BUILDER
+
+
+def validate_pc_builder(builder: Path) -> None:
+    """Reject legacy builders before they can remove recent-CL participation data."""
+    tree = ast.parse(builder.read_text(encoding="utf-8-sig"))
+    columns = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in {"PC_ACT_COLUMNS", "PC_PROPOSAL_COLUMNS"}:
+                    columns[target.id] = set(ast.literal_eval(node.value))
+    functions = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+    if ("_prepare_lifecycle" not in functions
+            or not {"numero_proceso", "source_layer", "resultado_provisional"} <= columns.get("PC_ACT_COLUMNS", set())
+            or not {"resultado_empresa", "fuente_resultado", "monto_ganado_fuente"} <= columns.get("PC_PROPOSAL_COLUMNS", set())):
+        raise RuntimeError(
+            "Constructor de Inteligencia PC desactualizado: faltan cotizaciones recientes "
+            "o resultados de participacion. Configura GEAPP_ROOT o geapp_root en "
+            "db/update_config.json con la misma version que Streamlit."
+        )
+
+
 def pc_analytics_command() -> list[str]:
     return [
         str(PYTHON_EXE),
-        str(PC_ANALYTICS_BUILDER),
+        str(pc_analytics_builder()),
         "--source",
         str(OPERATIONAL_DB),
         "--output",
@@ -270,6 +300,15 @@ def run_pipeline(mode: str) -> int:
         return 2
 
     update_started = _now()
+    try:
+        validate_pc_builder(pc_analytics_builder())
+    except Exception as exc:
+        finished = _now()
+        detail = f"No se inicio la actualizacion: {type(exc).__name__}: {exc}"
+        for name in ("db_local", "supabase_operational", "analytics"):
+            emit_component(name, "error" if name == "analytics" else "blocked", update_started, finished, detail)
+        print(f"[ERROR] {detail}", file=sys.stderr, flush=True)
+        return 2
     try:
         updater_returncode = _run(updater_command(mode))
         update_finished = _now()

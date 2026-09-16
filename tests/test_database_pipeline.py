@@ -73,6 +73,7 @@ def test_old_success_metadata_cannot_mask_a_lock_failure():
     old = {"last_run_started_at": "2026-09-14 00:31:00", "last_local_update_status": "success",
            "last_postgres_sync_status": "success", "last_total_rows": "250845"}
     with mock.patch.dict(os.environ, {"SUPABASE_DB_URL": "test-only"}), \
+         mock.patch.object(pipeline, "validate_pc_builder"), \
          mock.patch.object(pipeline, "_run", return_value=1) as runner, \
          mock.patch.object(pipeline, "read_metadata", return_value=old), \
          mock.patch.object(pipeline, "LAST_COMMAND_ERROR", "Otra actualización conserva el bloqueo"), \
@@ -89,6 +90,7 @@ def test_current_local_success_survives_postgres_failure():
     metadata = {"last_run_started_at": datetime.now().isoformat(), "last_local_update_status": "success",
                 "last_postgres_sync_status": "error", "last_postgres_sync_error": "connection unavailable"}
     with mock.patch.dict(os.environ, {"SUPABASE_DB_URL": "test-only"}), \
+         mock.patch.object(pipeline, "validate_pc_builder"), \
          mock.patch.object(pipeline, "_run", return_value=1) as runner, \
          mock.patch.object(pipeline, "read_metadata", return_value=metadata), \
          mock.patch.object(pipeline, "emit_component") as emit:
