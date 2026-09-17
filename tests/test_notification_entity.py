@@ -38,7 +38,7 @@ def isolated(monkeypatch, tmp_path):
 def test_aliases_preserve_hospital_and_avoid_repeating_entity(alias):
     record = {"entidad": "Caja de Seguro Social", alias: HOSPITAL, "dependencia": "CSS - Sede"}
     body = "\n".join(notification_location_lines(record))
-    assert "Caja de Seguro Social" in body and HOSPITAL in body and "CSS - Sede" in body
+    assert body.splitlines() == ["Entidad: Caja de Seguro Social", "Hospital: " + HOSPITAL]
     assert body.count(HOSPITAL) == 1
 
 
@@ -46,16 +46,24 @@ def test_no_inferred_hospital_and_no_none_or_nan_in_mail():
     record = {"entidad": "CSS", "unidad de compra": None, "hospital": float("nan"),
               "titulo": "Hospital inventado", "provincia": "Panamá"}
     body = "\n".join(notification_location_lines(record))
-    assert "No informado" in body
+    assert "Hospital: No especificado" in body
     assert "inventado" not in body and "nan" not in body and "None" not in body
     assert notification_location_from_row(["entidad", "hospital"], ["MINSA"]) == {"entidad": "MINSA"}
 
 
-def test_both_requesting_and_buying_units_are_shown_when_different():
+def test_only_hospital_is_shown_below_entity():
     lines = notification_location_lines({**ENTRY, "unidad de compra": "Dirección Nacional de Compras"})
-    assert any(HOSPITAL in line for line in lines)
-    assert any("Dirección Nacional de Compras" in line for line in lines)
-    assert "\n".join(notification_location_lines(ENTRY)).count(HOSPITAL) == 1
+    assert lines == ["Entidad: Caja de Seguro Social", "Hospital: " + HOSPITAL]
+
+
+@pytest.mark.parametrize("record,expected", [
+    ({"entidad": "MINSA", "unidad solicitante": "HSMA Compras", "dependencia": "Hospital San Miguel Arcangel"}, "Hospital San Miguel Arcangel"),
+    ({"entidad": "MINSA", "unidad de compra": "MINSA Bocas del Toro - Compras", "dependencia": "Region de Salud de Bocas del Toro"}, "No especificado"),
+    ({"entidad": "MINSA", "unidad solicitante": "Departamento de Compras de Medicamentos e Insumos para la Salud"}, "No especificado"),
+    ({"entidad": "MINSA", "unidad de compra": "Departamento De Compras / Instituto Oncologico Nacional"}, "Departamento De Compras / Instituto Oncologico Nacional"),
+])
+def test_department_is_not_mislabeled_as_a_hospital(record, expected):
+    assert notification_location_lines(record) == ["Entidad: MINSA", "Hospital: " + expected]
 
 
 def test_keyword_summary_preserves_official_unit():
@@ -118,7 +126,8 @@ def test_summary_to_queue_to_smtp_preserves_hospital_without_duplicates(monkeypa
     monkeypatch.setattr(o.smtplib, "SMTP_SSL", SMTP)
     assert getattr(o, "_send_pending_" + module + "_email")()[2] == 1
     body = messages[0].get_content()
-    assert HOSPITAL in body and "Caja de Seguro Social" in body and "CSS - Sede" in body
+    assert "   Entidad: Caja de Seguro Social\n   Hospital: " + HOSPITAL + "\n" in body
+    assert "CSS - Sede" not in body and "Dependencia:" not in body and "Unidad de compra:" not in body
     assert body.count(HOSPITAL) == 1
     assert queue("clv" if is_cl else "rir1", payload, datetime(2026, 9, 16, 18)) == 0
 

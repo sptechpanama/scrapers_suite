@@ -43,18 +43,21 @@ def notification_location_from_row(headers, row) -> dict[str, str]:
 def notification_location_lines(record: Mapping, *, indent: str = "") -> list[str]:
     location = notification_location(record)
     entity = location.get("entidad", "No informada en la fuente")
-    lines = [f"{indent}Entidad: {entity}"]
-    seen = {_key(entity)}
-    for field, label in (
-        ("hospital", "Hospital"),
-        ("unidad solicitante", "Hospital / unidad solicitante"),
-        ("unidad de compra", "Unidad de compra"),
-        ("dependencia", "Dependencia"),
-    ):
-        value = location.get(field, "")
-        if value and _key(value) not in seen:
-            lines.append(f"{indent}{label}: {value}")
-            seen.add(_key(value))
-    if len(lines) == 1:
-        lines.append(f"{indent}Hospital / unidad de compra: No informado en los datos disponibles")
-    return lines
+    hospital = location.get("hospital", "")
+    if not hospital:
+        for field in ("unidad solicitante", "unidad de compra", "dependencia"):
+            value = location.get(field, "")
+            normalized = "".join(
+                char for char in unicodedata.normalize("NFKD", value).casefold()
+                if not unicodedata.combining(char)
+            )
+            if re.search(
+                r"\b(?:hospital|hosp|complejo hospitalario|policlinica|ulaps|capsi|"
+                r"centro de salud|instituto oncologico)\b", normalized,
+            ):
+                hospital = value
+                break
+    return [
+        f"{indent}Entidad: {entity}",
+        f"{indent}Hospital: {hospital or 'No especificado'}",
+    ]

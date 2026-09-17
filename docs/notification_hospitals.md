@@ -16,8 +16,9 @@ scrapers y del monitor del orquestador.
 `common/notification_entity.py` normaliza los nombres de columnas de Sheets,
 SQLite y API pública. Conserva los nombres oficiales, evita repetir la misma
 unidad y no atribuye hospitales a partir del título, producto o provincia.
-Si no hay información, el correo dice que el hospital/unidad no está informado.
-Una compra centralizada de MINSA se presenta como tal, sin inventarle hospital.
+Si los campos oficiales no identifican un hospital o centro de salud, la línea
+indica `Hospital: No especificado`. Una unidad administrativa o región no se
+presenta como si fuera un hospital.
 
 No cambia destinatarios, credenciales, filtros, fichas vigiladas ni historial de
 envío. No requiere migración de Supabase ni cambios en Streamlit. El orquestador
@@ -31,10 +32,10 @@ los lectores de Sheets, el recorrido resumen-cola-SMTP con transporte simulado,
 deduplicación y la unidad obtenida del detalle oficial para recordatorios.
 Las pruebas no envían correos reales.
 
-## Formato breve solicitado
+## Formato solicitado
 
-Los correos deben mostrar ficha/producto, entidad y hospital o unidad solicitante,
-fechas, monto y enlace al acto. Si el acto tiene varios renglones, distinguir el
-monto del acto del monto de la ficha. Omitir referencias a documentos probatorios,
-enlaces adicionales de evidencia y explicaciones de auditoría. La evidencia se
-conserva en el registro interno; no se añade al cuerpo del aviso.
+Conservar exactamente el formato habitual de cada alerta y añadir únicamente
+`Hospital: ...` inmediatamente debajo de `Entidad: ...`. No añadir líneas de
+dependencia, unidad compradora, documentos probatorios ni explicaciones extra.
+Los metadatos completos siguen disponibles internamente para identificar el
+hospital en la unidad solicitante, unidad de compra o dependencia.
