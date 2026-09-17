@@ -4,47 +4,22 @@
                      "name":  "clv",
                      "python":  "C:/Users/rodri/scrapers_repo/.venv/Scripts/python.exe",
                      "script":  "C:/Users/rodri/scrapers_repo/clv/clv.py",
-                     "days_of_week":  [
-                                          "mon",
-                                          "tue",
-                                          "wed",
-                                          "thu",
-                                          "fri"
-                                      ],
-                     "times":  [
-                                   "07:45",
-                                   "13:45",
-                                   "21:45"
-                               ]
+                     "days_of_week":  ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+                     "times":  ["08:00", "09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "17:00"]
                  },
                  {
                      "name":  "clrir",
                      "python":  "C:/Users/rodri/scrapers_repo/.venv/Scripts/python.exe",
                      "script":  "C:/Users/rodri/scrapers_repo/clrir/clrir.py",
-                     "days_of_week":  [
-                                          "mon",
-                                          "tue",
-                                          "wed",
-                                          "thu",
-                                          "fri"
-                                      ],
-                     "times":  [
-                                   "08:15",
-                                   "22:30"
-                               ]
+                     "days_of_week":  ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+                     "times":  ["02:30", "18:00"]
                  },
                  {
                      "name":  "rir1",
                      "python":  "C:/Users/rodri/scrapers_repo/.venv/Scripts/python.exe",
                      "script":  "C:/Users/rodri/scrapers_repo/rir1/rir1.py",
-                     "days_of_week":  [
-                                          "mon",
-                                          "tue",
-                                          "fri"
-                                      ],
-                     "times":  [
-                                   "23:05"
-                               ]
+                     "days_of_week":  ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+                     "times":  ["16:30", "18:40"]
                  },
                  {
                      "name":  "sunday_db_minsa",
