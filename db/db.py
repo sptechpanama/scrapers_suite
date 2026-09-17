@@ -15,6 +15,8 @@ from sqlite3 import Error
 import re
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "common"))
+from scrape_coverage import collect_listing, ListingIncomplete
 DATA_DIR = REPO_ROOT / "data"
 CREDENTIALS_FILE = REPO_ROOT / "credentials" / "service-account.json"
 
@@ -1132,61 +1134,15 @@ def collect_links_by_state(driver, url_with_state_param):
     except Exception:
         LOG("PAGE", "no se pudo cambiar a 50 por página")
 
-    # =======================================
-    # Paginación completa (multi-página)
-    # =======================================
     PT = PageTools(driver)
-    links, seen = [], set()
-    pages_done = 0
-
-    while True:
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_all_elements_located((By.CSS_SELECTOR, CFG["css_links"]))
-        )
-
-        urls = [PT.a_url(a) for a in PT.find_css(CFG["css_links"])]
-        added = 0
-        for u in urls:
-            if u and u not in seen:
-                seen.add(u)
-                links.append(u)
-                added += 1
-        LOG("CAP", f"+{added} | total={len(links)}")
-
-        pages_done += 1
-
-        # ---------------------------------------
-        # 🔧 OPCIONAL: limitar páginas manualmente
-        # ---------------------------------------
-        # Si quieres limitar la cantidad de páginas para pruebas,
-        # cambia el valor del límite aquí (por ejemplo, 2 o 3 páginas).
-        #
-        # EJEMPLO: para solo 2 páginas, descomenta esta línea ↓↓↓
-        #
-##        if pages_done >= 3:
-##           LOG("PAGE", "Fin de paginación manual (límite de prueba alcanzado)")
-##           break
-        #
-        # ---------------------------------------
-
-        # Guardar referencia a la tabla actual antes de hacer click en "Siguiente"
-        tbody_old = PT.tbody_ref()
-        if not PT.click_next():
-            LOG("PAGE", "No hay más páginas disponibles (Next deshabilitado)")
-            break
-
-        try:
-            if tbody_old is not None:
-                WebDriverWait(driver, 15).until(EC.staleness_of(tbody_old))
-            else:
-                WebDriverWait(driver, 15).until(
-                    EC.presence_of_all_elements_located((By.CSS_SELECTOR, CFG["css_links"]))
-                )
-        except TimeoutException:
-            time.sleep(1.0)
-
-    LOG("DONE", f"enlaces capturados={len(links)}")
-    return links
+    PT.collect_links = lambda: [u for a in PT.find_css(CFG["css_links"]) if (u := PT.a_url(a))]
+    if not hasattr(PT, "close_popup"):
+        PT.close_popup = lambda: None
+    listing = collect_listing(PT, CFG["css_links"], LOG)
+    if not listing["complete"]:
+        raise ListingIncomplete(listing["error"])
+    LOG("DONE", f"enlaces capturados={len(listing['links'])}")
+    return listing["links"]
 
 
 

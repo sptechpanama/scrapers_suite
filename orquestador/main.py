@@ -58,6 +58,7 @@ if str(COMMON_DIR) not in sys.path:
 
 from ficha_utils import detectar_fichas_detalladas, get_catalog  # noqa: E402
 from notification_entity import notification_location, notification_location_from_row, notification_location_lines
+from scrape_coverage import coverage_problem
 
 CONFIG_PATH = BASE_DIR / "config.json"
 STATE_PATH = BASE_DIR / "state.json"
@@ -1806,6 +1807,7 @@ def run_job(job: JobConfig, execution: Optional[ExecutionRequest] = None) -> tup
             errors="replace",
         )
         end_time = datetime.now()
+        stdout = result.stdout or ""
         if result.returncode == 0:
             logging.info("Job %s finalizo correctamente", job.name)
             if result.stdout:
@@ -1966,6 +1968,11 @@ def run_job(job: JobConfig, execution: Optional[ExecutionRequest] = None) -> tup
                         "No se pudo procesar escaneo RS_SP para el job %s",
                         job.name,
                     )
+            partial = coverage_problem(stdout) if job.name in {"clv", "clrir", "rir1"} else ""
+            if partial:
+                logging.warning("%s: %s", job.name, partial)
+                update_last_run(job.name, "partial", started_at=start_time, finished_at=end_time, detail=partial)
+                return "partial", partial
             update_last_run(job.name, "success", started_at=start_time, finished_at=end_time)
             return "success", ""
         else:
@@ -2326,6 +2333,11 @@ def run_job_interruptible(
                         "No se pudo procesar escaneo RS_SP para el job %s",
                         job.name,
                     )
+            partial = coverage_problem(stdout) if job.name in {"clv", "clrir", "rir1"} else ""
+            if partial:
+                logging.warning("%s: %s", job.name, partial)
+                update_last_run(job.name, "partial", started_at=start_time, finished_at=end_time, detail=partial)
+                return "partial", partial
             update_last_run(job.name, "success", started_at=start_time, finished_at=end_time)
             return "success", ""
 

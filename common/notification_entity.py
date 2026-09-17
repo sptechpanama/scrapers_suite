@@ -43,21 +43,10 @@ def notification_location_from_row(headers, row) -> dict[str, str]:
 def notification_location_lines(record: Mapping, *, indent: str = "") -> list[str]:
     location = notification_location(record)
     entity = location.get("entidad", "No informada en la fuente")
-    hospital = location.get("hospital", "")
-    if not hospital:
-        for field in ("unidad solicitante", "unidad de compra", "dependencia"):
-            value = location.get(field, "")
-            normalized = "".join(
-                char for char in unicodedata.normalize("NFKD", value).casefold()
-                if not unicodedata.combining(char)
-            )
-            if re.search(
-                r"\b(?:hospital|hosp|complejo hospitalario|policlinica|ulaps|capsi|"
-                r"centro de salud|instituto oncologico)\b", normalized,
-            ):
-                hospital = value
-                break
+    # Older scraper rows called this official field "unidad solicitante".
+    # Never infer the buyer from a hospital mentioned in the title/dependency.
+    unit = location.get("unidad de compra") or location.get("unidad solicitante")
     return [
         f"{indent}Entidad: {entity}",
-        f"{indent}Hospital: {hospital or 'No especificado'}",
+        f"{indent}Unidad de compra: {unit or 'No especificada en la fuente'}",
     ]

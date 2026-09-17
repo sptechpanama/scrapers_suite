@@ -25,6 +25,23 @@ ENTRY = {"titulo": "chiller", "ficha_detectada": "43358", "entidad": "Caja de Se
          "palabras_clave": "chiller", "fecha": "18-09-2026", "precio_referencia": "20000"}
 
 
+def test_partial_capture_still_delivers_valid_alerts_but_reports_partial(monkeypatch):
+    from types import SimpleNamespace
+    output='SCRAPE_COVERAGE_JSON='+json.dumps({'complete':False,'failed':1,'listed':100,'error':'página pendiente'})
+    monkeypatch.setattr(o.subprocess,'run',lambda *a,**k:SimpleNamespace(returncode=0,stdout=output,stderr=''))
+    if hasattr(o,'record_component_states'): monkeypatch.setattr(o,'record_component_states',lambda *a:None)
+    statuses=[]; delivered=[]
+    monkeypatch.setattr(o,'update_last_run',lambda job,status,**kw:statuses.append(status))
+    monkeypatch.setattr(o,'_queue_ct_rir_notifications',lambda *a:1)
+    monkeypatch.setattr(o,'_queue_rs_sp_notifications',lambda *a:0)
+    monkeypatch.setattr(o,'_queue_scan_based_notifications',lambda *a:0)
+    monkeypatch.setattr(o,'_send_pending_ct_rir_email',lambda: (delivered.append(True) or True,'',0))
+    monkeypatch.setattr(o,'_send_pending_rs_sp_email',lambda: (True,'',0))
+    job=o.JobConfig(name='clv',python='python',script='clv.py',days_of_week=['thu'],times=['08:00'])
+    assert o.run_job(job)[0]=='partial'
+    assert delivered and statuses[-1]=='partial'
+
+
 @pytest.fixture(autouse=True)
 def isolated(monkeypatch, tmp_path):
     path = tmp_path / "state.json"
@@ -38,7 +55,7 @@ def isolated(monkeypatch, tmp_path):
 def test_aliases_preserve_hospital_and_avoid_repeating_entity(alias):
     record = {"entidad": "Caja de Seguro Social", alias: HOSPITAL, "dependencia": "CSS - Sede"}
     body = "\n".join(notification_location_lines(record))
-    assert body.splitlines() == ["Entidad: Caja de Seguro Social", "Hospital: " + HOSPITAL]
+    assert body.splitlines() == ["Entidad: Caja de Seguro Social", "Unidad de compra: " + HOSPITAL]
     assert body.count(HOSPITAL) == 1
 
 
@@ -46,24 +63,25 @@ def test_no_inferred_hospital_and_no_none_or_nan_in_mail():
     record = {"entidad": "CSS", "unidad de compra": None, "hospital": float("nan"),
               "titulo": "Hospital inventado", "provincia": "Panamá"}
     body = "\n".join(notification_location_lines(record))
-    assert "Hospital: No especificado" in body
+    assert "Unidad de compra: No especificada en la fuente" in body
     assert "inventado" not in body and "nan" not in body and "None" not in body
     assert notification_location_from_row(["entidad", "hospital"], ["MINSA"]) == {"entidad": "MINSA"}
 
 
-def test_only_hospital_is_shown_below_entity():
+def test_official_buying_unit_takes_precedence():
     lines = notification_location_lines({**ENTRY, "unidad de compra": "Dirección Nacional de Compras"})
-    assert lines == ["Entidad: Caja de Seguro Social", "Hospital: " + HOSPITAL]
+    assert lines == ["Entidad: Caja de Seguro Social", "Unidad de compra: Dirección Nacional de Compras"]
 
 
 @pytest.mark.parametrize("record,expected", [
-    ({"entidad": "MINSA", "unidad solicitante": "HSMA Compras", "dependencia": "Hospital San Miguel Arcangel"}, "Hospital San Miguel Arcangel"),
-    ({"entidad": "MINSA", "unidad de compra": "MINSA Bocas del Toro - Compras", "dependencia": "Region de Salud de Bocas del Toro"}, "No especificado"),
-    ({"entidad": "MINSA", "unidad solicitante": "Departamento de Compras de Medicamentos e Insumos para la Salud"}, "No especificado"),
+    ({"entidad": "MINSA", "unidad solicitante": "HSMA Compras", "dependencia": "Hospital San Miguel Arcangel"}, "HSMA Compras"),
+    ({"entidad": "MINSA", "unidad de compra": "MINSA Bocas del Toro - Compras", "dependencia": "Region de Salud de Bocas del Toro"}, "MINSA Bocas del Toro - Compras"),
+    ({"entidad": "MINSA", "unidad solicitante": "Departamento de Compras de Medicamentos e Insumos para la Salud"}, "Departamento de Compras de Medicamentos e Insumos para la Salud"),
+    ({"entidad": "MINSA", "unidad de compra": "Escuela Berta López"}, "Escuela Berta López"),
     ({"entidad": "MINSA", "unidad de compra": "Departamento De Compras / Instituto Oncologico Nacional"}, "Departamento De Compras / Instituto Oncologico Nacional"),
 ])
-def test_department_is_not_mislabeled_as_a_hospital(record, expected):
-    assert notification_location_lines(record) == ["Entidad: MINSA", "Hospital: " + expected]
+def test_non_hospital_buying_units_are_shown(record, expected):
+    assert notification_location_lines(record) == ["Entidad: MINSA", "Unidad de compra: " + expected]
 
 
 def test_keyword_summary_preserves_official_unit():
@@ -126,8 +144,9 @@ def test_summary_to_queue_to_smtp_preserves_hospital_without_duplicates(monkeypa
     monkeypatch.setattr(o.smtplib, "SMTP_SSL", SMTP)
     assert getattr(o, "_send_pending_" + module + "_email")()[2] == 1
     body = messages[0].get_content()
-    assert "   Entidad: Caja de Seguro Social\n   Hospital: " + HOSPITAL + "\n" in body
-    assert "CSS - Sede" not in body and "Dependencia:" not in body and "Unidad de compra:" not in body
+    assert "   Entidad: Caja de Seguro Social\n   Unidad de compra: " + HOSPITAL + "\n" in body
+    assert "CSS - Sede" not in body and "Dependencia:" not in body and "   Hospital:" not in body
+    assert body.count("Unidad de compra:") == 1
     assert body.count(HOSPITAL) == 1
     assert queue("clv" if is_cl else "rir1", payload, datetime(2026, 9, 16, 18)) == 0
 
