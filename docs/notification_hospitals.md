@@ -30,3 +30,11 @@ nulos, unidades distintas, los bloques reales de resumen de CLV/CLRIR/RIR1,
 los lectores de Sheets, el recorrido resumen-cola-SMTP con transporte simulado,
 deduplicación y la unidad obtenida del detalle oficial para recordatorios.
 Las pruebas no envían correos reales.
+
+## Formato breve solicitado
+
+Los correos deben mostrar ficha/producto, entidad y hospital o unidad solicitante,
+fechas, monto y enlace al acto. Si el acto tiene varios renglones, distinguir el
+monto del acto del monto de la ficha. Omitir referencias a documentos probatorios,
+enlaces adicionales de evidencia y explicaciones de auditoría. La evidencia se
+conserva en el registro interno; no se añade al cuerpo del aviso.
