@@ -66,6 +66,7 @@ if str(REPO_ROOT) not in sys.path:
 from common.process_refresh import process_code as refresh_process_code, route_payload as refresh_route_payload
 
 from common.notification_entity import notification_location, notification_location_from_row, notification_location_lines
+from common.scrape_coverage import coverage_problem
 
 from common.keyword_watch import (  # noqa: E402
     DEFAULT_RS_SP_NEGATIVE_KEYWORDS as SHARED_RS_SP_DEFAULT_NEGATIVE_KEYWORDS,
@@ -2216,6 +2217,7 @@ def run_job(job: JobConfig, execution: Optional[ExecutionRequest] = None) -> tup
         )
         end_time = datetime.now()
         record_component_states(result.stdout or "")
+        stdout = result.stdout or ""
         if result.returncode == 0:
             logging.info("Job %s finalizo correctamente", job.name)
             if result.stdout:
@@ -2386,6 +2388,11 @@ def run_job(job: JobConfig, execution: Optional[ExecutionRequest] = None) -> tup
                     _process_otras_fuentes_notifications(job.name, stdout, end_time)
                 except Exception:  # pylint: disable=broad-except
                     logging.exception("No se pudo procesar la notificación Otras fuentes")
+            partial = coverage_problem(stdout) if job.name in {"clv", "clrir", "rir1"} else ""
+            if partial:
+                logging.warning("%s: %s", job.name, partial)
+                update_last_run(job.name, "partial", started_at=start_time, finished_at=end_time, detail=partial)
+                return "partial", partial
             update_last_run(job.name, "success", started_at=start_time, finished_at=end_time)
             return "success", ""
         else:
@@ -2751,6 +2758,11 @@ def run_job_interruptible(
                     _process_otras_fuentes_notifications(job.name, result.stdout, end_time)
                 except Exception:  # pylint: disable=broad-except
                     logging.exception("No se pudo procesar la notificación Otras fuentes")
+            partial = coverage_problem(stdout) if job.name in {"clv", "clrir", "rir1"} else ""
+            if partial:
+                logging.warning("%s: %s", job.name, partial)
+                update_last_run(job.name, "partial", started_at=start_time, finished_at=end_time, detail=partial)
+                return "partial", partial
             update_last_run(job.name, "success", started_at=start_time, finished_at=end_time)
             return "success", ""
 

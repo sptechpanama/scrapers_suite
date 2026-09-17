@@ -45,6 +45,7 @@ from process_refresh import process_code, refresh_google_sheets
 PURGE_PROTECTED_CODES = set()
 
 from notification_entity import notification_location_from_row
+from scrape_coverage import collect_listing, recover_listing, DetailCoverage, verify_detail, technical_discard
 
 from keyword_watch import (
     DEFAULT_RS_SP_NEGATIVE_KEYWORDS,
@@ -1104,7 +1105,7 @@ def main():
 
     _, all_links = read_links_from_sheets(CFG["sheets_data"])
     desc_vals = gs_get(f"{CFG['sheet_desc']}!A1:ZZ")
-    descartes = {r[find_idx(desc_vals[0], 'enlace')].strip() for r in desc_vals[1:]} if desc_vals and find_idx(desc_vals[0], 'enlace') is not None else set()
+    descartes = {r[find_idx(desc_vals[0], 'enlace')].strip() for r in desc_vals[1:] if not technical_discard(r)} if desc_vals and find_idx(desc_vals[0], 'enlace') is not None else set()
 
     from selenium.common.exceptions import WebDriverException
     driver = start_browser()
@@ -1144,47 +1145,11 @@ def main():
     time.sleep(0.3)
     PT.close_popup()
 
-    WebDriverWait(driver, 30).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, CFG["css_links"])))
-
-    links, seen = [], set()
-
-    while True:
-        PT.close_popup()
-        WebDriverWait(driver, 20).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, CFG["css_links"])))
-        urls = [u for u in PT.collect_links() if u]
-        added = 0
-        for u in urls:
-            if u not in seen:
-                seen.add(u); links.append(u); added += 1
-        x, y = PT.page_xy()
-        LOG("PAGE", f"+{added} | total={len(links)} | pag={x}/{y}" if x and y else f"+{added} | total={len(links)}")
-
-        last = bool(x and y and x >= y)
-        next_disabled = False
-        if not last:
-            tbody_old = PT.tbody_ref()
-            PT.close_popup()
-            if not PT.click_next():
-                next_disabled = True
-            else:
-                try:
-                    if tbody_old is not None:
-                        WebDriverWait(driver, 15).until(EC.staleness_of(tbody_old))
-                    else:
-                        WebDriverWait(driver, 15).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, CFG["css_links"])))
-                except:
-                    time.sleep(1.0)
-
-        if last or next_disabled:
-            WebDriverWait(driver, 10).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, CFG["css_links"])))
-            urls = [u for u in PT.collect_links() if u]
-            add2 = 0
-            for u in urls:
-                if u not in seen:
-                    seen.add(u); links.append(u); add2 += 1
-            LOG("PAGE", f"captura final: +{add2} | total={len(links)}")
-            LOG("PAGE", "fin de paginación")
-            break
+    listing = collect_listing(PT, CFG["css_links"], LOG, expected_state="Vigente")
+    listing = recover_listing(listing, PT, "rir1", LOG, normalize_url=normalize_url)
+    links = listing["links"]
+    listing_complete = listing["complete"]
+    coverage = DetailCoverage(DATA_DIR / "scrape_coverage", "rir1", listing)
 
     LOG("DONE", f"enlaces extraídos={len(links)}")
     refresh_known_processes(links)
@@ -1242,6 +1207,7 @@ def main():
         for sh in ['ap_sin_requisitos','ap_sin_ficha','ap_con_ct',CFG["sheet_ct_rir"]]:
             reset_checkboxes(sh)
 
+        coverage.finish()
         LOG("DONE", "sin nuevos; mantenimiento completo")
         return
 
@@ -1257,15 +1223,15 @@ def main():
         for attempt in range(1, max_attempts + 1):
             t0 = time.time()
             try:
-                info = scrape(PT, link)
+                candidate = scrape(PT, link)
+                verify_detail(driver, link, candidate)
+                info = candidate
+                coverage.success(link)
                 LOG("SCRAPE", f"ok ({time.time()-t0:.1f}s)")
                 break
-            except TimeoutException:
-                # Si no aparecen los XPaths, no insistimos para evitar quedarnos pegados.
-                LOG("SCRAPE", f"timeout (intento {attempt}/{max_attempts}) - salto rapido")
-                break
             except Exception as exc:
-                LOG("SCRAPE", f"error {type(exc).__name__} (intento {attempt}/{max_attempts})")
+                coverage.failure(link, f"{type(exc).__name__}: {exc}")
+                LOG("SCRAPE", f"{type(exc).__name__} (intento {attempt}/{max_attempts}); pendiente de reintento")
             try:
                 driver.execute_script("window.stop();")
             except Exception:
@@ -1273,12 +1239,7 @@ def main():
             if attempt < max_attempts:
                 driver, PT = _restart_scrape_driver(driver)
         if info is None:
-            # Se marca como descarte tecnico para no volver a trabarse con el mismo enlace.
-            try:
-                gs_append(CFG["sheet_desc"], [[link, "skip_timeout_xpath"]])
-            except Exception:
-                pass
-            LOG("SCRAPE", "falló el enlace tras reintentos; salto definitivo")
+            LOG("SCRAPE", "detalle pendiente guardado; no se descarta el acto")
             continue
 
         # Descarte por precio/RS/med
@@ -1499,6 +1460,8 @@ def main():
             "truncated": truncated,
         }
         print("RS_SP_SUMMARY_JSON=" + json.dumps(payload, ensure_ascii=False), flush=True)
+
+    coverage.finish()
 
     LOG("DONE", f"CT={len(datos_ct)} | SinReq={len(datos_sr)} | SinFicha={len(datos_sf)} | CT_RIR={len(datos_ct_rir)} | Ignorados_RS={len(datos_rs)}")
 
