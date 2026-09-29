@@ -13,3 +13,4 @@ data/otras_fuentes/*.db*
 
 orquestador/config.last_good.json
 orquestador/.config.last_good.json.*.tmp
+orquestador/anestesia_docs.local.json
