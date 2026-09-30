@@ -146,6 +146,23 @@ def test_existing_ap_keys_are_unchanged(state):
     assert o._build_ct_rir_unique_key(entry) == "ap_ct_rir|https://example.test/acto"
 
 
+@pytest.mark.parametrize('sheet', ['cl_abiertas_419_sfd','cl_prog_419_sfd','ap_419_sfd'])
+def test_419_recovery_requires_watched_ficha_and_respects_discard(state, monkeypatch, sheet):
+    assert sheet in o.PANAMACOMPRA_CT_RIR_SCAN_SHEETS
+    monkeypatch.setattr(o, '_load_ct_rir_fichas_for_notifications', lambda: {'43358'})
+    if hasattr(o, '_ct_rir_semantic_anchor_tokens'):
+        monkeypatch.setattr(o, '_ct_rir_semantic_anchor_tokens', lambda *a: set())
+    def read(name):
+        if name != sheet: return []
+        return [['titulo','ficha_detectada','enlace','Descartar'],
+                ['Producto vigilado','43358',URL,''],
+                ['Sin producto coincidente','No Detectada',URL.replace('041711','041712'),''],
+                ['Descartado por el usuario','43358',URL.replace('041711','041713'),'TRUE']]
+    monkeypatch.setattr(o, '_read_panamacompra_sheet', read)
+    rows = o._scan_ct_rir_candidates()
+    assert len(rows) == 1 and rows[0]['enlace'] == URL
+
+
 def test_scanning_job_does_not_imply_stage_for_other_sources():
     assert o.cl_stage({"job": "clv", "enlace": URL}) == ""
     assert o.cl_stage({"job": "clv", "hoja_origen": "ap_sin_ficha"}) == ""

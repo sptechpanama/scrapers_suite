@@ -256,6 +256,9 @@ PANAMACOMPRA_CT_RIR_SCAN_SHEETS = [
     "ap_sin_requisitos",
     "ap_con_ct",
     "ap_ct_rir",
+    "cl_abiertas_419_sfd",
+    "cl_prog_419_sfd",
+    "ap_419_sfd",
 ]
 PANAMACOMPRA_RS_SP_SCAN_SHEETS = [
     "cl_abiertas",
