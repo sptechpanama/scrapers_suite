@@ -228,7 +228,7 @@ JOB_LABEL_TITLES = {
 }
 
 CT_RIR_EMAIL_DEFAULT_FROM = "rjsp100493@gmail.com"
-CT_RIR_EMAIL_DEFAULT_TO = ["soporte@sptech.com", "rjsp100493@gmail.com"]
+CT_RIR_EMAIL_DEFAULT_TO = ["rjsp100493@gmail.com"]
 RS_SP_EMAIL_DEFAULT_FROM = "rjsp100493@gmail.com"
 RS_SP_EMAIL_DEFAULT_TO = ["rjsp100493@gmail.com"]
 PANAMACOMPRA_SPREADSHEET_ID = os.environ.get(
