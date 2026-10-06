@@ -239,6 +239,20 @@ def pc_analytics_command() -> list[str]:
     ]
 
 
+def refresh_rotation_from_existing_data() -> None:
+    script = pc_analytics_builder().parents[1] / "scripts" / "update_ct_rotation.py"
+    if not script.is_file():
+        print("[ROTACION] Publicador no instalado; se conserva el histórico anterior.", flush=True)
+        return
+    command = [str(PYTHON_EXE), str(script), "--scrapers-root", str(REPO_ROOT)]
+    try:
+        result = _run(command)
+        if result:
+            print("[ROTACION] No se pudo publicar los datos extraídos; se conserva el histórico anterior.", flush=True)
+    except Exception as exc:
+        print(f"[ROTACION] Publicación pendiente: {type(exc).__name__}: {exc}", flush=True)
+
+
 def _local_detail(metadata: dict[str, str], mode: str) -> str:
     fields = [
         f"modo={mode}",
@@ -409,6 +423,8 @@ def run_pipeline(mode: str) -> int:
         analytics_finished,
         _analytics_detail(analytics_metadata, pc_analytics_metadata, mode),
     )
+    if analytics_returncode == 0:
+        refresh_rotation_from_existing_data()
     return analytics_returncode or pc_analytics_returncode
 
 

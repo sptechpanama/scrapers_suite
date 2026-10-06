@@ -98,3 +98,52 @@ def test_current_local_success_survives_postgres_failure():
     assert runner.call_count == 1
     assert [(c.args[0],c.args[1]) for c in emit.call_args_list] == [
         ("db_local", "success"), ("supabase_operational", "error"), ("analytics", "blocked")]
+
+
+def test_rotation_only_runs_the_publisher_with_existing_scraper_root(tmp_path):
+    builder = tmp_path / "scripts/build_inteligencia_pc.py"
+    publisher = builder.with_name("update_ct_rotation.py")
+    publisher.parent.mkdir()
+    publisher.touch()
+    with mock.patch.object(pipeline, "pc_analytics_builder", return_value=builder), \
+         mock.patch.object(pipeline, "_run", return_value=0) as runner:
+        pipeline.refresh_rotation_from_existing_data()
+    runner.assert_called_once_with([
+        str(pipeline.PYTHON_EXE), str(publisher), "--scrapers-root", str(pipeline.REPO_ROOT),
+    ])
+
+
+def test_rotation_failure_does_not_change_operational_pipeline_result(tmp_path, capsys):
+    builder = tmp_path / "scripts/build_inteligencia_pc.py"
+    publisher = builder.with_name("update_ct_rotation.py")
+    publisher.parent.mkdir()
+    publisher.touch()
+    with mock.patch.object(pipeline, "pc_analytics_builder", return_value=builder), \
+         mock.patch.object(pipeline, "_run", side_effect=OSError("Sheets temporalmente no disponible")):
+        pipeline.refresh_rotation_from_existing_data()
+    assert "Publicación pendiente" in capsys.readouterr().out
+
+
+def test_missing_rotation_publisher_does_not_execute_any_process(tmp_path):
+    with mock.patch.object(pipeline, "pc_analytics_builder", return_value=tmp_path / "scripts/build_inteligencia_pc.py"), \
+         mock.patch.object(pipeline, "_run") as runner:
+        pipeline.refresh_rotation_from_existing_data()
+    runner.assert_not_called()
+
+
+def test_rotation_is_published_after_normal_medical_analytics_only():
+    from datetime import datetime
+
+    for medical_result in (0, 1):
+        metadata = {"last_run_started_at": datetime.now().isoformat(), "last_local_update_status": "success", "last_postgres_sync_status": "success"}
+        with mock.patch.dict(os.environ, {"SUPABASE_DB_URL": "test-only"}), \
+             mock.patch.object(pipeline, "validate_pc_builder"), \
+             mock.patch.object(pipeline, "_run", side_effect=[0, medical_result, 0]) as runner, \
+             mock.patch.object(pipeline, "read_metadata", return_value=metadata), \
+             mock.patch.object(pipeline, "read_analytics_metadata", return_value={}), \
+             mock.patch.object(pipeline, "read_pc_analytics_metadata", return_value={}), \
+             mock.patch.object(pipeline, "emit_component"), \
+             mock.patch.object(pipeline, "refresh_rotation_from_existing_data") as refresh:
+            assert pipeline.run_pipeline("incremental") == medical_result
+        assert runner.call_count == 3
+        assert refresh.call_count == (1 if medical_result == 0 else 0)
