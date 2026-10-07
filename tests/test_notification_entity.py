@@ -49,6 +49,8 @@ def isolated(monkeypatch, tmp_path):
     monkeypatch.setattr(o, "STATE_PATH", path)
     monkeypatch.setattr(o.smtplib, "SMTP_SSL", lambda *a, **k: pytest.fail("Unexpected real SMTP"))
     monkeypatch.setattr(o, "_read_panamacompra_sheet", lambda *a: pytest.fail("Unexpected Sheets read"))
+    monkeypatch.setattr(o, "load_ficha_names", lambda *a: {"43358": "KIT DE CIRCUITO DE PACIENTE PARA MÁQUINA DE ANESTESIA"})
+    monkeypatch.setattr(o, "_load_ct_rir_fichas_for_notifications", lambda: {"43358"})
 
 
 @pytest.mark.parametrize("alias", ["unidad solicitante", "unidad_solicitante", "UNIDAD DE COMPRA", "nombreUnidadCompra", "unidad_solic"])
@@ -149,6 +151,43 @@ def test_summary_to_queue_to_smtp_preserves_hospital_without_duplicates(monkeypa
     assert body.count("Unidad de compra:") == 1
     assert body.count(HOSPITAL) == 1
     assert queue("clv" if is_cl else "rir1", payload, datetime(2026, 9, 16, 18)) == 0
+
+
+@pytest.mark.parametrize("sheet", ["ap_ct_rir", "cl_prog_ct_rir", "cl_abiertas_ct_rir"])
+@pytest.mark.parametrize("label", ["104747", "* 107861", "* 22241, * 101414", "987654"])
+def test_ct_email_inserts_only_ficha_name_before_stage_or_title(monkeypatch, sheet, label):
+    mapping = {"104747": "RESPIRADOR FACIAL", "107861": "HUMIDIFICADOR DE ALTO FLUJO", "22241": "TUBO CON BALÓN", "101414": "TUBO CÓNICO"}
+    monkeypatch.setattr(o, "load_ficha_names", lambda *a: mapping)
+    monkeypatch.setattr(o, "_load_ct_rir_fichas_for_notifications", lambda: set(mapping) | {"987654"})
+    monkeypatch.setattr(o, "_ct_rir_email_config", lambda: ("sender@example.test", "password", ["recipient@example.test"]))
+    entry = {**ENTRY, "ficha_detectada": label, "hoja_origen": sheet, "unique_key": "already-queued", "enlace": "https://example.test/2026-1-10-01-08-CL-050001/token"}
+    o.save_state({"ct_rir_email_pending": [entry]})
+    messages = []
+    class SMTP:
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def login(self, *args): pass
+        def send_message(self, message): messages.append(message); return {}
+    monkeypatch.setattr(o.smtplib, "SMTP_SSL", SMTP)
+    assert o._send_pending_ct_rir_email()[2] == 1
+    body = messages[0].get_content()
+    addition = "   Nombre de la ficha detectada: " + o.format_ficha_names(label, mapping)
+    lines = body.splitlines()
+    index = lines.index("1. Ficha: " + label)
+    assert lines[index + 1] == addition
+    following = "   Etapa:" if sheet.startswith("cl_") else "   Titulo:"
+    assert lines[index + 2].startswith(following)
+    assert body.count("Nombre de la ficha detectada:") == 1
+    assert "   Entidad: Caja de Seguro Social\n   Unidad de compra: " + HOSPITAL in body
+    assert "   Fecha: " + entry["fecha"] in body
+    assert "   Precio: " + entry["precio_referencia"] in body
+    assert "   Enlace: " + entry["enlace"] in body
+    assert messages[0]["To"] == "recipient@example.test"
+    state = o.load_state()
+    assert "already-queued" in state["ct_rir_email_sent_keys"]
+    assert state["ct_rir_email_pending"] == []
+    assert o._send_pending_ct_rir_email()[2] == 0
 
 
 def test_reminder_enriches_hospital_from_fresh_official_detail(monkeypatch):

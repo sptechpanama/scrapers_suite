@@ -28,6 +28,8 @@ def state(monkeypatch, tmp_path):
     # Accidental transport calls make these tests fail, never send real mail.
     monkeypatch.setattr(o.smtplib, "SMTP_SSL", lambda *a, **k: pytest.fail("unexpected SMTP"))
     monkeypatch.setattr(o, "_read_panamacompra_sheet", lambda *a: pytest.fail("unexpected Sheets read"))
+    monkeypatch.setattr(o, "_load_ct_rir_fichas_for_notifications", lambda: {"43358"})
+    monkeypatch.setattr(o, "load_ficha_names", lambda *a: {"43358": "KIT DE CIRCUITO PARA ANESTESIA"})
     return path
 
 

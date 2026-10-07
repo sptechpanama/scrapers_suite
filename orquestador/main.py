@@ -66,6 +66,7 @@ if str(REPO_ROOT) not in sys.path:
 from common.process_refresh import process_code as refresh_process_code, route_payload as refresh_route_payload
 
 from common.notification_entity import notification_location, notification_location_from_row, notification_location_lines
+from common.ficha_email import format_ficha_names, load_ficha_names
 from common.scrape_coverage import coverage_problem
 
 from common.keyword_watch import (  # noqa: E402
@@ -1237,6 +1238,12 @@ def _send_pending_ct_rir_email() -> tuple[bool, str, int]:
     if not ordered_entries:
         return True, "", 0
 
+    ficha_names = load_ficha_names(REPO_ROOT)
+    try:
+        tracked_fichas = _load_ct_rir_fichas_for_notifications()
+    except Exception as exc:
+        logging.warning("No se pudo confirmar la lista RIR para mostrar el nombre: %s", exc)
+        tracked_fichas = None
     lines: list[str] = []
     lines.append("Se detectaron nuevos actos en Criterios Tecnicos RIR.")
     lines.append("")
@@ -1249,6 +1256,8 @@ def _send_pending_ct_rir_email() -> tuple[bool, str, int]:
         lines.append(f"[{sheet_name}] {len(entries)} acto(s)")
         for idx, entry in enumerate(entries, start=1):
             lines.append(f"{idx}. Ficha: {entry.get('ficha_detectada', '') or 'No Detectada'}")
+            name = format_ficha_names(entry.get("ficha_detectada"), ficha_names, tracked_codes=tracked_fichas) if tracked_fichas is not None else "No fue posible verificar la ficha que activó RIR"
+            lines.append(f"   Nombre de la ficha detectada: {name}")
             if cl_stage(entry):
                 lines.append(f"   Etapa: CL {cl_stage(entry)}")
             lines.append(f"   Titulo: {entry.get('titulo', '')}")
