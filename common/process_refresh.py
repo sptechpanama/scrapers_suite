@@ -85,7 +85,7 @@ def parse_official_detail(data, url):
     return values
 
 
-def fetch_official_detail(url, *, attempts=3, sleeper=time.sleep):
+def fetch_official_detail(url, *, attempts=3, sleeper=time.sleep, read_timeout=25):
     flow, process_type = route_payload(url)
     error = None
     with requests.Session() as session:
@@ -94,7 +94,7 @@ def fetch_official_detail(url, *, attempts=3, sleeper=time.sleep):
             try:
                 response = session.get(
                     f"{API_ROOT}/procesos-configuracion/pagina-componentes-publico/{process_type}/procesoVistaPliego/{flow}",
-                    timeout=(8, 25),
+                    timeout=(8, read_timeout),
                 )
                 response.raise_for_status()
                 data = response.json()
@@ -102,7 +102,7 @@ def fetch_official_detail(url, *, attempts=3, sleeper=time.sleep):
                     response = session.post(
                         f"{API_ROOT}/ps/documentos-proceso/pliego-general/publico/get-page",
                         json={"idTipoProceso": process_type, "idProcesosContratacionFlujos": flow},
-                        timeout=(8, 25),
+                        timeout=(8, read_timeout),
                     )
                     response.raise_for_status()
                     data = response.json()
@@ -139,7 +139,7 @@ def _rows(snapshot):
 
 
 def refresh_processes(*, listing_links, read_sheets, write_cells, checkpoint_path,
-                      fetch=fetch_official_detail, now=None, force=False, workers=3):
+                      fetch=fetch_official_detail, now=None, force=False, workers=3, time_budget=None):
     """read_sheets returns a fresh snapshot. write_cells applies only named cells.
 
     The latest listing URL is authoritative. Same-version acts are checked daily,
@@ -182,8 +182,11 @@ def refresh_processes(*, listing_links, read_sheets, write_cells, checkpoint_pat
         if force or not same_version or previous.get("url") != latest or age >= interval:
             selected[code] = latest
     report = {"checked": 0, "changed": [], "failed": {}, "protected_codes": protected}
+    deadline = time.monotonic() + time_budget if time_budget is not None else None
     def get(pair):
         code, url = pair
+        if deadline is not None and time.monotonic() >= deadline:
+            return code, None, 'Tiempo de actualización agotado; reintentar próxima corrida'
         try:
             return code, fetch(url), ""
         except Exception as exc:
@@ -258,7 +261,8 @@ def refresh_processes(*, listing_links, read_sheets, write_cells, checkpoint_pat
     return report
 
 
-def refresh_google_sheets(service, spreadsheet_id, sheet_names, listing_links, checkpoint_path, *, force=False):
+def refresh_google_sheets(service, spreadsheet_id, sheet_names, listing_links, checkpoint_path, *, force=False,
+                         read_timeout=25, time_budget=None):
     names = list(dict.fromkeys(sheet_names))
     def read():
         response = service.spreadsheets().values().batchGet(
@@ -269,5 +273,9 @@ def refresh_google_sheets(service, spreadsheet_id, sheet_names, listing_links, c
         service.spreadsheets().values().batchUpdate(
             spreadsheetId=spreadsheet_id, body={'valueInputOption':'RAW', 'data':data},
         ).execute(num_retries=3)
+    def fetch(url):
+        return fetch_official_detail(url, read_timeout=read_timeout,
+                                     attempts=1 if time_budget is not None else 3)
     return refresh_processes(listing_links=listing_links, read_sheets=read, write_cells=write,
-                             checkpoint_path=checkpoint_path, force=force)
+                             checkpoint_path=checkpoint_path, force=force, fetch=fetch,
+                             time_budget=time_budget)

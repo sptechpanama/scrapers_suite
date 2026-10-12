@@ -46,7 +46,7 @@ from process_refresh import process_code, refresh_google_sheets
 PURGE_PROTECTED_CODES = set()
 
 from notification_entity import notification_location_from_row
-from scrape_coverage import collect_listing, recover_listing, DetailCoverage, verify_detail, technical_discard
+from scrape_coverage import collect_listing, recover_listing, DetailCoverage, verify_detail, technical_discard, wait_open_detail, fetch_open_detail
 
 from keyword_watch import (
     DEFAULT_RS_SP_NEGATIVE_KEYWORDS,
@@ -974,42 +974,44 @@ def _first_text_by_xpaths(driver, xps, default="No Disponible"):
 def scrape(page: PageTools, link: str):
     xp = CFG["xpath_map"]
     try:
-        page.d.get(link)
-    except TimeoutException:
+        detail = fetch_open_detail(link)
+    except Exception as exc:
+        LOG("API", f"Detalle pendiente; respaldo navegador: {type(exc).__name__}")
         try:
-            page.d.execute_script("window.stop();")
-        except Exception:
-            pass
-        raise
-    try:
-        page.d.refresh()
-    except TimeoutException:
-        try:
-            page.d.execute_script("window.stop();")
-        except Exception:
-            pass
-        raise
-    # Espera a que aparezca el precio (cualquier variante)
-    WebDriverWait(page.d, 25).until(
-        EC.presence_of_element_located((By.XPATH, xp["precio"][0]))
-    )
+            page.d.get(link)
+        except TimeoutException:
+            try:
+                page.d.execute_script("window.stop();")
+            except Exception:
+                pass
+            raise
+        wait_open_detail(page.d, link, xp["precio"], xp["items"])
+        detail = {
+            "titulo": _first_text_by_xpaths(page.d, xp["titulo"]),
+            "precio_referencia": _first_text_by_xpaths(page.d, xp["precio"]),
+            "fecha": _first_text_by_xpaths(page.d, xp["fecha"]),
+            "entidad": _first_text_by_xpaths(page.d, xp["entidad"]),
+            "unidad solicitante": _first_text_by_xpaths(page.d, xp["unidad"], default=""),
+            "termino_entrega": _first_text_by_xpaths(page.d, xp["termino"]),
+            "descripcion": _first_text_by_xpaths(page.d, xp["desc"]),
+            "publicacion": _first_text_by_xpaths(page.d, xp["pub"]),
+            "items": [],
+        }
+        for xpath in xp["items"]:
+            elements = page.d.find_elements(By.XPATH, xpath)
+            if elements:
+                detail["items"] = [element.text.strip() for element in elements]
+                break
 
-    titulo  = _first_text_by_xpaths(page.d, xp["titulo"])
-    precio  = _first_text_by_xpaths(page.d, xp["precio"])
-    fecha   = _first_text_by_xpaths(page.d, xp["fecha"])
-    entidad = _first_text_by_xpaths(page.d, xp["entidad"])
-    unidad  = _first_text_by_xpaths(page.d, xp["unidad"], default="")
-    termino = _first_text_by_xpaths(page.d, xp["termino"])
-    desc    = _first_text_by_xpaths(page.d, xp["desc"])
-    pub     = _first_text_by_xpaths(page.d, xp["pub"])
-
-    # Ítems: lista de descripciones por fila
-    items = []
-    for xpath in (xp["items"] if isinstance(xp["items"], list) else [xp["items"]]):
-        els = page.d.find_elements(By.XPATH, xpath)
-        if els:
-            items = [e.text.strip() for e in els]
-            break
+    titulo = detail["titulo"]
+    precio = detail["precio_referencia"]
+    fecha = detail["fecha"]
+    entidad = detail["entidad"]
+    unidad = detail["unidad solicitante"]
+    termino = detail["termino_entrega"]
+    desc = detail["descripcion"]
+    pub = detail["publicacion"]
+    items = detail["items"]
 
     publ = (pub.split(' -')[0]) if pub != "No Disponible" else pub
     mix = " ".join([titulo, desc] + items)
@@ -1034,6 +1036,7 @@ def scrape(page: PageTools, link: str):
     fd_rs = next((code for code in fichas_base_ordered if code in FICHAS_CON_RS), None)
 
     return {
+        "_verified_process_number": detail.get("_verified_process_number", ""),
         "publicacion": publ,
         "enlace": link,
         "titulo": titulo,
@@ -1065,6 +1068,8 @@ def refresh_known_processes(links):
         result = refresh_google_sheets(
             GSVC, SSID, sheets, links,
             DATA_DIR / "process_refresh" / "clv.json",
+            read_timeout=60,
+            time_budget=120,
         )
         PURGE_PROTECTED_CODES = result["protected_codes"]
         for change in result["changed"]:
@@ -1132,7 +1137,10 @@ def main():
 
     LOG("DONE", f"enlaces extraídos={len(links)}")
     refresh_known_processes(links)
-    purge_all()
+    if listing_complete:
+        purge_all()
+    else:
+        LOG("COVERAGE", "Listado parcial: se conserva el histórico y se pospone la verificación de cierres")
     _, all_links = read_links_from_sheets(CFG["sheets_data"])
     try: driver.quit()
     except: pass
@@ -1161,7 +1169,14 @@ def main():
     driver = start_browser()
     PT = PageTools(driver)
     datos_ct, datos_sr, datos_sf, datos_rs, datos_ct_rir = [], [], [], [], []
-    for key in nuevos:
+    consecutive_failures = 0
+    detail_deadline = time.monotonic() + 600
+    for position, key in enumerate(nuevos):
+        if consecutive_failures >= 3 or time.monotonic() >= detail_deadline:
+            reason = "Portal sin detalles verificables o tiempo de captura agotado; reintentar próxima corrida"
+            coverage.defer_remaining([map_key_raw[value] for value in nuevos[position:]], reason)
+            LOG("COVERAGE", reason)
+            break
         link = map_key_raw[key]
         LOG("SCRAPE", link)
         info = None
@@ -1185,8 +1200,10 @@ def main():
             if attempt < max_attempts:
                 driver, PT = _restart_scrape_driver(driver)
         if info is None:
+            consecutive_failures += 1
             LOG("SCRAPE", "detalle pendiente guardado; no se descarta el acto")
             continue
+        consecutive_failures = 0
 
         # Descarte por precio/RS/med
         desc, mot = want_descartar(info)

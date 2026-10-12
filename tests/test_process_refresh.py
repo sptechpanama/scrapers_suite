@@ -25,8 +25,10 @@ def test_each_scraper_refreshes_before_purge_and_invalidates_sheet_caches(job, t
     assert all(line > refresh_line for line, name in calls if name in ('purge_all', 'purge_by_fecha'))
     assert not any(name == 'update_fechas_sheet' for _, name in calls)
     observed = []
-    def refresh(*args):
+    def refresh(*args, **kwargs):
         observed.append(args)
+        if job == 'clv':
+            assert kwargs == {'read_timeout': 60, 'time_budget': 120}
         return {'protected_codes': {CODE}, 'changed': [], 'failed': {CODE: 'Timeout'}, 'checked': 0}
     namespace = {'CFG': {'sheets_data': ['source', 'priority'], 'sheet_ct_rir': 'ct_rir'},
         'GSVC': object(), 'SSID': 'test', 'DATA_DIR': tmp_path, 'process_code': process_code,
@@ -122,6 +124,19 @@ def test_invalid_official_data_keeps_rows_and_retries(tmp_path,payload):
     result=run(grid,tmp_path,fetch=lambda u:parse_official_detail(payload,u))
     assert CODE in result['protected_codes'] and CODE in result['failed']
     assert grid.read()==before and not grid.writes
+    assert not (tmp_path/'refresh.json').exists()
+
+
+def test_refresh_budget_preserves_rows_and_leaves_safe_retry(tmp_path):
+    grid = Sheets()
+    before = grid.read()
+    result = refresh_processes(
+        listing_links=[url(1037777)], read_sheets=grid.read, write_cells=grid.write,
+        checkpoint_path=tmp_path/'refresh.json', time_budget=0,
+        fetch=lambda link: pytest.fail('No request after the refresh budget'),
+    )
+    assert CODE in result['protected_codes'] and CODE in result['failed']
+    assert grid.read() == before and not grid.writes
     assert not (tmp_path/'refresh.json').exists()
 
 

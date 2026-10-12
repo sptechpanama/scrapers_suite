@@ -165,10 +165,10 @@ def test_every_production_job_uses_verified_listing_and_details(job):
     assert 'skip_timeout_xpath' not in ast.unparse(main)
 
 
-def api_response(records, size=5000, status=1):
+def api_response(records, size=5000, status=1, cursor=None):
     class Response:
         def raise_for_status(self): pass
-        def json(self): return {'status':status,'result':{'registros':records,'registrosPorPagina':size}}
+        def json(self): return {'status':status,'result':{'registros':records,'registrosPorPagina':size,'valorInicial':cursor}}
     return Response()
 
 
@@ -204,6 +204,205 @@ def test_api_recovery_updates_modalities_and_removes_stale_state_links():
     r=c.recover_listing({'links':[url(2)],'pages':[],'complete':False,'error':'UI bloqueada'},page,'clv',lambda *a:None,request=lambda *a,**kw:api_response([api_record(1)]))
     assert r['complete'] and len(r['links'])==1 and c.process_key(r['links'][0])==c.process_key(url(1))
     assert page.adjudication_by_url[r['links'][0]]=='Global'
+
+
+def test_open_api_uses_small_batches_and_follows_cursor_until_empty():
+    from types import SimpleNamespace
+    calls = []
+    responses = iter([
+        api_response([api_record(1), api_record(2)], size=2, cursor='first'),
+        api_response([api_record(3), api_record(4)], size=2, cursor='second'),
+        api_response([], size=2),
+    ])
+    def request(endpoint, json, timeout):
+        calls.append(dict(json))
+        return next(responses)
+    result = c.recover_listing({'links': [], 'pages': [], 'complete': False, 'error': 'UI'},
+                              SimpleNamespace(), 'clv', lambda *args: None, request=request)
+    assert result['complete'] and len(result['links']) == 4
+    assert [payload['valorSiguiente'] for payload in calls] == ['', 'first', 'second']
+    assert all(payload['registrosPorPagina'] == 50 for payload in calls)
+
+
+def test_open_cursor_failure_preserves_all_successful_batches():
+    from types import SimpleNamespace
+    calls = []
+    def request(endpoint, json, timeout):
+        calls.append(dict(json))
+        if len(calls) == 1:
+            return api_response([api_record(1), api_record(2)], size=2, cursor='first')
+        return api_response([], status=0)
+    result = c.recover_listing({'links': [url(3)], 'pages': [], 'complete': False, 'error': 'UI'},
+                              SimpleNamespace(), 'clv', lambda *args: None, request=request)
+    assert not result['complete']
+    assert {c.process_key(link) for link in result['links']} == {c.process_key(url(number)) for number in (1, 2, 3)}
+    assert len(calls) == 7
+    assert calls[1]['valorSiguiente'] == calls[2]['valorSiguiente'] == calls[3]['valorSiguiente'] == 'first'
+
+
+def test_open_cursor_duplicate_versions_keep_latest_official_route():
+    from types import SimpleNamespace
+    older, newer = api_record(1), api_record(1)
+    newer['idProcesosContratacionFlujos'] = 99
+    responses = iter([
+        api_response([newer, api_record(2)], size=2, cursor='first'),
+        api_response([older], size=2),
+    ])
+    result = c.recover_listing({'links': [], 'pages': [], 'complete': False, 'error': 'UI'},
+                              SimpleNamespace(), 'clv', lambda *args: None,
+                              request=lambda *args, **kwargs: next(responses))
+    from common.process_refresh import route_payload
+    assert result['complete'] and len(result['links']) == 2
+    assert route_payload(result['links'][0])[0] == 99
+
+
+def test_full_api_batch_from_another_state_is_not_accepted():
+    from types import SimpleNamespace
+    wrong = api_record(1)
+    wrong['idEstado'] = 15
+    result = c.recover_listing({'links': [url(2)], 'pages': [], 'complete': False, 'error': 'UI'},
+                              SimpleNamespace(), 'clv', lambda *args: None,
+                              request=lambda *args, **kwargs: api_response([wrong], size=1))
+    assert not result['complete'] and result['links'] == [url(2)]
+
+
+def test_deferred_details_survive_restart_without_fake_attempts(tmp_path, capsys):
+    listing = {'links': [url(1), url(2)], 'pages': [], 'complete': True, 'error': ''}
+    coverage = c.DetailCoverage(tmp_path, 'clv', listing)
+    coverage.failure(url(1), 'timeout')
+    coverage.defer_remaining(listing['links'], 'Fuente temporalmente caída')
+    restarted = c.DetailCoverage(tmp_path, 'clv', listing)
+    assert restarted.pending[c.process_key(url(1))]['attempts'] == 1
+    assert restarted.pending[c.process_key(url(2))]['attempts'] == 0
+    coverage.finish()
+    assert '2 detalles pendientes' in c.coverage_problem(capsys.readouterr().out)
+
+
+def test_open_detail_waits_for_slow_server_all_price_variants_and_items():
+    from types import SimpleNamespace
+    from selenium.common.exceptions import StaleElementReferenceException
+    started = c.time.monotonic()
+    class Driver:
+        stale = True
+        def execute_script(self, *args):
+            return c.process_key(url(1)) if c.time.monotonic() - started >= 32 else 'Cargando...'
+        def find_elements(self, by, xpath):
+            if self.stale:
+                self.stale = False
+                raise StaleElementReferenceException()
+            return [SimpleNamespace(text='B/. 1,500.00' if xpath == 'fallback-price' else 'Ficha técnica: 43358')] if xpath != 'first-price' else []
+    c.wait_open_detail(Driver(), url(1), ['first-price', 'fallback-price'], ['items'])
+    assert 32 <= c.time.monotonic() - started < 60
+
+
+@pytest.mark.parametrize('body,items', [(c.process_key(url(2)), True), (c.process_key(url(1)), False)])
+def test_open_detail_does_not_accept_wrong_act_or_missing_items(body, items):
+    from types import SimpleNamespace
+    from selenium.common.exceptions import TimeoutException
+    class Driver:
+        def execute_script(self, *args): return body
+        def find_elements(self, by, xpath):
+            return [SimpleNamespace(text='10.00')] if xpath == 'price' or items else []
+    with pytest.raises(TimeoutException):
+        c.wait_open_detail(Driver(), url(1), ['price'], ['items'], timeout=2)
+
+
+def test_open_scraper_does_not_refresh_and_defers_on_persistent_failure():
+    path = Path(__file__).resolve().parents[1] / 'clv' / 'clv.py'
+    tree = ast.parse(path.read_text(encoding='utf-8'))
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+    assert not any(isinstance(node, ast.Attribute) and node.attr == 'refresh' for node in ast.walk(functions['scrape']))
+    assert any(isinstance(node, ast.Name) and node.id == 'wait_open_detail' for node in ast.walk(functions['scrape']))
+    assert any(isinstance(node, ast.Attribute) and node.attr == 'defer_remaining' for node in ast.walk(functions['main']))
+
+
+def open_detail_url():
+    token = c.base64.b64encode(b'{"i":1,"tp":2}').decode().rstrip('=')[::-1]
+    return url(1).replace('/token', '/' + token)
+
+
+def open_detail_response(*, number=None, items=True, price=True, title='Circuito de anestesia'):
+    values = [
+        {'nombre': 'Número de Proceso', 'value': number or c.process_key(url(1))},
+        {'nombre': 'Título', 'value': title},
+        {'nombre': 'Entidad', 'value': 'Caja de Seguro Social'},
+        {'nombre': 'Unidad de Compra', 'value': 'Hospital de prueba'},
+        {'nombre': 'Fecha y hora presentación de cotizaciones', 'value': '12-10-2026 a 15-10-2026'},
+        {'nombre': 'Fecha de Publicación', 'value': '09-10-2026 - 10:00 AM'},
+    ]
+    if price:
+        values.append({'nombre': 'Precio estimado', 'value': 'B/. 37,500.00'})
+    class Response:
+        def raise_for_status(self): pass
+        def json(self):
+            return {'status': 1, 'result': {'pageComponentes': [
+                {'tipo': 'componentInfoProcesos', 'value': values},
+                {'tipo': 'componentItems', 'value': [{'descripcion': 'Kit de circuito. Ficha técnica: 43358'}] if items else []},
+            ]}}
+    return Response()
+
+
+def test_open_api_detail_is_complete_and_does_not_need_a_loaded_browser():
+    observed = []
+    def request(endpoint, timeout):
+        observed.append((endpoint, timeout))
+        return open_detail_response()
+    detail = c.fetch_open_detail(open_detail_url(), request=request)
+    c.verify_detail(None, open_detail_url(), detail)
+    assert detail['titulo'] == 'Circuito de anestesia'
+    assert detail['precio_referencia'] == 'B/. 37,500.00'
+    assert detail['unidad solicitante'] == 'Hospital de prueba'
+    assert detail['publicacion'] == '09-10-2026'
+    assert detail['items'] == ['Kit de circuito. Ficha técnica: 43358']
+    assert observed[0][1] == (8, 45)
+
+
+@pytest.mark.parametrize('changes', [
+    {'number': c.process_key(url(2))}, {'items': False}, {'price': False}, {'title': ''},
+])
+def test_open_api_rejects_wrong_act_and_missing_required_values(changes):
+    calls = []
+    def request(*args, **kwargs):
+        calls.append(1)
+        return open_detail_response(**changes)
+    with pytest.raises(c.ListingIncomplete):
+        c.fetch_open_detail(open_detail_url(), request=request, sleeper=lambda delay: None)
+    assert len(calls) == 2
+
+
+def test_open_api_retries_transient_error_and_validates_after_recovery():
+    calls = []
+    def request(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise TimeoutError('Fuente lenta')
+        return open_detail_response()
+    assert c.fetch_open_detail(open_detail_url(), request=request, sleeper=lambda delay: None)['items']
+    assert len(calls) == 2
+
+
+def test_open_api_classification_keeps_existing_ficha_logic():
+    from types import SimpleNamespace
+    path = Path(__file__).resolve().parents[1] / 'clv' / 'clv.py'
+    tree = ast.parse(path.read_text(encoding='utf-8'))
+    scrape = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'scrape')
+    detail = c.fetch_open_detail(open_detail_url(), request=lambda *args, **kwargs: open_detail_response())
+    namespace = {
+        'PageTools': SimpleNamespace,
+        'CFG': {'xpath_map': {}}, 'fetch_open_detail': lambda link: detail,
+        'detectar_fichas_tokens': lambda text: ['43358'] if '43358' in text else [],
+        'FICHAS_CON_CT': ['43358'], 'FICHAS_SIN_REQ': [], 'FICHAS_CON_RS': [],
+    }
+    if any(isinstance(node, ast.Name) and node.id == 'parse_purchase_unit_components' for node in ast.walk(scrape)):
+        from common import no_requirements, purchase_unit_details, process_law
+        namespace.update(vars(no_requirements))
+        namespace.update(vars(purchase_unit_details))
+        namespace.update(vars(process_law))
+    exec(compile(ast.Module(body=[scrape], type_ignores=[]), str(path), 'exec'), namespace)
+    info = namespace['scrape'](SimpleNamespace(d=None), open_detail_url())
+    assert info['ficha_detectada'] == '43358' and info['has_ct']
+    assert info['items'] == detail['items']
+    c.verify_detail(None, open_detail_url(), info)
 
 
 def test_database_api_splits_full_windows_and_does_not_hide_failures():

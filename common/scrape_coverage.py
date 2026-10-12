@@ -47,11 +47,12 @@ def recover_listing(listing, page_tools, job, log, *, request=None, normalize_ur
         page_tools.adjudication_by_url = {}
     records, windows, failures = {}, [], []
     calls, consecutive_errors = 0, 0
-    size = 5000
+    size = 50 if job == 'clv' else 5000
+    deadline = time.monotonic() + 180 if job == 'clv' else None
     def iso(value): return value.isoformat(timespec='milliseconds').replace('+00:00','Z')
     def fetch(start, end, depth=0):
         nonlocal calls, consecutive_errors
-        if calls >= 45 or consecutive_errors >= 6:
+        if calls >= 45 or consecutive_errors >= 6 or (deadline is not None and time.monotonic() >= deadline):
             failures.append({'start':iso(start),'end':iso(end),'error':'API indisponible o límite de recuperación alcanzado; reintentar próxima corrida'})
             return
         payload = {'registrosPorPagina':size, 'valorSiguiente':'', 'filtro': {
@@ -59,34 +60,60 @@ def recover_listing(listing, page_tools, job, log, *, request=None, normalize_ur
             'fechaDesde':iso(start),'fechaHasta':iso(end)}}
         error = ''
         rows = None
-        for attempt in range(3):
-            try:
-                calls += 1
-                response = request(LIST_ENDPOINT, json=payload, timeout=30)
-                response.raise_for_status()
-                data = response.json()
-                if data.get('status') != 1 or not isinstance(data.get('result'),dict):
-                    raise ListingIncomplete('API pública no devolvió un listado exitoso')
-                result = data['result']
-                rows = result.get('registros')
-                if not isinstance(rows,list):
-                    raise ListingIncomplete('Respuesta sin registros verificables')
-                consecutive_errors = 0
-                effective = min(size,int(result.get('registrosPorPagina') or size))
-                if len(rows) < effective:
-                    for row in rows:
-                        if not row.get('numProceso') or not row.get('idProcesosContratacionFlujos') or int(row.get('idEstado',-1))!=state:
+        cursors = set()
+        window_rows = 0
+        while calls < 45 and (deadline is None or time.monotonic() < deadline):
+            rows = None
+            for attempt in range(3):
+                if calls >= 45 or (deadline is not None and time.monotonic() >= deadline):
+                    error = 'Límite de recuperación alcanzado; reintentar próxima corrida'
+                    break
+                try:
+                    calls += 1
+                    response = request(LIST_ENDPOINT, json=payload, timeout=15 if job == 'clv' else 30)
+                    response.raise_for_status()
+                    data = response.json()
+                    if data.get('status') != 1 or not isinstance(data.get('result'),dict):
+                        raise ListingIncomplete('API pública no devolvió un listado exitoso')
+                    result = data['result']
+                    candidate_rows = result.get('registros')
+                    if not isinstance(candidate_rows,list):
+                        raise ListingIncomplete('Respuesta sin registros verificables')
+                    for row in candidate_rows:
+                        if not isinstance(row, dict) or not row.get('numProceso') or not row.get('idProcesosContratacionFlujos') or int(row.get('idEstado',-1))!=state:
                             raise ListingIncomplete('Registro incompleto o de otro estado en API')
-                    for row in rows: records[row['numProceso']]=row
-                    windows.append({'start':iso(start),'end':iso(end),'rows':len(rows)})
-                    log('COVERAGE', f'API estado={state} | {start.date()} -> {end.date()} | registros={len(rows)}')
-                    return
-                error = f'Ventana saturada: {len(rows)} registros'
+                        if job == 'clv' and (int(row.get('idTipoProceso', -1)) != 2 or row.get('prefijo') != 'CL'):
+                            raise ListingIncomplete('Registro de otro tipo de proceso en cotizaciones abiertas')
+                    rows = candidate_rows
+                    consecutive_errors = 0
+                    break
+                except Exception as exc:
+                    consecutive_errors += 1
+                    error = f'{type(exc).__name__}: {exc}'
+                    if attempt < 2: time.sleep(1.5*(2**attempt))
+            if rows is None:
                 break
-            except Exception as exc:
-                consecutive_errors += 1
-                error = f'{type(exc).__name__}: {exc}'
-                if attempt < 2: time.sleep(1.5*(2**attempt))
+            for row in rows:
+                previous = records.get(row['numProceso'])
+                if previous is None or int(row['idProcesosContratacionFlujos']) >= int(previous['idProcesosContratacionFlujos']):
+                    records[row['numProceso']] = row
+            window_rows += len(rows)
+            effective = min(size,int(result.get('registrosPorPagina') or size))
+            if effective <= 0:
+                error = 'Tamaño de página API inválido'
+                break
+            if len(rows) < effective:
+                windows.append({'start':iso(start),'end':iso(end),'rows':window_rows})
+                log('COVERAGE', f'API estado={state} | {start.date()} -> {end.date()} | registros={window_rows}')
+                return
+            cursor = str(result.get('valorInicial') or '').strip()
+            if job == 'clv' and cursor and cursor not in cursors:
+                cursors.add(cursor)
+                payload['valorSiguiente'] = cursor
+                log('COVERAGE', f'API abiertas: lote={len(rows)} | actos únicos={len(records)}')
+                continue
+            error = 'Cursor API repetido' if cursor in cursors else f'Ventana saturada: {len(rows)} registros'
+            break
         if end-start <= timedelta(seconds=1) or depth >= 24:
             failures.append({'start':iso(start),'end':iso(end),'error':error})
             return
@@ -239,16 +266,102 @@ def collect_listing(page_tools, css, log, *, expected_state=None, timeout=35, se
         return {'links': links, 'pages': pages, 'complete': False, 'error': error}
 
 
+def fetch_open_detail(link, *, request=None, attempts=2, sleeper=time.sleep):
+    try:
+        from .process_refresh import parse_official_detail, route_payload, normalized
+    except ImportError:
+        from process_refresh import parse_official_detail, route_payload, normalized
+    if request is None:
+        import requests
+        request = requests.get
+    flow, process_type = route_payload(link)
+    if process_type != 2:
+        raise ListingIncomplete('El enlace no corresponde a una cotización en línea')
+    error = None
+    for attempt in range(attempts):
+        try:
+            response = request(
+                f'https://apisv3.panamacompra.gob.pa/procesos-configuracion/pagina-componentes-publico/{process_type}/procesoVistaPliego/{flow}',
+                timeout=(8, 45),
+            )
+            response.raise_for_status()
+            data = response.json()
+            verified = parse_official_detail(data, link)
+            components = data['result']['pageComponentes']
+            labels, items = {}, []
+            for component in components:
+                if str(component.get('tipo', '')).startswith('componentInfo'):
+                    labels.update({normalized(pair['nombre']): pair.get('value')
+                                   for pair in component.get('value') or []
+                                   if isinstance(pair, dict) and 'nombre' in pair})
+                elif component.get('tipo') == 'componentItems':
+                    items.extend(str(item.get('descripcion') or '').strip()
+                                 for item in component.get('value') or [] if isinstance(item, dict))
+            items = [item for item in items if item]
+            if not items or 'precio referencia' not in verified:
+                raise ListingIncomplete('Detalle público sin precio o renglones verificables')
+            detail = {
+                'publicacion': str(labels.get('fecha de publicacion') or '').split(' -')[0],
+                'titulo': str(labels.get('titulo') or ''),
+                'precio_referencia': str(labels.get('precio estimado') or labels.get('precio de referencia') or verified['precio referencia']),
+                'fecha': verified['fecha'],
+                'entidad': str(labels.get('entidad') or ''),
+                'unidad solicitante': str(labels.get('unidad de compra') or ''),
+                'termino_entrega': str(labels.get('termino de entrega') or ''),
+                'descripcion': str(labels.get('descripcion') or ''),
+                'items': items,
+                '_api_components': components,
+                '_verified_process_number': process_key(link),
+            }
+            verify_detail(None, link, detail)
+            return detail
+        except Exception as exc:
+            error = exc
+            if attempt + 1 < attempts:
+                sleeper(1.5 * (2 ** attempt))
+    raise ListingIncomplete(f'Detalle público pendiente de {process_key(link)}: {error}')
+
+
 def verify_detail(driver, link, info):
     """Do not persist an error screen or a previous Angular detail as an act."""
     expected = process_key(link)
-    text = driver.execute_script('return document.body.innerText') or ''
-    if PROCESS.fullmatch(expected) and expected not in text:
-        raise ListingIncomplete(f'El detalle no corresponde al acto {expected}')
+    if info.get('_verified_process_number'):
+        if info['_verified_process_number'] != expected:
+            raise ListingIncomplete(f'El detalle público no corresponde al acto {expected}')
+    else:
+        text = driver.execute_script('return document.body.innerText') or ''
+        if PROCESS.fullmatch(expected) and expected not in text:
+            raise ListingIncomplete(f'El detalle no corresponde al acto {expected}')
     for field in ('titulo', 'entidad'):
         value = str(info.get(field) or '').strip().casefold()
         if value in {'', 'no disponible', 'none', 'null'}:
             raise ListingIncomplete(f'Detalle incompleto: falta {field} en {expected}')
+
+
+def wait_open_detail(driver, link, price_xpaths, item_xpaths, *, timeout=60):
+    from selenium.common.exceptions import StaleElementReferenceException
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    expected = process_key(link)
+    def ready(current_driver):
+        text = current_driver.execute_script('return document.body.innerText') or ''
+        if expected.casefold() not in text.casefold():
+            return False
+        price_loaded = any(
+            re.search(r'\d', element.text or '')
+            for xpath in price_xpaths
+            for element in current_driver.find_elements(By.XPATH, xpath)
+        )
+        items_loaded = any(
+            (element.text or '').strip()
+            for xpath in item_xpaths
+            for element in current_driver.find_elements(By.XPATH, xpath)
+        )
+        return price_loaded and items_loaded
+    WebDriverWait(driver, timeout, ignored_exceptions=(StaleElementReferenceException,)).until(
+        ready, message=f'Detalle o renglones pendientes de {expected}'
+    )
 
 
 def technical_discard(row):
@@ -290,6 +403,19 @@ class DetailCoverage:
         self.attempted.add(key)
         self.succeeded.add(key)
         self.failed.pop(key, None)
+
+    def defer_remaining(self, links, reason):
+        for link in links:
+            key = process_key(link)
+            self.failed[key] = str(reason)
+            self.pending[key] = {
+                **self.pending.get(key, {}),
+                'url': link,
+                'last_error': str(reason),
+                'deferred_at': datetime.now(timezone.utc).isoformat(),
+                'attempts': int(self.pending.get(key, {}).get('attempts', 0)),
+            }
+        _write_json(self.path, self.pending)
 
     def finish(self):
         for key in self.succeeded:
