@@ -161,6 +161,10 @@ def test_every_production_job_uses_verified_listing_and_details(job):
     tree=ast.parse((root/job/(job+'.py')).read_text(encoding='utf-8'))
     main=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='main')
     calls={n.func.id for n in ast.walk(main) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name)}
+    if job == 'clv':
+        assert '_load_open_listing' in calls
+        loader = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == '_load_open_listing')
+        calls.update(node.func.id for node in ast.walk(loader) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name))
     assert {'collect_listing','DetailCoverage','verify_detail','technical_discard'}<=calls
     assert 'skip_timeout_xpath' not in ast.unparse(main)
 
@@ -403,6 +407,134 @@ def test_open_api_classification_keeps_existing_ficha_logic():
     assert info['ficha_detectada'] == '43358' and info['has_ct']
     assert info['items'] == detail['items']
     c.verify_detail(None, open_detail_url(), info)
+
+
+@pytest.fixture
+def open_bootstrap():
+    from types import SimpleNamespace
+    from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
+    path = Path(__file__).resolve().parents[1] / 'clv' / 'clv.py'
+    tree = ast.parse(path.read_text(encoding='utf-8'))
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                 and node.name in {'_load_open_listing', '_restart_scrape_driver', 'scrape'}]
+    calls = {'api': 0, 'collected': 0, 'navigated': 0, 'finished': 0}
+    class Driver:
+        problem = ''
+        quits = 0
+        def get(self, address):
+            calls['navigated'] += 1
+            if self.problem == 'navigation': raise WebDriverException('Navegación fallida')
+        def execute_script(self, *args): pass
+        def quit(self): self.quits += 1
+    driver = Driver()
+    def start_browser():
+        if driver.problem == 'browser': raise WebDriverException('Chrome no disponible')
+        return driver
+    class Wait:
+        def __init__(self, *args): pass
+        def until(self, condition):
+            if driver.problem == condition:
+                raise TimeoutException('Control no disponible')
+            return SimpleNamespace()
+    class Select:
+        def __init__(self, *args): pass
+        def select_by_visible_text(self, text):
+            if driver.problem == 'option': raise NoSuchElementException('50 no disponible')
+            assert text == '50'
+    def collect(*args, **kwargs):
+        calls['collected'] += 1
+        return {'links': [url(1)], 'pages': [], 'complete': True, 'error': ''}
+    def request(*args, **kwargs):
+        calls['api'] += 1
+        return api_response([api_record(1)])
+    namespace = {
+        'CFG': {'url_list': 'https://www.panamacompra.gob.pa/Inicio/', 'css_links': 'a'},
+        'SimpleNamespace': SimpleNamespace, 'time': c.time, 'LOG': lambda *args: None,
+        'start_browser': start_browser, 'PageTools': lambda current: SimpleNamespace(d=current, close_popup=lambda: None),
+        'WebDriverException': WebDriverException, 'WebDriverWait': Wait, 'Select': Select,
+        'By': SimpleNamespace(XPATH='xpath'), 'EC': SimpleNamespace(element_to_be_clickable=lambda locator: 'tab',
+        presence_of_element_located=lambda locator: 'selector'),
+        'collect_listing': collect, 'normalize_url': str,
+        'recover_listing': lambda *args, **kwargs: c.recover_listing(*args, **kwargs, request=request),
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(path), 'exec'), namespace)
+    return namespace, driver, calls
+
+
+@pytest.mark.parametrize('problem', ['selector', 'tab', 'option', 'navigation', 'browser'])
+def test_open_bootstrap_failures_reach_api_instead_of_aborting(open_bootstrap, problem):
+    namespace, browser, calls = open_bootstrap
+    browser.problem = problem
+    driver, page, listing = namespace['_load_open_listing']()
+    assert driver is None and page.d is None
+    assert listing['complete'] and len(listing['links']) == 1
+    assert calls['api'] == 1 and calls['collected'] == 0
+    assert browser.quits == (0 if problem == 'browser' else 1)
+    assert calls['navigated'] == (5 if problem == 'navigation' else 0 if problem == 'browser' else 1)
+
+
+def test_working_open_ui_does_not_need_api_recovery(open_bootstrap):
+    namespace, browser, calls = open_bootstrap
+    driver, page, listing = namespace['_load_open_listing']()
+    assert driver is browser and page.d is browser and listing['complete']
+    assert calls['api'] == 0 and calls['collected'] == 1 and browser.quits == 0
+
+
+def test_bootstrap_and_api_outage_remain_partial(open_bootstrap):
+    namespace, browser, calls = open_bootstrap
+    browser.problem = 'selector'
+    namespace['recover_listing'] = lambda *args, **kwargs: c.recover_listing(
+        *args, **kwargs, request=lambda *request_args, **request_kwargs: api_response([], status=0))
+    driver, page, listing = namespace['_load_open_listing']()
+    assert driver is None and page.d is None
+    assert not listing['complete'] and not listing['links']
+    assert listing['failed_windows'] and browser.quits == 1
+
+
+def test_detail_browser_failure_does_not_block_public_api(open_bootstrap):
+    namespace, browser, calls = open_bootstrap
+    browser.problem = 'browser'
+    driver, page = namespace['_restart_scrape_driver'](None)
+    assert driver is None and page.d is None
+
+
+def test_api_error_without_browser_preserves_original_error(open_bootstrap):
+    from types import SimpleNamespace
+    namespace, browser, calls = open_bootstrap
+    namespace['CFG']['xpath_map'] = {}
+    def unavailable(link): raise c.ListingIncomplete('Fuente pública no disponible')
+    namespace['fetch_open_detail'] = unavailable
+    with pytest.raises(c.ListingIncomplete, match='Fuente pública no disponible'):
+        namespace['scrape'](SimpleNamespace(d=None), open_detail_url())
+
+
+def test_empty_unverified_listing_returns_before_maintenance(tmp_path):
+    from types import SimpleNamespace
+    path = Path(__file__).resolve().parents[1] / 'clv' / 'clv.py'
+    tree = ast.parse(path.read_text(encoding='utf-8'))
+    main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'main')
+    stop = next(index for index, node in enumerate(main.body)
+                if isinstance(node, ast.If) and isinstance(node.test, ast.BoolOp)
+                and isinstance(node.test.op, ast.And)
+                and {value.operand.id for value in node.test.values if isinstance(value, ast.UnaryOp)
+                     and isinstance(value.op, ast.Not) and isinstance(value.operand, ast.Name)} == {'links', 'listing_complete'})
+    main.body = main.body[:stop + 1] + [ast.Raise(exc=ast.Call(func=ast.Name(id='AssertionError', ctx=ast.Load()),
+                                                          args=[ast.Constant('No maintenance after an unverified list')], keywords=[]))]
+    ast.fix_missing_locations(main)
+    finished = []
+    listing = {'links': [], 'pages': [], 'complete': False, 'error': 'API caída'}
+    namespace = {
+        'CFG': {'sheet_ct_rir': 'ct', 'sheet_419_sfd': '419', 'sheets_data': [], 'sheet_desc': 'discard'},
+        'ensure_sheet_exists': lambda *args: None, 'load_ct_rir_fichas': lambda: set(),
+        'load_rs_sp_keywords': lambda: [], 'load_rs_sp_negative_keywords': lambda: [],
+        '_flush_failed_appends': lambda: None, 'read_links_from_sheets': lambda sheets: ({}, set()),
+        'gs_get': lambda *args: [], 'LOG': lambda *args: None,
+        '_load_open_listing': lambda: (None, SimpleNamespace(adjudication_by_url={}), listing),
+        'DATA_DIR': tmp_path, 'DetailCoverage': lambda *args: SimpleNamespace(finish=lambda: finished.append(True)),
+    }
+    exec(compile(ast.Module(body=[main], type_ignores=[]), str(path), 'exec'), namespace)
+    namespace['main']()
+    assert finished == [True]
 
 
 def test_database_api_splits_full_windows_and_does_not_hide_failures():

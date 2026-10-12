@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse, unquote
 from typing import List, Tuple
+from types import SimpleNamespace
 import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -837,8 +838,12 @@ def _restart_scrape_driver(driver):
         driver.quit()
     except Exception:
         pass
-    new_driver = start_browser()
-    return new_driver, PageTools(new_driver)
+    try:
+        new_driver = start_browser()
+        return new_driver, PageTools(new_driver)
+    except Exception as exc:
+        LOG("API", f"Navegador no disponible; se continuará por API: {type(exc).__name__}: {exc}")
+        return None, SimpleNamespace(d=None, adjudication_by_url={})
 
 class PageTools:
     def __init__(self, driver): self.d = driver
@@ -976,6 +981,8 @@ def scrape(page: PageTools, link: str):
     try:
         detail = fetch_open_detail(link)
     except Exception as exc:
+        if page.d is None:
+            raise
         LOG("API", f"Detalle pendiente; respaldo navegador: {type(exc).__name__}")
         try:
             page.d.get(link)
@@ -1087,6 +1094,50 @@ def refresh_known_processes(links):
             cache.clear()
 
 
+def _load_open_listing():
+    driver = None
+    page = SimpleNamespace(d=None, adjudication_by_url={})
+    listing = {"links": [], "pages": [], "complete": False, "error": "Listado web pendiente"}
+    try:
+        driver = start_browser()
+        page = PageTools(driver)
+        for attempt in range(5):
+            try:
+                driver.get(CFG["url_list"])
+                LOG("NAV", f"intento {attempt + 1}")
+                break
+            except WebDriverException:
+                time.sleep(5)
+        else:
+            raise WebDriverException("No fue posible abrir el listado después de cinco intentos")
+        time.sleep(1.5)
+        page.close_popup()
+        driver.execute_script("window.scrollBy(0,400)")
+        button = WebDriverWait(driver, 30).until(
+            EC.element_to_be_clickable((By.XPATH, "//label[@for='btnradio1']"))
+        )
+        driver.execute_script("arguments[0].click();", button)
+        page.close_popup()
+        selector = WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located((By.XPATH, "//select[contains(@class,'form-select')]"))
+        )
+        Select(selector).select_by_visible_text("50")
+        page.close_popup()
+        listing = collect_listing(page, CFG["css_links"], LOG, expected_state="Abierta")
+    except Exception as exc:
+        listing["error"] = f"Arranque del listado: {type(exc).__name__}: {exc}"
+        LOG("COVERAGE", f"No cargó el listado web; recuperación por API: {type(exc).__name__}")
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        driver = None
+        page = SimpleNamespace(d=None, adjudication_by_url={})
+    listing = recover_listing(listing, page, "clv", LOG, normalize_url=normalize_url)
+    return driver, page, listing
+
+
 def main():
     global FICHAS_CT_RIR_DYNAMIC
     ensure_sheet_exists(CFG["sheet_ct_rir"])
@@ -1099,48 +1150,21 @@ def main():
     desc_vals = gs_get(f"{CFG['sheet_desc']}!A1:ZZ")
     descartes = {r[find_idx(desc_vals[0], 'enlace')].strip() for r in desc_vals[1:] if not technical_discard(r)} if desc_vals and find_idx(desc_vals[0], 'enlace') is not None else set()
 
-    from selenium.common.exceptions import WebDriverException
-    driver = start_browser()
-    PT = PageTools(driver)
-
-    # Navegación al listado con reintentos
-    for i in range(5):
-        try:
-            driver.get(CFG["url_list"])
-            LOG("NAV", f"intento {i+1}")
-            break
-        except WebDriverException:
-            time.sleep(5)
-
-    time.sleep(1.5)
-    PT.close_popup()
-    driver.execute_script("window.scrollBy(0,400)")
-    time.sleep(0.3)
-
-    # Pestaña "Abiertas"
-    boton_abiertas = WebDriverWait(driver, 30).until(EC.element_to_be_clickable((By.XPATH, "//label[@for='btnradio1']")))
-    driver.execute_script("arguments[0].click();", boton_abiertas)
-    time.sleep(0.2)
-    PT.close_popup()
-
-    # 50 por página
-    select_registros = WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.XPATH, "//select[contains(@class,'form-select')]")))
-    Select(select_registros).select_by_visible_text("50")
-    time.sleep(0.3)
-    PT.close_popup()
-
-    listing = collect_listing(PT, CFG["css_links"], LOG, expected_state="Abierta")
-    listing = recover_listing(listing, PT, "clv", LOG, normalize_url=normalize_url)
+    driver, PT, listing = _load_open_listing()
     links = listing["links"]
     listing_complete = listing["complete"]
     coverage = DetailCoverage(DATA_DIR / "scrape_coverage", "clv", listing)
+    if not links and not listing_complete:
+        coverage.finish()
+        LOG("COVERAGE", "No se verificó el listado; se conserva el histórico y se omite el mantenimiento de filas")
+        return
 
     LOG("DONE", f"enlaces extraídos={len(links)}")
     refresh_known_processes(links)
     if listing_complete:
         purge_all()
     else:
-        LOG("COVERAGE", "Listado parcial: se conserva el histórico y se pospone la verificación de cierres")
+        LOG("COVERAGE", "Se conserva el histórico; se pospone la verificación de cierres")
     _, all_links = read_links_from_sheets(CFG["sheets_data"])
     try: driver.quit()
     except: pass
@@ -1166,8 +1190,7 @@ def main():
         return
 
     # === SCRAPE DETALLE (sólo para nuevos) ===
-    driver = start_browser()
-    PT = PageTools(driver)
+    driver, PT = _restart_scrape_driver(None)
     datos_ct, datos_sr, datos_sf, datos_rs, datos_ct_rir = [], [], [], [], []
     consecutive_failures = 0
     detail_deadline = time.monotonic() + 600
